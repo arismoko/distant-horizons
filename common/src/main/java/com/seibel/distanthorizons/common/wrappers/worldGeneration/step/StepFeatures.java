@@ -103,17 +103,17 @@ public final class StepFeatures extends AbstractWorldGenStep
 			catch (ConcurrentModificationException e)
 			{
 				String message = "Concurrency issue when generating features for chunk at pos ["+chunkWrapper.getChunkPos()+"], error: ["+e.getMessage()+"], this message will only be logged once. This issue cannot be resolved from DH's end.";
-				if (LOGGED_ERRORS.add(message))
+				if (LOGGED_ERRORS.add(e.getMessage()))
 				{
-					LOGGER.warn(message, e);
+					LOGGER.error(message, e);
 				}
 			}
 			catch (Exception e)
 			{
 				String message = "Unexpected issue when generating features for chunk at pos ["+chunkWrapper.getChunkPos()+"], error: ["+e.getMessage()+"].";
-				if (LOGGED_ERRORS.add(message))
+				if (LOGGED_ERRORS.add(e.getMessage()))
 				{
-					LOGGER.warn(message, e);
+					LOGGER.error(message, e);
 				}
 			}
 		}
