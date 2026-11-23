@@ -357,7 +357,8 @@ public abstract class AbstractDhTintGetter implements BlockAndTintGetter
 	public static void setStaticColor(BlockStateWrapper blockStateWrapper, BiomeWrapper biomeWrapper, Integer colorInt)
 	{
 		BlockBiomeWrapperPair pair = BlockBiomeWrapperPair.get(blockStateWrapper, biomeWrapper);
-		COLOR_BY_BLOCK_BIOME_PAIR.put(pair, colorInt);
+		// blended tints already saved the biome's own color
+		COLOR_BY_BLOCK_BIOME_PAIR.putIfAbsent(pair, colorInt);
 	}
 	
 	public static void clear() { COLOR_BY_BLOCK_BIOME_PAIR.clear(); }
