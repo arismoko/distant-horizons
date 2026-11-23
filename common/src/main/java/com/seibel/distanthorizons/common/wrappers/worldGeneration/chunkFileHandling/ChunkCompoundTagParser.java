@@ -407,7 +407,8 @@ public class ChunkCompoundTagParser
 					#else
 					{
 						CompoundTag biomeTag = CompoundTagUtil.getCompoundTag(tagSection, "biomeRegistry");
-						if (biomeTag == null)
+						if (biomeTag == null 
+							|| biomeTag.isEmpty())
 						{
 							biomeTag = CompoundTagUtil.getCompoundTag(tagSection, "biomes");
 						}
