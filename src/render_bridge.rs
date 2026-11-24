@@ -26,8 +26,8 @@ struct FrameUniforms {
     jittered: mat4x4<f32>,
     // [near_dh, far_dh, clip_dist, sun_brightness]
     clip_and_light: vec4<f32>,
-    // [noise_intensity, fade_band, fog_r, fog_g]
-    noise_and_fog: vec4<f32>,
+    // [noise_intensity, fade_band, brightness_multiplier, saturation_multiplier]
+    noise_and_grade: vec4<f32>,
     // [shading_enabled, noise_enabled, fade_enabled, is_hdr]
     flags: vec4<u32>,
 };
@@ -95,8 +95,14 @@ fn vs_main(v: VsIn) -> VsOut {
         shade = clamp(shade + height_hint, 0.45, 1.06);
     }
 
+    let brightness = u_frame.noise_and_grade.z;
+    let saturation = u_frame.noise_and_grade.w;
+    var graded = base.rgb * light * shade * brightness;
+    let luma = dot(graded, vec3<f32>(0.2126, 0.7152, 0.0722));
+    graded = clamp(mix(vec3<f32>(luma), graded, saturation), vec3<f32>(0.0), vec3<f32>(1.0));
+
     out.clip_pos = clip;
-    out.color = vec4<f32>(clamp(base.rgb * light * shade, vec3<f32>(0.0), vec3<f32>(1.0)), base.a);
+    out.color = vec4<f32>(graded, base.a);
     out.rel_pos = rel;
     out.block_pos = v.local_pos;
     out.packed_meta = v.packed_meta;
@@ -125,7 +131,7 @@ fn bayer4x4(p: vec2<f32>) -> f32 {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let dist = length(in.rel_pos.xz);
     let clip_dist = u_frame.clip_and_light.z;
-    let fade_band = u_frame.noise_and_fog.y;
+    let fade_band = u_frame.noise_and_grade.y;
     if (clip_dist > 0.0) {
         if (u_frame.flags.z != 0u && fade_band > 0.5) {
             let t = smoothstep(clip_dist, clip_dist + fade_band, dist);
@@ -140,7 +146,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var rgb = in.color.rgb;
     let is_fluid = (in.packed_meta >> 12u) & 1u;
     if (u_frame.flags.y != 0u && is_fluid == 0u) {
-        let intensity = u_frame.noise_and_fog.x;
+        let intensity = u_frame.noise_and_grade.x;
         let lum = (rgb.r + rgb.g + rgb.b) / 3.0;
         let amp = (1.0 - pow(lum * 2.0 - 1.0, 2.0)) * intensity;
         let qpos = floor(in.block_pos);
@@ -290,6 +296,12 @@ pub struct DhState {
     pub fog_color: [f32; 4],
     pub vanilla_far_blocks: f32,
     pub sun_brightness: f32,
+    pub rain_level: f32,
+    pub thunder_level: f32,
+    /// Client's current vanilla render distance in chunks (from `ClientHost::graphics_options`).
+    pub vanilla_render_distance_chunks: i32,
+    /// Loaded vanilla client chunk coordinates for accurate seam handling.
+    pub client_loaded_chunks: HashSet<[i32; 2]>,
     pub dimensions: HashMap<String, DimensionLodStore>,
     pub pending_chunks: HashMap<String, VecDeque<[i32; 2]>>,
     pub pending_chunk_set: HashMap<String, HashSet<[i32; 2]>>,
@@ -322,6 +334,10 @@ impl Default for DhState {
             fog_color: [0.75, 0.85, 1.0, 1.0],
             vanilla_far_blocks: 80.0,
             sun_brightness: 1.0,
+            rain_level: 0.0,
+            thunder_level: 0.0,
+            vanilla_render_distance_chunks: 12,
+            client_loaded_chunks: HashSet::new(),
             dimensions: HashMap::new(),
             pending_chunks: HashMap::new(),
             pending_chunk_set: HashMap::new(),
@@ -473,8 +489,14 @@ pub fn stats() -> DhStats {
     }
 }
 
-/// Compute sun brightness `0.2..=1.0` from Minecraft's `day_time` (`0..24000`).
-pub fn sun_brightness_from_day_time(day_time: i64, dimension: &str) -> f32 {
+/// Compute sun brightness `0.18..=1.0` from Minecraft's `day_time` (`0..24000`), dimension, and
+/// live rain/thunder weather levels (`0.0..=1.0`).
+pub fn sun_brightness_from_day_time_and_weather(
+    day_time: i64,
+    dimension: &str,
+    rain_level: f32,
+    thunder_level: f32,
+) -> f32 {
     if dimension == "minecraft:the_nether" {
         return 0.72;
     }
@@ -486,5 +508,39 @@ pub fn sun_brightness_from_day_time(day_time: i64, dimension: &str) -> f32 {
     let angle = (t - 0.25) * std::f32::consts::TAU;
     let sun_h = angle.cos();
     let day_factor = ((sun_h * 2.0) + 0.5).clamp(0.0, 1.0);
-    0.26 + 0.74 * day_factor
+    // Match vanilla `ClientLevel.getSkyDarken`: rain dims sky up to 31.25%, thunder another 25%.
+    let weather_scale =
+        (1.0 - rain_level.clamp(0.0, 1.0) * 0.3125) * (1.0 - thunder_level.clamp(0.0, 1.0) * 0.25);
+    (0.24 + 0.76 * day_factor * weather_scale).clamp(0.18, 1.0)
+}
+
+/// Compute sun brightness `0.2..=1.0` from Minecraft's `day_time` (`0..24000`) in clear weather.
+pub fn sun_brightness_from_day_time(day_time: i64, dimension: &str) -> f32 {
+    sun_brightness_from_day_time_and_weather(day_time, dimension, 0.0, 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weather_dims_overworld_sun_brightness_but_not_nether_or_end() {
+        let clear_noon =
+            sun_brightness_from_day_time_and_weather(6_000, "minecraft:overworld", 0.0, 0.0);
+        let storm_noon =
+            sun_brightness_from_day_time_and_weather(6_000, "minecraft:overworld", 1.0, 1.0);
+        let clear_midnight =
+            sun_brightness_from_day_time_and_weather(18_000, "minecraft:overworld", 0.0, 0.0);
+        assert!(clear_noon > 0.99);
+        assert!(storm_noon < clear_noon - 0.25);
+        assert!(storm_noon > clear_midnight);
+        assert_eq!(
+            sun_brightness_from_day_time_and_weather(18_000, "minecraft:the_nether", 1.0, 1.0),
+            0.72
+        );
+        assert_eq!(
+            sun_brightness_from_day_time_and_weather(18_000, "minecraft:the_end", 1.0, 1.0),
+            0.80
+        );
+    }
 }

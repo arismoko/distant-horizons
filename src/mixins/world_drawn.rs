@@ -576,13 +576,13 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
     for (i, f) in clip_and_light.iter().enumerate() {
         u_bytes[64 + i * 4..68 + i * 4].copy_from_slice(&f.to_le_bytes());
     }
-    let noise_and_fog = [
+    let noise_and_grade = [
         params.config.noise_intensity,
         fade_band,
-        params.fog_color[0],
-        params.fog_color[1],
+        params.config.brightness_multiplier,
+        params.config.saturation_multiplier,
     ];
-    for (i, f) in noise_and_fog.iter().enumerate() {
+    for (i, f) in noise_and_grade.iter().enumerate() {
         u_bytes[80 + i * 4..84 + i * 4].copy_from_slice(&f.to_le_bytes());
     }
     let is_hdr = matches!(

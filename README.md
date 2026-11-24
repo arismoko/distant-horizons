@@ -10,25 +10,25 @@ primitives land.
 
 | Stage | Scope | Status |
 |---|---|---|
-| **Stage 1** | End-to-end LOD prototype on Sunrise: multi-layer LOD store (`DHLOD002`), background meshing, per-world disk storage, reversed-Z offscreen rendering & sky-masked HDR fog composite, settings UI, and F3 debug telemetry (using two temporary `[[native.mixin]]` render hooks) | **Done** (pinned to Sunrise Dev `ebd2d226`) |
-| **Stage 2** | Full data & worldgen parity: zero-copy chunk snapshots, non-blocking chunk loading, saved Anvil region import, off-thread detached worldgen, multiplayer LOD streaming, and public mod-to-mod API for external generators / LOD providers | **Not done** (blocked on Sunrise API PRs) |
-| **Stage 3** | Pure general mod-API renderer in GLSL: delete both temporary `[[native.mixin]]` hooks (`render_needs`, `world_drawn`) so `sunrise-mod.toml` has zero `[native.*]` entries | **Not done** (blocked on `#1161` and `#2005`) |
+| **Stage 1** | End-to-end LOD prototype on Sunrise: multi-layer LOD store (`DHLOD002`), background meshing, per-world disk storage, reversed-Z offscreen rendering & sky-masked HDR fog composite, settings UI, and F3 debug telemetry (using two temporary `[[native.mixin]]` render hooks) | **Done** (pinned to Sunrise Dev `f8aa80e4`) |
+| **Stage 2a** | Public mod-to-mod LOD API (`src/api.rs`), `FullDataSourceV2DTO` wire decoder with LZ4/Zstd/LZMA2 (`src/dh_v2.rs`), optional droppable multiplayer LOD sync (`distanthorizons:lod_sync`, `src/network.rs`), client `/dh` commands, Controls keybinds, live brightness/saturation & weather-aware lighting, and GLSL shader sources (`assets/distanthorizons/shaders/core/`) | **Done** (on `sunrise`, Dev `f8aa80e4`) |
+| **Stage 2b** | Full data & worldgen parity: zero-copy `ChunkSnapshot` (client & server), non-blocking `LevelRef::request_chunk` queue, saved Anvil `.mca` `SavedChunkReader` import, and off-thread `DetachedChunkGenerator` worldgen | **Staged on branch `stage2-data-gaps`** (PRs `#5339`, `#5340`, `#5341`, `#5347` open on `sunrise-org/sunrise`) |
+| **Stage 3** | Pure general mod-API renderer in GLSL: delete both temporary `[[native.mixin]]` hooks (`render_needs`, `world_drawn`) so `sunrise-mod.toml` has zero `[native.*]` entries | **Not done** (blocked on `#4758`, `#1161`/`#5342`, and `#2005`) |
 | **Stage 4** | Native drawing under translated Iris/OptiFine shader packs (`dh_terrain`, `dh_water`, `dh_shadow`, auxiliary depth planes, and pack uniforms) | **Not done** (shader-pack binding design pending) |
 
 ## What works today
 
 - **LOD data & storage:** Multi-layer vertical column spans (overhangs, arches, caves, Nether ceilings) with cave culling, detail levels `0`–`6` (up to 512 chunks), background disk persistence (`DHLOD002` format with backward-compatible `DHLOD001` reads), and automatic quadtree parent mipmapping.
-- **Meshing & rendering:** Background section mesher with neighbor face culling, side-plane frustum culling, independent reversed-Z projection and depth buffer, sky-masked compositing into Sunrise's linear HDR world target, configurable dithering fade, noise texture, and atmospheric distance fog.
-- **Data capture (prototype):** Single-player/integrated-server capture of loaded chunks via `read_columns` and surface preview sampling via `terrain_surface`.
-- **UI & telemetry:** Mod settings screen (render distance, quality presets, vertical quality, cave culling, fog/fade/noise/shading/brightness/saturation, distant generation mode) and F3 debug overlay entries.
+- **Meshing & rendering:** Background section mesher with neighbor face culling, side-plane frustum culling, independent reversed-Z projection and depth buffer, sky-masked compositing into Sunrise's linear HDR world target, configurable dithering fade, noise texture, brightness/saturation grading, weather- and time-aware lighting, and atmospheric distance fog.
+- **Public mod-to-mod API & multiplayer sync:** Public Rust API (`distanthorizons::api`) for custom `LodWorldGenerator` overrides, `RemoteLodProvider` clients, column/chunk submission, and `FullDataSourceV2DTO` wire decoding (LZ4/Zstd/LZMA2), plus an optional droppable `distanthorizons:lod_sync` play payload channel for server-to-client LOD streaming.
+- **Data capture (on Dev `f8aa80e4`):** Single-player/integrated-server capture of loaded chunks via `read_columns` and surface preview sampling via `terrain_surface`. Full-height zero-copy snapshots (`#5339`), async chunk requests (`#5340`), saved Anvil region import (`#5341`), and detached off-thread worldgen (`#5347`) are wired on branch `stage2-data-gaps` ready to merge as soon as those PRs hit a Dev SDK.
+- **UI, controls, commands & telemetry:** Mod settings screen (render distance, horizontal/vertical quality, cave culling, fog/fade/noise/shading/brightness/saturation, distant generation mode), `/dh` and `/distanthorizons` client commands, Controls keybinds (toggle rendering, cycle quality, clear cache), and F3 debug overlay entries.
 
 ## What does not work yet
 
-- **Full-height background chunk snapshots (client & server):** Loaded chunk ingestion still uses synchronous tick-thread `read_columns` rather than zero-copy off-thread snapshots (so multiplayer client-side LOD recording from received chunks and full-light/3D-biome snapshots are not wired yet).
-- **Saved region import:** Previously explored Anvil `.mca` regions outside the loaded radius are not imported in the background yet.
-- **Full off-thread distant world generation:** Distant terrain outside loaded chunks currently uses basic surface column sampling; off-thread carvers, caves, biomes, trees/features, Nether, End, and custom dimension generators are not wired yet.
-- **Multiplayer server-sent LODs & public mod-to-mod API:** Remote DH server LOD streaming and the public mod-to-mod API (letting other Sunrise mods override distant generation or push external/server-sent LOD data into Distant Horizons) are not implemented yet.
-- **Zero-mixin rendering:** Rendering still relies on two temporary `[[native.mixin]]` hooks (`sunrise_mod_render::render::render_needs` and `world_drawn`) with WGSL shaders until Sunrise's general mod render pipeline and world stage APIs land.
+- **Full-height background chunk snapshots, saved region import & detached worldgen on `sunrise` branch:** Wired on branch `stage2-data-gaps`; merges to `sunrise` once `#5339`–`#5341` and `#5347` land in a Sunrise Dev SDK.
+- **Typed mod-to-mod event bus:** Public trait/function API (`src/api.rs`) is in place; typed `#[derive(mod_api::Event)]` events wait on `#5137`/`#5136`.
+- **Zero-mixin rendering:** Rendering still relies on two temporary `[[native.mixin]]` hooks (`sunrise_mod_render::render::render_needs` and `world_drawn`) with WGSL shaders until Sunrise's `#4758` + `#1161` + `#2005` GLSL mod render pipeline APIs land (GLSL shaders are already staged in `assets/distanthorizons/shaders/core/`).
 - **Translated Iris/OptiFine shader packs:** When an Iris/OptiFine shader pack is active, Distant Horizons currently draws in its own standalone world-composite pass after vanilla world rendering rather than participating in the shader pack's gbuffer, shadow, deferred, or composite passes. Shader-pack shadows, water reflections, and pack fog do not apply to distant LOD terrain yet.
 
 ## Known Sunrise mod-API gaps

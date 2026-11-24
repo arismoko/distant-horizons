@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod colors;
+pub mod commands;
 pub mod config;
 pub mod dh_v2;
 pub mod lod;
@@ -22,23 +23,26 @@ pub mod render_bridge;
 pub mod storage;
 
 use crate::api::{LodGenRequest, LodGenStep, LodSectionPos, ingest_gen_output};
-
 use crate::colors::{biome_water_color, block_color, is_skippable_for_lod, is_water_block};
+use crate::commands::DhKeybinds;
 use crate::config::{DhConfig, MOD_ID};
 use crate::lod::{
     DimensionLodStore, LodColumn, SECTION_SIZE, SOURCE_DISTANT_SURFACE, SOURCE_LOADED_CHUNK,
     SectionPos,
 };
-use crate::render_bridge::{runtime, stats, sun_brightness_from_day_time};
+use crate::render_bridge::{runtime, stats, sun_brightness_from_day_time_and_weather};
 use mod_api::client::fog::FogType;
 use mod_api::{
-    self, BlockChangedEvent, ChunkLoadEvent, ClientHost, ClientLevelLoadEvent,
-    ClientLevelUnloadEvent, ClientTickPreEvent, DebugEntry, DebugGroup, Heightmap, Hooks, HostSide,
-    LevelDimension, LevelHost, LevelLoadEvent, LevelTickPostEvent, LevelUnloadEvent,
-    MAX_TERRAIN_COLUMNS, RegisterDebugEntriesEvent, Registrar, RegistrationContext, RenderFogEvent,
-    ServerHost, ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
+    self, BlockChangedEvent, ChunkLoadEvent, ClientBlockChangedEvent, ClientChunkLoadEvent,
+    ClientChunkUnloadEvent, ClientHost, ClientLevelLoadEvent, ClientLevelUnloadEvent,
+    ClientSetupContext, ClientSetupEvent, ClientTickPreEvent, CommandEvent, DebugEntry, DebugGroup,
+    Flow, Heightmap, Hooks, HostSide, LevelDimension, LevelHost, LevelLoadEvent,
+    LevelTickPostEvent, LevelUnloadEvent, MAX_TERRAIN_COLUMNS, RegisterClientCommandsEvent,
+    RegisterDebugEntriesEvent, Registrar, RegistrationContext, RenderFogEvent, ServerHost,
+    ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
 };
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 /// Depth below the `WorldSurface` heightmap scanned per loaded chunk column to see through
@@ -54,13 +58,32 @@ const CHUNKS_PER_TICK: usize = 4;
 const DISTANT_COLS_PER_TICK: usize = 1024;
 
 #[derive(Default)]
-struct DistantHorizonsMod;
+struct DistantHorizonsMod {
+    keybinds: Mutex<DhKeybinds>,
+}
 
 #[mod_api::sunrise_mod]
 impl Hooks for DistantHorizonsMod {
     fn register(&self, registrar: &mut dyn Registrar, _cx: &RegistrationContext) {
         DhConfig::register_settings(registrar);
+        commands::register_key_mappings(registrar);
         network::register_payloads(registrar);
+    }
+
+    fn client_setup(&self, host: &mut dyn ClientSetupContext, _event: &mut ClientSetupEvent) {
+        *self.keybinds.lock().unwrap() = DhKeybinds::resolve(host);
+    }
+
+    fn register_client_commands(
+        &self,
+        _host: &mut dyn ClientHost,
+        event: &mut RegisterClientCommandsEvent<'_>,
+    ) {
+        commands::register_client_commands(event.commands);
+    }
+
+    fn command(&self, host: &mut dyn ClientHost, event: &mut CommandEvent<'_>) -> Flow {
+        commands::handle_client_command(host, event.command)
     }
 
     fn register_debug_entries(
@@ -98,6 +121,7 @@ impl Hooks for DistantHorizonsMod {
         let rt = runtime();
         let mut st = rt.inner.lock().unwrap();
         st.active_dimension = event.dimension.to_owned();
+        st.client_loaded_chunks.clear();
         st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
         // Re-submit any already-known sections in this dimension to the mesher so the GPU cache
         // immediately populates after switching dimensions or rejoining a world.
@@ -118,9 +142,43 @@ impl Hooks for DistantHorizonsMod {
         let rt = runtime();
         let mut st = rt.inner.lock().unwrap();
         st.remote_requested.remove(event.dimension);
+        st.client_loaded_chunks.clear();
         if st.active_dimension == event.dimension {
             st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
         }
+    }
+
+    fn client_chunk_load(&self, host: &mut dyn ClientHost, event: &mut ClientChunkLoadEvent<'_>) {
+        if !host.on(MOD_ID) {
+            return;
+        }
+        let rt = runtime();
+        rt.inner
+            .lock()
+            .unwrap()
+            .client_loaded_chunks
+            .insert(event.chunk);
+    }
+
+    fn client_chunk_unload(
+        &self,
+        _host: &mut dyn ClientHost,
+        event: &mut ClientChunkUnloadEvent<'_>,
+    ) {
+        let rt = runtime();
+        rt.inner
+            .lock()
+            .unwrap()
+            .client_loaded_chunks
+            .remove(&event.chunk);
+    }
+
+    fn client_block_changed(&self, host: &dyn ClientHost, event: &mut ClientBlockChangedEvent<'_>) {
+        if !host.on(MOD_ID) || event.predicted {
+            return;
+        }
+        // Record chunk coordinate for future client-side ChunkSnapshot refresh (G1/#5233).
+        let _ = (event.dimension, [event.pos.x >> 4, event.pos.z >> 4]);
     }
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
@@ -128,21 +186,41 @@ impl Hooks for DistantHorizonsMod {
         let cfg = DhConfig::read_from_client(host);
         rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
 
+        if host.playing() {
+            let kb = self.keybinds.lock().unwrap();
+            kb.poll(host);
+        }
+
         let cam = host.camera();
         let clock = host.clock();
+        let gfx_opts = host.graphics_options();
+        let active_dim_now = rt.inner.lock().unwrap().active_dimension.clone();
+        let (rain_level, thunder_level) = host
+            .level(&active_dim_now)
+            .and_then(|lvl| lvl.weather(host))
+            .unwrap_or((0.0, 0.0));
+
         let remote_batch = {
             let mut st = rt.inner.lock().unwrap();
-            st.config = cfg;
+            st.config = DhConfig::read_from_client(host);
+            st.vanilla_render_distance_chunks = gfx_opts.render_distance.max(2);
+            st.rain_level = rain_level.clamp(0.0, 1.0);
+            st.thunder_level = thunder_level.clamp(0.0, 1.0);
             if let Some(camera) = cam {
                 st.camera_pos = camera.position;
                 st.has_camera = true;
-                if st.vanilla_far_blocks <= 16.0 && camera.far.is_finite() && camera.far > 64.0 {
-                    st.vanilla_far_blocks = camera.far * 0.25;
+                let opts_far = (st.vanilla_render_distance_chunks as f32) * 16.0;
+                if st.vanilla_far_blocks <= 16.0 {
+                    st.vanilla_far_blocks = opts_far;
                 }
             }
             if let Some(clk) = clock {
-                st.sun_brightness =
-                    sun_brightness_from_day_time(clk.day_time, &st.active_dimension);
+                st.sun_brightness = sun_brightness_from_day_time_and_weather(
+                    clk.day_time,
+                    &st.active_dimension,
+                    st.rain_level,
+                    st.thunder_level,
+                );
             }
 
             let active_dim = st.active_dimension.clone();
