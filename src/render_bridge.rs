@@ -27,7 +27,7 @@ struct FrameUniforms {
     clip_and_light: vec4<f32>,
     // [noise_intensity, fade_band, fog_r, fog_g]
     noise_and_fog: vec4<f32>,
-    // [shading_enabled, noise_enabled, fade_enabled, fog_b_bits]
+    // [shading_enabled, noise_enabled, fade_enabled, is_hdr]
     flags: vec4<u32>,
 };
 
@@ -164,7 +164,7 @@ struct CompositeUniforms {
     fog_color: vec4<f32>,
     // [near_dh, far_dh, fog_start, fog_end]
     params: vec4<f32>,
-    // [fog_enabled, 0, 0, 0]
+    // [fog_enabled, is_hdr, 0, 0]
     flags: vec4<u32>,
 };
 
@@ -228,7 +228,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let t = clamp((view_dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
         // Smooth exponential-like atmospheric fog curve matching DH's horizon blend.
         let fog_factor = clamp(1.0 - exp(-2.8 * t * t), 0.0, 1.0);
-        col = mix(col, u_comp.fog_color.rgb, fog_factor);
+        if (u_comp.flags.y != 0u) {
+            // Convert sRGB LOD albedo and fog color to linear HDR (docs/hdr-passes.md).
+            let lin_col = pow(max(col, vec3<f32>(0.0)), vec3<f32>(2.2));
+            let lin_fog = pow(max(u_comp.fog_color.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
+            col = mix(lin_col, lin_fog, fog_factor);
+        } else {
+            col = mix(col, u_comp.fog_color.rgb, fog_factor);
+        }
+    } else if (u_comp.flags.y != 0u) {
+        col = pow(max(col, vec3<f32>(0.0)), vec3<f32>(2.2));
     }
 
     return vec4<f32>(max(col, vec3<f32>(0.0)), 1.0);

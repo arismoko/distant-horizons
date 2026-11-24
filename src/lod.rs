@@ -502,9 +502,10 @@ impl DimensionLodStore {
         selected
     }
 
-    /// Returns sections to populate in coarse-to-fine progressive order (detail `MAX_DETAIL` down
-    /// to `0`, nearest-first within each detail level) so the full horizon fills in seconds and
-    /// then sharpens smoothly without holes.
+    /// Returns sections to populate in progressive order: first the inner fine detail rings
+    /// around the vanilla border (`detail 0` and `detail 1` within ~384 blocks) so the immediate
+    /// border outside vanilla chunks is crisp right away, then coarse-to-fine (`detail MAX_DETAIL`
+    /// down to `0`) across the rest of the horizon.
     pub fn desired_sections_coarse_to_fine(
         cam_x: f64,
         cam_z: f64,
@@ -529,14 +530,30 @@ impl DimensionLodStore {
                 );
             }
         }
-        let mut ordered = Vec::new();
-        for detail in (0..=MAX_DETAIL as usize).rev() {
-            let bucket = &mut by_detail[detail];
+        for bucket in &mut by_detail {
             bucket.sort_by(|a, b| {
                 a.min_horizontal_distance(cam_x, cam_z)
                     .total_cmp(&b.min_horizontal_distance(cam_x, cam_z))
             });
-            ordered.extend(bucket.iter().copied());
+        }
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+        // Prioritize the immediate near-horizon detail 0/1 ring so the vanilla border is sharp first.
+        for &detail in &[0usize, 1usize] {
+            let near_cap = if detail == 0 { 192.0 } else { 384.0 };
+            for &pos in &by_detail[detail] {
+                if pos.min_horizontal_distance(cam_x, cam_z) <= near_cap && seen.insert(pos) {
+                    ordered.push(pos);
+                }
+            }
+        }
+        // Then sweep coarse-to-fine across the full render distance.
+        for detail in (0..=MAX_DETAIL as usize).rev() {
+            for &pos in &by_detail[detail] {
+                if seen.insert(pos) {
+                    ordered.push(pos);
+                }
+            }
         }
         ordered
     }

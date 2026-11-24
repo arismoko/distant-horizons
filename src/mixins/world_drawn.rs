@@ -541,11 +541,15 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
     for (i, f) in noise_and_fog.iter().enumerate() {
         u_bytes[80 + i * 4..84 + i * 4].copy_from_slice(&f.to_le_bytes());
     }
+    let is_hdr = matches!(
+        world.color_format,
+        wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rg11b10Ufloat
+    );
     let flags = [
         u32::from(params.config.shading_enabled),
         u32::from(params.config.noise_enabled),
         u32::from(params.config.fade_enabled),
-        params.fog_color[2].to_bits(),
+        u32::from(is_hdr),
     ];
     for (i, v) in flags.iter().enumerate() {
         u_bytes[96 + i * 4..100 + i * 4].copy_from_slice(&v.to_le_bytes());
@@ -628,7 +632,12 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
     for (i, f) in comp_params.iter().enumerate() {
         comp_bytes[16 + i * 4..20 + i * 4].copy_from_slice(&f.to_le_bytes());
     }
-    let comp_flags = [u32::from(params.config.fog_enabled), 0u32, 0u32, 0u32];
+    let comp_flags = [
+        u32::from(params.config.fog_enabled),
+        u32::from(is_hdr),
+        0u32,
+        0u32,
+    ];
     for (i, v) in comp_flags.iter().enumerate() {
         comp_bytes[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
