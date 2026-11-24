@@ -865,32 +865,38 @@ fn sample_distant_sections(
 
 fn flush_dimension_dirty(world_dir: Option<std::path::PathBuf>, dim: &str) {
     let rt = runtime();
-    let mut st = rt.inner.lock().unwrap();
-    let Some(dir) = world_dir.or_else(|| st.world_dir.clone()) else {
-        return;
-    };
-    if let Some(store) = st.dimensions.get_mut(dim) {
-        for sec in store.sections.values_mut() {
-            if sec.dirty_save && sec.populated > 0 {
-                sec.dirty_save = false;
-                rt.io.request_save(dir.clone(), dim.to_owned(), sec.clone());
+    {
+        let mut st = rt.inner.lock().unwrap();
+        let Some(dir) = world_dir.or_else(|| st.world_dir.clone()) else {
+            return;
+        };
+        if let Some(store) = st.dimensions.get_mut(dim) {
+            for sec in store.sections.values_mut() {
+                if sec.dirty_save && sec.populated > 0 {
+                    sec.dirty_save = false;
+                    rt.io.request_save(dir.clone(), dim.to_owned(), sec.clone());
+                }
             }
         }
     }
+    rt.io.flush();
 }
 
 fn flush_dirty_sections(world_dir: Option<std::path::PathBuf>) {
     let rt = runtime();
-    let mut st = rt.inner.lock().unwrap();
-    let Some(dir) = world_dir.or_else(|| st.world_dir.clone()) else {
-        return;
-    };
-    for (dim, store) in st.dimensions.iter_mut() {
-        for sec in store.sections.values_mut() {
-            if sec.dirty_save && sec.populated > 0 {
-                sec.dirty_save = false;
-                rt.io.request_save(dir.clone(), dim.clone(), sec.clone());
+    {
+        let mut st = rt.inner.lock().unwrap();
+        let Some(dir) = world_dir.or_else(|| st.world_dir.clone()) else {
+            return;
+        };
+        for (dim, store) in st.dimensions.iter_mut() {
+            for sec in store.sections.values_mut() {
+                if sec.dirty_save && sec.populated > 0 {
+                    sec.dirty_save = false;
+                    rt.io.request_save(dir.clone(), dim.clone(), sec.clone());
+                }
             }
         }
     }
+    rt.io.flush();
 }

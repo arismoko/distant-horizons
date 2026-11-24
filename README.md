@@ -18,7 +18,7 @@ primitives land.
 
 ## Differences from the original
 
-- **LOD storage format (`DHREG001`):** Stores LOD data in region-packed Zstd-compressed binary files (`16×16` sections per `.dhreg` file, CRC32-checked, copy-on-write append with automatic compaction) rather than Java Distant Horizons' `DistantHorizons.sqlite` database. Existing Java DH SQLite databases are not shared or read directly.
+- **LOD storage format (`DHREG002`):** Stores LOD data in region-packed Zstd-compressed binary files (`16×16` sections per `.dhreg` file, double-buffered CRC32-checksummed headers, copy-on-write append with streaming atomic compaction) rather than Java Distant Horizons' `DistantHorizons.sqlite` database. Existing Java DH SQLite databases are not shared or read directly.
 
 ## What works today
 
