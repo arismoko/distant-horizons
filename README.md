@@ -16,6 +16,10 @@ primitives land.
 | **Stage 3** | Pure general mod-API renderer in GLSL: delete both temporary `[[native.mixin]]` hooks (`render_needs`, `world_drawn`) so `sunrise-mod.toml` has zero `[native.*]` entries | **Not done** (blocked on `#4758`, `#1161`/`#5342`, and `#2005`) |
 | **Stage 4** | Native drawing under translated Iris/OptiFine shader packs (`dh_terrain`, `dh_water`, `dh_shadow`, auxiliary depth planes, and pack uniforms) | **Not done** (shader-pack binding design pending) |
 
+## Differences from the original
+
+- **LOD storage format (`DHREG001`):** Stores LOD data in region-packed Zstd-compressed binary files (`16×16` sections per `.dhreg` file, CRC32-checked, copy-on-write append with automatic compaction) rather than Java Distant Horizons' `DistantHorizons.sqlite` database. Existing Java DH SQLite databases are not shared or read directly.
+
 ## What works today
 
 - **LOD data & storage:** Multi-layer vertical column spans (overhangs, arches, caves, Nether ceilings) with cave culling, detail levels `0`–`6` (up to 512 chunks), background disk persistence (`DHLOD002` format with backward-compatible `DHLOD001` reads), and automatic quadtree parent mipmapping.
