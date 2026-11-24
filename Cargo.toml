@@ -14,6 +14,9 @@ default = []
 # Enable `#4758` `WorldRenderView<'a>` (`Camera` + 9 `RenderLevelStage` variants) hook wiring
 # once a Sunrise Dev SDK cut from `8bed1cbbd5` or newer is installed.
 sunrise-4758-world-view = []
+# Enable direct mod_api adapters for G1 (#5339), G2 (#5340), G3 (#5341), and G4 (#5347) once
+# those PRs land in a Sunrise Dev SDK.
+sunrise-gaps-g1-g4 = []
 
 [dependencies]
 sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }

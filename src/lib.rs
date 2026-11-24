@@ -15,6 +15,7 @@ pub mod api;
 pub mod colors;
 pub mod commands;
 pub mod config;
+pub mod data_pipeline;
 pub mod dh_v2;
 pub mod lod;
 pub mod mesh;
