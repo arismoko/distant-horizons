@@ -1,0 +1,13 @@
+[package]
+name = "distanthorizons"
+version = "3.3.5"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Distant Horizons level-of-detail terrain port for Sunrise"
+
+[lib]
+name = "distanthorizons"
+path = "src/lib.rs"
+
+[dependencies]
+sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }

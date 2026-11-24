@@ -1,0 +1,39 @@
+id = "distanthorizons"
+name = "Distant Horizons"
+version = "3.3.5"
+description = "Generates and renders simplified level-of-detail terrain beyond the normal view distance."
+authors = [
+    "James Seibel",
+    "Leonardo Amato",
+    "Cola",
+    "coolGi",
+    "Ran",
+    "Leetom",
+    "pshsh",
+    "Karnatour",
+    "arismoko",
+]
+license = "LGPL-3.0-or-later"
+homepage = "https://github.com/arismoko/distant-horizons"
+issues = "https://github.com/arismoko/distant-horizons/issues"
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+sunrise = "ebd2d226fbe2cf2783e4c3be5a86e385e3258f5e"
+
+[[native.mixin]]
+id = "render_needs"
+target = "sunrise_mod_render::render::render_needs"
+kind = "HEAD"
+helper = "src/mixins/render_needs.rs"
+bindings = [{ name = "needs", ty = "&mut RenderNeeds", value = "&mut *needs" }]
+
+[[native.mixin]]
+id = "world_drawn"
+target = "sunrise_mod_render::render::world_drawn"
+kind = "HEAD"
+helper = "src/mixins/world_drawn.rs"
+bindings = [{ name = "world", ty = "&mut WorldDrawn<'_>", value = "&mut *world" }]
