@@ -1,4 +1,5 @@
 fn world_drawn(world: &mut WorldDrawn<'_>) {
+    use distanthorizons::generic_render::{GenericGroupMesh, dh_view_proj_and_inverse};
     use distanthorizons::lod::SectionPos;
     use distanthorizons::mesh::{LodVertex, SectionMeshData};
     use distanthorizons::render_bridge::{
@@ -16,6 +17,17 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         fluid_indices: u32,
         min_y: f32,
         max_y: f32,
+        quad_count: u32,
+    }
+
+    struct GpuGenericGroup {
+        revision: u64,
+        solid_vb: Option<wgpu::Buffer>,
+        solid_ib: Option<wgpu::Buffer>,
+        solid_indices: u32,
+        trans_vb: Option<wgpu::Buffer>,
+        trans_ib: Option<wgpu::Buffer>,
+        trans_indices: u32,
         quad_count: u32,
     }
 
@@ -67,6 +79,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         comp_layout: wgpu::BindGroupLayout,
         comp_pipeline: wgpu::RenderPipeline,
         sections: HashMap<SectionPos, GpuSection>,
+        generic_groups: HashMap<String, GpuGenericGroup>,
         gpu_epoch: u64,
     }
 
@@ -300,7 +313,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         });
         let comp_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dh-composite-uniforms"),
-            size: 48,
+            size: 160,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -395,7 +408,73 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
             comp_layout,
             comp_pipeline,
             sections: HashMap::new(),
+            generic_groups: HashMap::new(),
             gpu_epoch,
+        }
+    }
+
+    fn upload_generic_group(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &GenericGroupMesh,
+    ) -> GpuGenericGroup {
+        let (solid_vb, solid_ib, solid_indices) = if !mesh.solid_indices.is_empty() {
+            let vb = create_buffer_with_bytes(
+                device,
+                queue,
+                "dh-gen-solid-vb",
+                wgpu::BufferUsages::VERTEX,
+                &mesh.solid_vertex_bytes,
+            );
+            let mut idx_bytes = Vec::with_capacity(mesh.solid_indices.len() * 4);
+            for &i in &mesh.solid_indices {
+                idx_bytes.extend_from_slice(&i.to_le_bytes());
+            }
+            let ib = create_buffer_with_bytes(
+                device,
+                queue,
+                "dh-gen-solid-ib",
+                wgpu::BufferUsages::INDEX,
+                &idx_bytes,
+            );
+            (Some(vb), Some(ib), mesh.solid_indices.len() as u32)
+        } else {
+            (None, None, 0)
+        };
+
+        let (trans_vb, trans_ib, trans_indices) = if !mesh.translucent_indices.is_empty() {
+            let vb = create_buffer_with_bytes(
+                device,
+                queue,
+                "dh-gen-trans-vb",
+                wgpu::BufferUsages::VERTEX,
+                &mesh.translucent_vertex_bytes,
+            );
+            let mut idx_bytes = Vec::with_capacity(mesh.translucent_indices.len() * 4);
+            for &i in &mesh.translucent_indices {
+                idx_bytes.extend_from_slice(&i.to_le_bytes());
+            }
+            let ib = create_buffer_with_bytes(
+                device,
+                queue,
+                "dh-gen-trans-ib",
+                wgpu::BufferUsages::INDEX,
+                &idx_bytes,
+            );
+            (Some(vb), Some(ib), mesh.translucent_indices.len() as u32)
+        } else {
+            (None, None, 0)
+        };
+
+        GpuGenericGroup {
+            revision: mesh.revision,
+            solid_vb,
+            solid_ib,
+            solid_indices,
+            trans_vb,
+            trans_ib,
+            trans_indices,
+            quad_count: mesh.quad_count,
         }
     }
 
@@ -472,7 +551,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
     }
 
     let cam = [world.camera.x, world.camera.y, world.camera.z];
-    let (params, uploads, epoch) = begin_render_frame(cam);
+    let (params, uploads, generic_uploads, epoch) = begin_render_frame(cam);
     if !params.enabled {
         record_frame_stats(0, 0);
         return;
@@ -500,20 +579,38 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
     }
     if state.gpu_epoch != epoch {
         state.sections.clear();
+        state.generic_groups.clear();
         state.gpu_epoch = epoch;
     }
 
-    // Upload newly meshed sections to GPU.
+    // Upload newly meshed sections and revised generic box groups to GPU.
     for mesh in &uploads {
         let gpu_sec = upload_mesh(world.device, world.queue, mesh);
         state.sections.insert(mesh.pos, gpu_sec);
+    }
+    for gmesh in &generic_uploads {
+        let same_rev = state
+            .generic_groups
+            .get(&gmesh.id)
+            .map(|g| g.revision == gmesh.revision)
+            .unwrap_or(false);
+        if !same_rev {
+            if gmesh.is_empty() {
+                state.generic_groups.remove(&gmesh.id);
+            } else {
+                let gpu_g = upload_generic_group(world.device, world.queue, gmesh);
+                state.generic_groups.insert(gmesh.id.clone(), gpu_g);
+            }
+        }
     }
 
     // Build frustum-culled draw list and per-section camera-relative instance offsets.
     let mat_cols = world.jittered.to_cols_array();
     let frustum_planes = extract_side_frustum_planes(mat_cols);
     let mut draw_list: Vec<SectionPos> = Vec::with_capacity(params.visible_sections.len());
-    let mut instance_bytes: Vec<u8> = Vec::with_capacity(params.visible_sections.len() * 16);
+    let mut generic_draw_ids: Vec<(String, u32)> = Vec::with_capacity(params.generic_active.len());
+    let mut instance_bytes: Vec<u8> =
+        Vec::with_capacity((params.visible_sections.len() + params.generic_active.len()) * 16);
     let mut total_quads: u64 = 0;
 
     for &pos in &params.visible_sections {
@@ -542,13 +639,33 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         draw_list.push(pos);
     }
 
-    if draw_list.is_empty() {
+    for (gid, origin) in &params.generic_active {
+        let Some(gpu_g) = state.generic_groups.get(gid) else {
+            continue;
+        };
+        if gpu_g.solid_indices == 0 && gpu_g.trans_indices == 0 {
+            continue;
+        }
+        let inst_idx = (draw_list.len() + generic_draw_ids.len()) as u32;
+        let rel_x = (origin[0] - world.camera.x) as f32;
+        let rel_y = (origin[1] - world.camera.y) as f32;
+        let rel_z = (origin[2] - world.camera.z) as f32;
+        instance_bytes.extend_from_slice(&rel_x.to_le_bytes());
+        instance_bytes.extend_from_slice(&rel_y.to_le_bytes());
+        instance_bytes.extend_from_slice(&rel_z.to_le_bytes());
+        instance_bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        total_quads += gpu_g.quad_count as u64;
+        generic_draw_ids.push((gid.clone(), inst_idx));
+    }
+
+    let total_instances = draw_list.len() + generic_draw_ids.len();
+    if total_instances == 0 {
         record_frame_stats(0, 0);
         return;
     }
 
-    if draw_list.len() > state.instance_cap {
-        let new_cap = draw_list.len().next_power_of_two();
+    if total_instances > state.instance_cap {
+        let new_cap = total_instances.next_power_of_two();
         state.instance_buf = world.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dh-section-instances"),
             size: (new_cap * 16) as u64,
@@ -593,7 +710,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         u32::from(params.config.shading_enabled),
         u32::from(params.config.noise_enabled),
         u32::from(params.config.fade_enabled),
-        u32::from(is_hdr),
+        params.config.debug_mode,
     ];
     for (i, v) in flags.iter().enumerate() {
         u_bytes[96 + i * 4..100 + i * 4].copy_from_slice(&v.to_le_bytes());
@@ -602,7 +719,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         .queue
         .write_buffer(&state.terrain_uniform_buf, 0, &u_bytes);
 
-    // Pass 1: Render Distant Horizons solid + translucent LOD terrain into offscreen targets.
+    // Pass 1: Render Distant Horizons solid + translucent LOD terrain and generic box groups.
     {
         let mut pass = world
             .encoder
@@ -636,54 +753,109 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         pass.set_bind_group(0, &state.terrain_bind_group, &[]);
         pass.set_vertex_buffer(1, state.instance_buf.slice(..));
 
-        // Opaque solid pass (front-to-back)
+        // Opaque solid pass (terrain front-to-back, then opaque generic groups e.g. beacon cores)
         pass.set_pipeline(&state.solid_pipeline);
         for (idx, pos) in draw_list.iter().enumerate() {
             let sec = &state.sections[pos];
-            if sec.solid_indices > 0 {
-                if let (Some(vb), Some(ib)) = (&sec.solid_vb, &sec.solid_ib) {
-                    pass.set_vertex_buffer(0, vb.slice(..));
-                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    let inst = idx as u32;
-                    pass.draw_indexed(0..sec.solid_indices, 0, inst..(inst + 1));
-                }
+            if sec.solid_indices > 0
+                && let (Some(vb), Some(ib)) = (&sec.solid_vb, &sec.solid_ib)
+            {
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                let inst = idx as u32;
+                pass.draw_indexed(0..sec.solid_indices, 0, inst..(inst + 1));
+            }
+        }
+        for (gid, inst) in &generic_draw_ids {
+            if let Some(g) = state.generic_groups.get(gid)
+                && g.solid_indices > 0
+                && let (Some(vb), Some(ib)) = (&g.solid_vb, &g.solid_ib)
+            {
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..g.solid_indices, 0, *inst..(*inst + 1));
             }
         }
 
-        // Translucent fluid pass (back-to-front over solid terrain depth)
+        // Translucent pass (fluid terrain back-to-front, then translucent generic groups e.g. clouds/beacon halos)
         pass.set_pipeline(&state.fluid_pipeline);
         for (idx, pos) in draw_list.iter().enumerate().rev() {
             let sec = &state.sections[pos];
-            if sec.fluid_indices > 0 {
-                if let (Some(vb), Some(ib)) = (&sec.fluid_vb, &sec.fluid_ib) {
-                    pass.set_vertex_buffer(0, vb.slice(..));
-                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    let inst = idx as u32;
-                    pass.draw_indexed(0..sec.fluid_indices, 0, inst..(inst + 1));
-                }
+            if sec.fluid_indices > 0
+                && let (Some(vb), Some(ib)) = (&sec.fluid_vb, &sec.fluid_ib)
+            {
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                let inst = idx as u32;
+                pass.draw_indexed(0..sec.fluid_indices, 0, inst..(inst + 1));
+            }
+        }
+        for (gid, inst) in &generic_draw_ids {
+            if let Some(g) = state.generic_groups.get(gid)
+                && g.trans_indices > 0
+                && let (Some(vb), Some(ib)) = (&g.trans_vb, &g.trans_ib)
+            {
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..g.trans_indices, 0, *inst..(*inst + 1));
             }
         }
     }
 
-    // Pass 2: Composite DH terrain + atmospheric horizon fog into vanilla's sky pixels.
+    // Pass 2: Composite DH terrain + spiral SSAO + far/height/environmental fog into vanilla's sky pixels.
+    let (_, inv_m_dh) = dh_view_proj_and_inverse(mat_cols, near_dh, dh_far);
     let fog_end = params.config.render_distance_blocks().max(256.0);
     let fog_start = (fog_end * 0.45).max(params.vanilla_far_blocks * 0.9);
-    let mut comp_bytes = [0u8; 48];
-    for (i, f) in params.fog_color.iter().enumerate() {
+    let debug_active = params.config.debug_mode != 0;
+    let ssao_samples = if debug_active {
+        0
+    } else {
+        params.config.ssao_sample_count()
+    };
+    let fog_on = u32::from(params.config.fog_enabled && !debug_active);
+
+    let mut comp_bytes = [0u8; 160];
+    for (i, f) in inv_m_dh.iter().enumerate() {
         comp_bytes[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
-    let comp_params = [near_dh, dh_far, fog_start, fog_end];
-    for (i, f) in comp_params.iter().enumerate() {
-        comp_bytes[16 + i * 4..20 + i * 4].copy_from_slice(&f.to_le_bytes());
+    for (i, f) in params.fog_color.iter().enumerate() {
+        comp_bytes[64 + i * 4..68 + i * 4].copy_from_slice(&f.to_le_bytes());
     }
-    let comp_flags = [
-        u32::from(params.config.fog_enabled),
-        u32::from(is_hdr),
-        0u32,
-        0u32,
+    let fog_params = [near_dh, dh_far, fog_start, fog_end];
+    for (i, f) in fog_params.iter().enumerate() {
+        comp_bytes[80 + i * 4..84 + i * 4].copy_from_slice(&f.to_le_bytes());
+    }
+    let height_and_env = [
+        world.camera.y as f32,
+        params.config.height_fog_base_height,
+        params.env_fog_start,
+        params.env_fog_end,
     ];
-    for (i, v) in comp_flags.iter().enumerate() {
-        comp_bytes[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    for (i, f) in height_and_env.iter().enumerate() {
+        comp_bytes[96 + i * 4..100 + i * 4].copy_from_slice(&f.to_le_bytes());
+    }
+    let ssao_fade = (params.config.render_distance_blocks() * 0.75).max(512.0);
+    let ssao_params = [14.0f32, params.config.ssao_strength, 0.08f32, ssao_fade];
+    for (i, f) in ssao_params.iter().enumerate() {
+        comp_bytes[112 + i * 4..116 + i * 4].copy_from_slice(&f.to_le_bytes());
+    }
+    let flags0 = [
+        fog_on,
+        u32::from(is_hdr),
+        params.config.fog_falloff,
+        u32::from(params.config.fog_spherical),
+    ];
+    for (i, v) in flags0.iter().enumerate() {
+        comp_bytes[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let flags1 = [
+        u32::from(params.config.height_fog_enabled && !debug_active),
+        params.config.height_fog_mix_mode,
+        ssao_samples,
+        if debug_active { 0 } else { params.fog_type },
+    ];
+    for (i, v) in flags1.iter().enumerate() {
+        comp_bytes[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     world
         .queue

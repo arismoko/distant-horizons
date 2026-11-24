@@ -4,9 +4,11 @@
 //! so every action works in single-player, LAN, and multiplayer without needing a server-side mod.
 
 use crate::config::{
-    DhConfig, KEY_CAVE_CULLING, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FADE_ENABLED,
-    KEY_FOG_ENABLED, KEY_HORIZONTAL_QUALITY, KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE,
-    KEY_VERTICAL_QUALITY, MOD_ID,
+    DEBUG_OFF, DEBUG_SHOW_DETAIL, DEBUG_SHOW_DETAIL_WIREFRAME, DEBUG_SHOW_GEN_MODE,
+    DEBUG_SHOW_LIGHTING, DhConfig, KEY_BEACON_BEAMS_ENABLED, KEY_CAVE_CULLING, KEY_CLOUDS_ENABLED,
+    KEY_DEBUG_MODE, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FADE_ENABLED, KEY_FOG_ENABLED,
+    KEY_HEIGHT_FOG_ENABLED, KEY_HORIZONTAL_QUALITY, KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE,
+    KEY_SSAO_ENABLED, KEY_SSAO_QUALITY, KEY_VERTICAL_QUALITY, MOD_ID,
 };
 use crate::render_bridge::{runtime, stats};
 use mod_api::{
@@ -108,7 +110,13 @@ pub fn register_client_commands(commands: &mut Vec<Command>) {
         commands.push(Command::new(&format!("{prefix} toggle")));
         commands.push(Command::new(&format!("{prefix} radius <chunks:integer>")));
         commands.push(Command::new(&format!("{prefix} quality <preset:word>")));
+        commands.push(Command::new(&format!("{prefix} preset <preset:word>")));
         commands.push(Command::new(&format!("{prefix} fog <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} heightfog <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} ssao <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} clouds <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} beacons <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} debug <mode:word>")));
         commands.push(Command::new(&format!("{prefix} gen <mode:word>")));
         commands.push(Command::new(&format!("{prefix} cavecull <mode:word>")));
         commands.push(Command::new(&format!("{prefix} clear")));
@@ -178,6 +186,101 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
                 ));
             }
         },
+        "preset" => match arg.map(str::to_ascii_lowercase).as_deref() {
+            Some("low") => {
+                apply_preset(
+                    host,
+                    64,
+                    0,
+                    0,
+                    0,
+                    false,
+                    "distanthorizons.setting.quality.low",
+                );
+            }
+            Some("medium" | "med") => {
+                apply_preset(
+                    host,
+                    128,
+                    1,
+                    1,
+                    1,
+                    true,
+                    "distanthorizons.setting.quality.medium",
+                );
+            }
+            Some("high") => {
+                apply_preset(
+                    host,
+                    256,
+                    2,
+                    2,
+                    1,
+                    true,
+                    "distanthorizons.setting.quality.high",
+                );
+            }
+            Some("extreme") => {
+                apply_preset(
+                    host,
+                    512,
+                    2,
+                    3,
+                    2,
+                    true,
+                    "distanthorizons.setting.quality.extreme",
+                );
+            }
+            _ => {
+                let _ = host.chat_line(Text::translate(
+                    "distanthorizons.command.usage_preset",
+                    Vec::new(),
+                ));
+            }
+        },
+        "ssao" => handle_bool_setting(host, KEY_SSAO_ENABLED, "ssao", arg),
+        "heightfog" => handle_bool_setting(host, KEY_HEIGHT_FOG_ENABLED, "heightfog", arg),
+        "clouds" => handle_bool_setting(host, KEY_CLOUDS_ENABLED, "clouds", arg),
+        "beacons" => handle_bool_setting(host, KEY_BEACON_BEAMS_ENABLED, "beacons", arg),
+        "debug" => {
+            let parsed = match arg.map(str::to_ascii_lowercase).as_deref() {
+                Some("off" | "none" | "0") => {
+                    Some((DEBUG_OFF, "distanthorizons.setting.debug.off"))
+                }
+                Some("detail" | "lod" | "1") => {
+                    Some((DEBUG_SHOW_DETAIL, "distanthorizons.setting.debug.detail"))
+                }
+                Some("gen" | "source" | "2") => Some((
+                    DEBUG_SHOW_GEN_MODE,
+                    "distanthorizons.setting.debug.gen_mode",
+                )),
+                Some("light" | "lighting" | "3") => Some((
+                    DEBUG_SHOW_LIGHTING,
+                    "distanthorizons.setting.debug.lighting",
+                )),
+                Some("wireframe" | "wire" | "4") => Some((
+                    DEBUG_SHOW_DETAIL_WIREFRAME,
+                    "distanthorizons.setting.debug.wireframe",
+                )),
+                _ => None,
+            };
+            match parsed {
+                Some((mode, label_key)) => {
+                    host.set_setting(MOD_ID, KEY_DEBUG_MODE, &mode.to_string());
+                    refresh_config(host);
+                    let _ = host.chat_line(Text::translate(
+                        "distanthorizons.command.debug_set",
+                        vec![Text::translate(label_key, Vec::new())],
+                    ));
+                }
+                None => {
+                    let _ = host.chat_line(Text::translate(
+                        "distanthorizons.command.usage_debug",
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
         "fog" => match parse_toggle_arg(arg) {
             Some(v) => {
                 host.set_setting(MOD_ID, KEY_FOG_ENABLED, if v { "true" } else { "false" });
@@ -364,6 +467,54 @@ fn set_quality(host: &mut dyn ClientHost, preset: u32) {
     let _ = host.chat_line(Text::translate(
         "distanthorizons.command.quality_set",
         vec![Text::translate(quality_label_key(preset), Vec::new())],
+    ));
+}
+
+fn handle_bool_setting(host: &mut dyn ClientHost, key: &str, label: &str, arg: Option<&str>) {
+    match parse_toggle_arg(arg) {
+        Some(v) => {
+            host.set_setting(MOD_ID, key, if v { "true" } else { "false" });
+            refresh_config(host);
+            let _ = host.chat_line(Text::translate(
+                if v {
+                    "distanthorizons.command.setting_on"
+                } else {
+                    "distanthorizons.command.setting_off"
+                },
+                vec![Text::literal(label)],
+            ));
+        }
+        None => {
+            let _ = host.chat_line(Text::translate(
+                "distanthorizons.command.usage_toggle",
+                vec![Text::literal(label)],
+            ));
+        }
+    }
+}
+
+fn apply_preset(
+    host: &mut dyn ClientHost,
+    radius: u32,
+    h_qual: u32,
+    v_qual: u32,
+    ssao_q: u32,
+    ssao_on: bool,
+    label_key: &str,
+) {
+    host.set_setting(MOD_ID, KEY_RENDER_DISTANCE, &radius.to_string());
+    host.set_setting(MOD_ID, KEY_HORIZONTAL_QUALITY, &h_qual.to_string());
+    host.set_setting(MOD_ID, KEY_VERTICAL_QUALITY, &v_qual.to_string());
+    host.set_setting(
+        MOD_ID,
+        KEY_SSAO_ENABLED,
+        if ssao_on { "true" } else { "false" },
+    );
+    host.set_setting(MOD_ID, KEY_SSAO_QUALITY, &ssao_q.to_string());
+    refresh_config(host);
+    let _ = host.chat_line(Text::translate(
+        "distanthorizons.command.preset_set",
+        vec![Text::translate(label_key, Vec::new())],
     ));
 }
 

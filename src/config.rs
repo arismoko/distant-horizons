@@ -18,6 +18,25 @@ pub const KEY_FADE_ENABLED: &str = "fade_enabled";
 pub const KEY_SHADING_ENABLED: &str = "shading_enabled";
 pub const KEY_BRIGHTNESS: &str = "brightness_multiplier";
 pub const KEY_SATURATION: &str = "saturation_multiplier";
+pub const KEY_SSAO_ENABLED: &str = "ssao_enabled";
+pub const KEY_SSAO_QUALITY: &str = "ssao_quality";
+pub const KEY_SSAO_STRENGTH: &str = "ssao_strength";
+pub const KEY_DISABLE_VANILLA_FOG: &str = "disable_vanilla_fog";
+pub const KEY_FOG_FALLOFF: &str = "fog_falloff";
+pub const KEY_FOG_SPHERICAL: &str = "fog_spherical";
+pub const KEY_HEIGHT_FOG_ENABLED: &str = "height_fog_enabled";
+pub const KEY_HEIGHT_FOG_BASE_HEIGHT: &str = "height_fog_base_height";
+pub const KEY_HEIGHT_FOG_MIX_MODE: &str = "height_fog_mix_mode";
+pub const KEY_CLOUDS_ENABLED: &str = "clouds_enabled";
+pub const KEY_BEACON_BEAMS_ENABLED: &str = "beacon_beams_enabled";
+pub const KEY_DEBUG_MODE: &str = "debug_mode";
+
+/// Debug visualization modes matching upstream `EDhApiDebugRendering`.
+pub const DEBUG_OFF: u32 = 0;
+pub const DEBUG_SHOW_DETAIL: u32 = 1;
+pub const DEBUG_SHOW_GEN_MODE: u32 = 2;
+pub const DEBUG_SHOW_LIGHTING: u32 = 3;
+pub const DEBUG_SHOW_DETAIL_WIREFRAME: u32 = 4;
 
 /// Runtime settings mirrored from Sunrise's mod settings UI (`Options > Mods > Distant Horizons`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,6 +60,22 @@ pub struct DhConfig {
     pub shading_enabled: bool,
     pub brightness_multiplier: f32,
     pub saturation_multiplier: f32,
+    pub ssao_enabled: bool,
+    /// 0 = Low (6 samples), 1 = Medium (12 samples), 2 = High (20 samples).
+    pub ssao_quality: u32,
+    pub ssao_strength: f32,
+    pub disable_vanilla_fog: bool,
+    /// 0 = Linear, 1 = Exponential, 2 = Exponential Squared.
+    pub fog_falloff: u32,
+    pub fog_spherical: bool,
+    pub height_fog_enabled: bool,
+    pub height_fog_base_height: f32,
+    /// 0 = Basic (far only), 1 = Max, 2 = Addition, 3 = Multiply, 4 = Inverse Multiply.
+    pub height_fog_mix_mode: u32,
+    pub clouds_enabled: bool,
+    pub beacon_beams_enabled: bool,
+    /// `DEBUG_OFF..=DEBUG_SHOW_DETAIL_WIREFRAME`.
+    pub debug_mode: u32,
 }
 
 impl Default for DhConfig {
@@ -62,6 +97,18 @@ impl Default for DhConfig {
             shading_enabled: true,
             brightness_multiplier: 1.0,
             saturation_multiplier: 1.0,
+            ssao_enabled: true,
+            ssao_quality: 1,
+            ssao_strength: 0.45,
+            disable_vanilla_fog: true,
+            fog_falloff: 2,
+            fog_spherical: false,
+            height_fog_enabled: true,
+            height_fog_base_height: 70.0,
+            height_fog_mix_mode: 4,
+            clouds_enabled: true,
+            beacon_beams_enabled: true,
+            debug_mode: DEBUG_OFF,
         }
     }
 }
@@ -69,6 +116,17 @@ impl Default for DhConfig {
 impl DhConfig {
     pub fn render_distance_blocks(self) -> f32 {
         (self.render_distance_chunks as f32) * 16.0
+    }
+
+    pub fn ssao_sample_count(self) -> u32 {
+        if !self.ssao_enabled {
+            return 0;
+        }
+        match self.ssao_quality {
+            0 => 6,
+            2 => 20,
+            _ => 12,
+        }
     }
 
     /// Maximum extra vertical spans retained per column beneath the primary surface.
@@ -225,6 +283,108 @@ impl DhConfig {
                 1.0,
             )
             .tooltip("distanthorizons.setting.saturation_multiplier.tooltip"),
+            SettingSpec::toggle(
+                KEY_SSAO_ENABLED,
+                "distanthorizons.setting.ssao_enabled",
+                true,
+            )
+            .tooltip("distanthorizons.setting.ssao_enabled.tooltip"),
+            SettingSpec::choice(
+                KEY_SSAO_QUALITY,
+                "distanthorizons.setting.ssao_quality",
+                [
+                    "distanthorizons.setting.quality.low",
+                    "distanthorizons.setting.quality.medium",
+                    "distanthorizons.setting.quality.high",
+                ],
+                1,
+            )
+            .tooltip("distanthorizons.setting.ssao_quality.tooltip"),
+            SettingSpec::range(
+                KEY_SSAO_STRENGTH,
+                "distanthorizons.setting.ssao_strength",
+                0.0,
+                1.0,
+                0.05,
+                0.45,
+            )
+            .tooltip("distanthorizons.setting.ssao_strength.tooltip"),
+            SettingSpec::toggle(
+                KEY_DISABLE_VANILLA_FOG,
+                "distanthorizons.setting.disable_vanilla_fog",
+                true,
+            )
+            .tooltip("distanthorizons.setting.disable_vanilla_fog.tooltip"),
+            SettingSpec::choice(
+                KEY_FOG_FALLOFF,
+                "distanthorizons.setting.fog_falloff",
+                [
+                    "distanthorizons.setting.fog_falloff.linear",
+                    "distanthorizons.setting.fog_falloff.exponential",
+                    "distanthorizons.setting.fog_falloff.exponential_squared",
+                ],
+                2,
+            )
+            .tooltip("distanthorizons.setting.fog_falloff.tooltip"),
+            SettingSpec::toggle(
+                KEY_FOG_SPHERICAL,
+                "distanthorizons.setting.fog_spherical",
+                false,
+            )
+            .tooltip("distanthorizons.setting.fog_spherical.tooltip"),
+            SettingSpec::toggle(
+                KEY_HEIGHT_FOG_ENABLED,
+                "distanthorizons.setting.height_fog_enabled",
+                true,
+            )
+            .tooltip("distanthorizons.setting.height_fog_enabled.tooltip"),
+            SettingSpec::range(
+                KEY_HEIGHT_FOG_BASE_HEIGHT,
+                "distanthorizons.setting.height_fog_base_height",
+                -64.0,
+                320.0,
+                4.0,
+                70.0,
+            )
+            .tooltip("distanthorizons.setting.height_fog_base_height.tooltip"),
+            SettingSpec::choice(
+                KEY_HEIGHT_FOG_MIX_MODE,
+                "distanthorizons.setting.height_fog_mix_mode",
+                [
+                    "distanthorizons.setting.height_fog_mix.basic",
+                    "distanthorizons.setting.height_fog_mix.max",
+                    "distanthorizons.setting.height_fog_mix.addition",
+                    "distanthorizons.setting.height_fog_mix.multiply",
+                    "distanthorizons.setting.height_fog_mix.inverse_multiply",
+                ],
+                4,
+            )
+            .tooltip("distanthorizons.setting.height_fog_mix_mode.tooltip"),
+            SettingSpec::toggle(
+                KEY_CLOUDS_ENABLED,
+                "distanthorizons.setting.clouds_enabled",
+                true,
+            )
+            .tooltip("distanthorizons.setting.clouds_enabled.tooltip"),
+            SettingSpec::toggle(
+                KEY_BEACON_BEAMS_ENABLED,
+                "distanthorizons.setting.beacon_beams_enabled",
+                true,
+            )
+            .tooltip("distanthorizons.setting.beacon_beams_enabled.tooltip"),
+            SettingSpec::choice(
+                KEY_DEBUG_MODE,
+                "distanthorizons.setting.debug_mode",
+                [
+                    "distanthorizons.setting.debug.off",
+                    "distanthorizons.setting.debug.detail",
+                    "distanthorizons.setting.debug.gen_mode",
+                    "distanthorizons.setting.debug.lighting",
+                    "distanthorizons.setting.debug.wireframe",
+                ],
+                0,
+            )
+            .tooltip("distanthorizons.setting.debug_mode.tooltip"),
         ];
         for spec in specs {
             let _ = registrar.register_setting(spec);
@@ -286,6 +446,44 @@ impl DhConfig {
                 .setting_f64(KEY_SATURATION)
                 .map(|v| (v as f32).clamp(0.0, 2.0))
                 .unwrap_or(def.saturation_multiplier),
+            ssao_enabled: host
+                .setting_bool(KEY_SSAO_ENABLED)
+                .unwrap_or(def.ssao_enabled),
+            ssao_quality: host
+                .setting_choice(KEY_SSAO_QUALITY)
+                .unwrap_or(def.ssao_quality),
+            ssao_strength: host
+                .setting_f64(KEY_SSAO_STRENGTH)
+                .map(|v| (v as f32).clamp(0.0, 1.0))
+                .unwrap_or(def.ssao_strength),
+            disable_vanilla_fog: host
+                .setting_bool(KEY_DISABLE_VANILLA_FOG)
+                .unwrap_or(def.disable_vanilla_fog),
+            fog_falloff: host
+                .setting_choice(KEY_FOG_FALLOFF)
+                .unwrap_or(def.fog_falloff),
+            fog_spherical: host
+                .setting_bool(KEY_FOG_SPHERICAL)
+                .unwrap_or(def.fog_spherical),
+            height_fog_enabled: host
+                .setting_bool(KEY_HEIGHT_FOG_ENABLED)
+                .unwrap_or(def.height_fog_enabled),
+            height_fog_base_height: host
+                .setting_f64(KEY_HEIGHT_FOG_BASE_HEIGHT)
+                .map(|v| (v as f32).clamp(-64.0, 320.0))
+                .unwrap_or(def.height_fog_base_height),
+            height_fog_mix_mode: host
+                .setting_choice(KEY_HEIGHT_FOG_MIX_MODE)
+                .unwrap_or(def.height_fog_mix_mode),
+            clouds_enabled: host
+                .setting_bool(KEY_CLOUDS_ENABLED)
+                .unwrap_or(def.clouds_enabled),
+            beacon_beams_enabled: host
+                .setting_bool(KEY_BEACON_BEAMS_ENABLED)
+                .unwrap_or(def.beacon_beams_enabled),
+            debug_mode: host
+                .setting_choice(KEY_DEBUG_MODE)
+                .unwrap_or(def.debug_mode),
         }
     }
 }

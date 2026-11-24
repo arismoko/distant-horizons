@@ -17,6 +17,8 @@ use crate::dh_v2::{
     DH_SECTION_MIN_DETAIL, DecodedDhV2Section, DhV2Error, DhV2FullDataDto, pack_dh_section_pos,
     unpack_dh_section_pos,
 };
+use crate::generic_render::build_box_group_mesh;
+pub use crate::generic_render::{BoxGroupShading, RenderableBox, RenderableBoxGroup};
 use crate::lod::{
     ExtraSpan, LodColumn, MAX_DETAIL, SECTION_CELLS, SECTION_SIZE, SOURCE_LOADED_CHUNK, SectionPos,
 };
@@ -37,6 +39,34 @@ pub const fn api_version() -> (u32, u32, u32) {
 /// Returns `true` when Distant Horizons LOD rendering is currently enabled.
 pub fn is_active() -> bool {
     runtime().enabled_flag.load(Ordering::Relaxed)
+}
+
+/// Register or update a named generic [`RenderableBoxGroup`] rendered in Distant Horizons'
+/// reversed-Z LOD pass for `dimension` (matches upstream `IDhApiCustomRenderRegister.add`).
+pub fn register_box_group(dimension: &str, group: RenderableBoxGroup) {
+    let mesh = build_box_group_mesh(&group);
+    let rt = runtime();
+    let mut st = rt.inner.lock().unwrap();
+    st.generic_groups
+        .entry(dimension.to_owned())
+        .or_default()
+        .insert(group.id.clone(), mesh);
+    st.generic_groups_revision = st.generic_groups_revision.wrapping_add(1);
+}
+
+/// Remove a previously registered generic [`RenderableBoxGroup`] from `dimension`.
+pub fn unregister_box_group(dimension: &str, group_id: &str) -> bool {
+    let rt = runtime();
+    let mut st = rt.inner.lock().unwrap();
+    let removed = st
+        .generic_groups
+        .get_mut(dimension)
+        .map(|m| m.remove(group_id).is_some())
+        .unwrap_or(false);
+    if removed {
+        st.generic_groups_revision = st.generic_groups_revision.wrapping_add(1);
+    }
+    removed
 }
 
 /// Default build minimum Y for standard Minecraft dimensions when a caller does not know the

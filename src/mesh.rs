@@ -29,11 +29,44 @@ impl LodVertex {
         is_fluid: bool,
         material_id: u8,
     ) -> u32 {
+        Self::pack_meta_ext(
+            normal_idx,
+            sky_light,
+            block_light,
+            is_fluid,
+            material_id,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_meta_ext(
+        normal_idx: u32,
+        sky_light: u8,
+        block_light: u8,
+        is_fluid: bool,
+        material_id: u8,
+        detail: u8,
+        source: u8,
+        is_generic: bool,
+        unshaded: bool,
+        skip_clip_dist: bool,
+    ) -> u32 {
         (normal_idx & 0x7)
             | (((sky_light as u32) & 0xF) << 4)
             | (((block_light as u32) & 0xF) << 8)
             | ((is_fluid as u32) << 12)
             | (((material_id as u32) & 0xF) << 13)
+            | (((detail as u32) & 0x7) << 17)
+            | (((source as u32) & 0x3) << 20)
+            | ((is_generic as u32) << 22)
+            | ((unshaded as u32) << 23)
+            | ((skip_clip_dist as u32) << 24)
     }
 
     #[inline]
@@ -102,12 +135,14 @@ struct TopKey {
     y: i16,
     rgba: [u8; 4],
     material_id: u8,
+    source: u8,
 }
 
 /// Build an optimized solid + translucent fluid mesh for `section`.
 /// Positions are local to `section.pos.block_origin()` in X/Z and absolute in Y.
 pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMeshData {
     let cell = section.pos.cell_size() as f32;
+    let detail = section.pos.detail;
     let mut solid = MeshBuilder::with_capacity(512);
     let mut fluid = MeshBuilder::with_capacity(128);
     let mut min_y = f32::INFINITY;
@@ -129,6 +164,7 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                 y: col.solid_top_y,
                 rgba: col.solid_rgba,
                 material_id: col.material_id,
+                source: col.source,
             };
             let mut w = 1usize;
             while gx + w < SECTION_SIZE {
@@ -141,6 +177,7 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                     || ncol.solid_top_y != key.y
                     || ncol.solid_rgba != key.rgba
                     || ncol.material_id != key.material_id
+                    || ncol.source != key.source
                 {
                     break;
                 }
@@ -158,6 +195,7 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                         || ncol.solid_top_y != key.y
                         || ncol.solid_rgba != key.rgba
                         || ncol.material_id != key.material_id
+                        || ncol.source != key.source
                     {
                         break 'grow_z;
                     }
@@ -179,12 +217,17 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             max_y = max_y.max(y);
 
             let color = LodVertex::pack_rgba(key.rgba[0], key.rgba[1], key.rgba[2], 255);
-            let meta = LodVertex::pack_meta(
+            let meta = LodVertex::pack_meta_ext(
                 1,
                 LodColumn::sky_light(key.rgba),
                 LodColumn::block_light(key.rgba),
                 false,
                 key.material_id,
+                detail,
+                key.source,
+                false,
+                false,
+                false,
             );
             // CCW outward (+Y)
             solid.push_quad(
@@ -211,6 +254,7 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                 y: col.fluid_top_y,
                 rgba: col.fluid_rgba,
                 material_id: crate::colors::DH_BLOCK_WATER,
+                source: col.source,
             };
             let mut w = 1usize;
             while gx + w < SECTION_SIZE {
@@ -255,12 +299,17 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             max_y = max_y.max(y);
 
             let color = LodVertex::pack_rgba(key.rgba[0], key.rgba[1], key.rgba[2], 196);
-            let meta = LodVertex::pack_meta(
+            let meta = LodVertex::pack_meta_ext(
                 1,
                 LodColumn::sky_light(key.rgba),
                 LodColumn::block_light(key.rgba),
                 true,
                 key.material_id,
+                detail,
+                key.source,
+                false,
+                false,
+                false,
             );
             fluid.push_quad(
                 [[x0, y, z0], [x0, y, z1], [x1, y, z1], [x1, y, z0]],
@@ -300,7 +349,18 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             if top > north_y {
                 let y0 = north_y as f32;
                 min_y = min_y.min(y0);
-                let meta = LodVertex::pack_meta(2, sky, blk, false, col.material_id);
+                let meta = LodVertex::pack_meta_ext(
+                    2,
+                    sky,
+                    blk,
+                    false,
+                    col.material_id,
+                    detail,
+                    col.source,
+                    false,
+                    false,
+                    false,
+                );
                 solid.push_quad(
                     [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
                     color,
@@ -317,7 +377,18 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             if top > south_y {
                 let y0 = south_y as f32;
                 min_y = min_y.min(y0);
-                let meta = LodVertex::pack_meta(3, sky, blk, false, col.material_id);
+                let meta = LodVertex::pack_meta_ext(
+                    3,
+                    sky,
+                    blk,
+                    false,
+                    col.material_id,
+                    detail,
+                    col.source,
+                    false,
+                    false,
+                    false,
+                );
                 solid.push_quad(
                     [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
                     color,
@@ -334,7 +405,18 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             if top > west_y {
                 let y0 = west_y as f32;
                 min_y = min_y.min(y0);
-                let meta = LodVertex::pack_meta(4, sky, blk, false, col.material_id);
+                let meta = LodVertex::pack_meta_ext(
+                    4,
+                    sky,
+                    blk,
+                    false,
+                    col.material_id,
+                    detail,
+                    col.source,
+                    false,
+                    false,
+                    false,
+                );
                 solid.push_quad(
                     [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]],
                     color,
@@ -351,7 +433,18 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             if top > east_y {
                 let y0 = east_y as f32;
                 min_y = min_y.min(y0);
-                let meta = LodVertex::pack_meta(5, sky, blk, false, col.material_id);
+                let meta = LodVertex::pack_meta_ext(
+                    5,
+                    sky,
+                    blk,
+                    false,
+                    col.material_id,
+                    detail,
+                    col.source,
+                    false,
+                    false,
+                    false,
+                );
                 solid.push_quad(
                     [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]],
                     color,
@@ -367,7 +460,18 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             {
                 let y_bot = col.solid_bottom_y as f32;
                 min_y = min_y.min(y_bot);
-                let meta = LodVertex::pack_meta(0, sky, blk, false, col.material_id);
+                let meta = LodVertex::pack_meta_ext(
+                    0,
+                    sky,
+                    blk,
+                    false,
+                    col.material_id,
+                    detail,
+                    col.source,
+                    false,
+                    false,
+                    false,
+                );
                 solid.push_quad(
                     [
                         [x0, y_bot, z1],
@@ -417,7 +521,19 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                 };
 
                 // Top (+Y, normal 1)
-                let top_meta = LodVertex::pack_meta(1, sky, blk, span.is_fluid, span.material_id);
+                let col_src = section.get(gx, gz).source;
+                let top_meta = LodVertex::pack_meta_ext(
+                    1,
+                    sky,
+                    blk,
+                    span.is_fluid,
+                    span.material_id,
+                    detail,
+                    col_src,
+                    false,
+                    false,
+                    false,
+                );
                 target.push_quad(
                     [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
                     color,
@@ -429,7 +545,18 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                     && let Some(next_below) = spans.get(si + 1)
                     && span.bottom_y > next_below.top_y
                 {
-                    let bot_meta = LodVertex::pack_meta(0, sky, blk, false, span.material_id);
+                    let bot_meta = LodVertex::pack_meta_ext(
+                        0,
+                        sky,
+                        blk,
+                        false,
+                        span.material_id,
+                        detail,
+                        col_src,
+                        false,
+                        false,
+                        false,
+                    );
                     target.push_quad(
                         [[x0, y0, z1], [x0, y0, z0], [x1, y0, z0], [x1, y0, z1]],
                         color,
@@ -475,8 +602,18 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                             false
                         };
                         if !covered {
-                            let meta =
-                                LodVertex::pack_meta(normal, sky, blk, false, span.material_id);
+                            let meta = LodVertex::pack_meta_ext(
+                                normal,
+                                sky,
+                                blk,
+                                false,
+                                span.material_id,
+                                detail,
+                                col_src,
+                                false,
+                                false,
+                                false,
+                            );
                             target.push_quad(quad, color, meta);
                         }
                     }

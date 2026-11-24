@@ -16,6 +16,7 @@ pub mod colors;
 pub mod commands;
 pub mod config;
 pub mod dh_v2;
+pub mod generic_render;
 pub mod lod;
 pub mod mesh;
 pub mod network;
@@ -30,6 +31,10 @@ use crate::colors::{
 };
 use crate::commands::DhKeybinds;
 use crate::config::{DhConfig, MOD_ID};
+use crate::generic_render::{
+    BeaconBeam, GROUP_ID_BEACONS, GROUP_ID_CLOUDS, blend_beacon_tint, build_box_group_mesh,
+    stained_glass_tint,
+};
 use crate::lod::{
     DimensionLodStore, LodColumn, SECTION_SIZE, SOURCE_DISTANT_SURFACE, SOURCE_LOADED_CHUNK,
     SectionPos,
@@ -226,6 +231,53 @@ impl Hooks for DistantHorizonsMod {
             }
 
             let active_dim = st.active_dimension.clone();
+            if st.has_camera {
+                let cam_pos = st.camera_pos;
+                let v_far = st.vanilla_far_blocks;
+                let dh_far = cfg.render_distance_blocks().max(256.0);
+                let elapsed = st.start_instant.elapsed().as_secs_f64();
+                let rain = st.rain_level;
+
+                // Update procedural 3D LOD clouds (drifts smoothly every tick; only re-meshes on cell/config change).
+                let (cloud_group, cloud_origin) =
+                    st.cloud_field
+                        .update(&active_dim, cam_pos, v_far, cfg, rain, elapsed);
+                if let Some(group) = cloud_group {
+                    let mesh = build_box_group_mesh(&group);
+                    st.generic_groups
+                        .entry(active_dim.clone())
+                        .or_default()
+                        .insert(GROUP_ID_CLOUDS.to_owned(), mesh);
+                    st.generic_groups_revision = st.generic_groups_revision.wrapping_add(1);
+                } else if let Some(existing) = st
+                    .generic_groups
+                    .get_mut(&active_dim)
+                    .and_then(|m| m.get_mut(GROUP_ID_CLOUDS))
+                {
+                    existing.origin = cloud_origin;
+                }
+
+                // Update distant beacon beams (only rebuilds when beacons, origin grid, or render distance change).
+                let beacon_group = st
+                    .beacons
+                    .entry(active_dim.clone())
+                    .or_default()
+                    .maybe_build_group(
+                        cam_pos,
+                        v_far,
+                        dh_far,
+                        cfg.enabled && cfg.beacon_beams_enabled,
+                    );
+                if let Some(group) = beacon_group {
+                    let mesh = build_box_group_mesh(&group);
+                    st.generic_groups
+                        .entry(active_dim.clone())
+                        .or_default()
+                        .insert(GROUP_ID_BEACONS.to_owned(), mesh);
+                    st.generic_groups_revision = st.generic_groups_revision.wrapping_add(1);
+                }
+            }
+
             if cfg.enabled && st.has_camera {
                 if let Some(provider) = st.remote_providers.get(&active_dim).cloned() {
                     let desired = DimensionLodStore::desired_sections_coarse_to_fine(
@@ -281,13 +333,24 @@ impl Hooks for DistantHorizonsMod {
         let rt = runtime();
         let mut st = rt.inner.lock().unwrap();
         st.fog_color = event.fog.color;
+        st.fog_type = match event.fog_type {
+            FogType::Atmospheric => 0,
+            FogType::Water => 1,
+            FogType::Lava => 2,
+            FogType::PowderSnow => 3,
+        };
+        st.env_fog_start = event.fog.environmental_start;
+        st.env_fog_end = event.fog.environmental_end;
         if event.fog.render_distance_end.is_finite() && event.fog.render_distance_end > 16.0 {
             st.vanilla_far_blocks = event.fog.render_distance_end;
         }
         // Push vanilla's atmospheric render-distance fog out past vanilla's clip so the horizon
-        // reveals Distant Horizons LOD terrain (DH applies its own atmospheric horizon fog in the
+        // reveals Distant Horizons LOD terrain (DH applies its own atmospheric/height fog in the
         // composite pass). Underwater/lava/powder-snow fog stays vanilla-exact.
-        if st.config.enabled && event.fog_type == FogType::Atmospheric {
+        if st.config.enabled
+            && st.config.disable_vanilla_fog
+            && event.fog_type == FogType::Atmospheric
+        {
             let dh_far = st.config.render_distance_blocks().max(512.0);
             event.fog.render_distance_start = event.fog.render_distance_start.max(dh_far * 0.75);
             event.fog.render_distance_end = event.fog.render_distance_end.max(dh_far);
@@ -516,6 +579,8 @@ fn sample_loaded_chunks(
         chunk_biomes.push(grid);
     }
 
+    let mut chunk_beacons: Vec<Vec<BeaconBeam>> = vec![Vec::new(); chunks.len()];
+
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
     let store = st.dimensions.entry(dim.to_owned()).or_default();
@@ -542,12 +607,17 @@ fn sample_loaded_chunks(
 
         let mut fluid_top: Option<i32> = None;
         let mut solid_top: Option<(i32, &str)> = None;
+        let mut beacon_y: Option<i32> = None;
+        let mut beacon_tint: Option<[u8; 3]> = None;
 
-        // Scan top-down through the sampled band.
+        // Scan top-down through the sampled band for surface + any sky-visible beacon & stained glass tint.
         for offset in (0..span).rev() {
             let pal_idx = col_blocks[offset] as usize;
             let block_id = palette_ids.get(pal_idx).copied().unwrap_or("minecraft:air");
             let y = base_y - (LOADED_SCAN_BELOW as i32) + (offset as i32) + 1;
+            if block_id == "minecraft:beacon" {
+                beacon_y = Some(y);
+            }
             if is_water_block(block_id) {
                 if fluid_top.is_none() {
                     fluid_top = Some(y);
@@ -557,8 +627,33 @@ fn sample_loaded_chunks(
             if is_skippable_for_lod(block_id) {
                 continue;
             }
-            solid_top = Some((y, block_id));
-            break;
+            if solid_top.is_none() {
+                solid_top = Some((y, block_id));
+                if beacon_y.is_some() {
+                    break;
+                }
+            }
+        }
+
+        if let Some(by) = beacon_y {
+            // Walk bottom-up above the beacon to apply vanilla stained-glass tint averaging.
+            for (offset, &pal_u16) in col_blocks.iter().enumerate() {
+                let y = base_y - (LOADED_SCAN_BELOW as i32) + (offset as i32) + 1;
+                if y <= by {
+                    continue;
+                }
+                let pal_idx = pal_u16 as usize;
+                let block_id = palette_ids.get(pal_idx).copied().unwrap_or("minecraft:air");
+                if let Some(glass_rgb) = stained_glass_tint(block_id) {
+                    beacon_tint = Some(blend_beacon_tint(beacon_tint, glass_rgb));
+                }
+            }
+            if let Some(list) = chunk_beacons.get_mut(ci) {
+                list.push(BeaconBeam {
+                    pos: [bx, by, bz],
+                    color: beacon_tint.unwrap_or([255, 255, 255]),
+                });
+            }
         }
 
         let (top_y, block_id) = match solid_top {
@@ -587,6 +682,13 @@ fn sample_loaded_chunks(
         let (lx, lz) = sec_pos.local_cell(bx, bz);
         if store.get_or_create_mut(sec_pos).set_cell(lx, lz, lod_col) {
             dirty_sections.insert(sec_pos);
+        }
+    }
+
+    let tracker = st.beacons.entry(dim.to_owned()).or_default();
+    for (ci, &chunk) in chunks.iter().enumerate() {
+        if let Some(found) = chunk_beacons.get(ci) {
+            tracker.replace_chunk_beacons(chunk, found);
         }
     }
 }
