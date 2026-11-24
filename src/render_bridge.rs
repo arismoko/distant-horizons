@@ -37,7 +37,7 @@ var<uniform> u_frame: FrameUniforms;
 struct VsIn {
     @location(0) local_pos: vec3<f32>,
     @location(1) color_packed: u32,
-    @location(2) meta: u32,
+    @location(2) packed_meta: u32,
     // Per-section instance attribute: [origin_x - cam_x, -cam_y, origin_z - cam_z, cell_size]
     @location(3) section_offset: vec4<f32>,
 };
@@ -47,7 +47,7 @@ struct VsOut {
     @location(0) color: vec4<f32>,
     @location(1) rel_pos: vec3<f32>,
     @location(2) block_pos: vec3<f32>,
-    @location(3) @interpolate(flat) meta: u32,
+    @location(3) @interpolate(flat) packed_meta: u32,
 };
 
 fn unpack_rgba(c: u32) -> vec4<f32> {
@@ -80,9 +80,9 @@ fn vs_main(v: VsIn) -> VsOut {
     clip.z = (near_dh * far_dh - near_dh * clip.w) / max(far_dh - near_dh, 1.0);
 
     let base = unpack_rgba(v.color_packed);
-    let normal_idx = v.meta & 0x7u;
-    let sky_light = f32((v.meta >> 4u) & 0xFu) / 15.0;
-    let block_light = f32((v.meta >> 8u) & 0xFu) / 15.0;
+    let normal_idx = v.packed_meta & 0x7u;
+    let sky_light = f32((v.packed_meta >> 4u) & 0xFu) / 15.0;
+    let block_light = f32((v.packed_meta >> 8u) & 0xFu) / 15.0;
     let sun = u_frame.clip_and_light.w;
     let light = clamp(max(sky_light * sun, block_light) * 0.90 + 0.10, 0.08, 1.0);
 
@@ -98,7 +98,7 @@ fn vs_main(v: VsIn) -> VsOut {
     out.color = vec4<f32>(clamp(base.rgb * light * shade, vec3<f32>(0.0), vec3<f32>(1.0)), base.a);
     out.rel_pos = rel;
     out.block_pos = v.local_pos;
-    out.meta = v.meta;
+    out.packed_meta = v.packed_meta;
     return out;
 }
 
@@ -137,7 +137,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     var rgb = in.color.rgb;
-    let is_fluid = (in.meta >> 12u) & 1u;
+    let is_fluid = (in.packed_meta >> 12u) & 1u;
     if (u_frame.flags.y != 0u && is_fluid == 0u) {
         let intensity = u_frame.noise_and_fog.x;
         let lum = (rgb.r + rgb.g + rgb.b) / 3.0;
