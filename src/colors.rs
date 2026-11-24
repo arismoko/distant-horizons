@@ -1,5 +1,152 @@
 //! Vanilla 26.3 block and biome surface color palette for Distant Horizons LOD columns.
 
+/// Iris / Distant Horizons standard material IDs (`StandardMacros.java:81-96`).
+///
+/// Exposed to translated Iris/OptiFine shader packs via `DH_BLOCK_*` preprocessor defines and
+/// vertex attribute `dhMaterialId`.
+pub const DH_BLOCK_UNKNOWN: u8 = 0;
+pub const DH_BLOCK_LEAVES: u8 = 1;
+pub const DH_BLOCK_STONE: u8 = 2;
+pub const DH_BLOCK_WOOD: u8 = 3;
+pub const DH_BLOCK_METAL: u8 = 4;
+pub const DH_BLOCK_DIRT: u8 = 5;
+pub const DH_BLOCK_LAVA: u8 = 6;
+pub const DH_BLOCK_DEEPSLATE: u8 = 7;
+pub const DH_BLOCK_SNOW: u8 = 8;
+pub const DH_BLOCK_SAND: u8 = 9;
+pub const DH_BLOCK_TERRACOTTA: u8 = 10;
+pub const DH_BLOCK_NETHER_STONE: u8 = 11;
+pub const DH_BLOCK_WATER: u8 = 12;
+pub const DH_BLOCK_GRASS: u8 = 13;
+pub const DH_BLOCK_AIR: u8 = 14;
+pub const DH_BLOCK_ILLUMINATED: u8 = 15;
+
+/// Classify a block ID into its 4-bit Iris/DH `dhMaterialId` (`0..=15`).
+pub fn classify_dh_material(block_id: &str) -> u8 {
+    let name = strip_mc_namespace(block_id);
+    if matches!(name, "air" | "cave_air" | "void_air") {
+        return DH_BLOCK_AIR;
+    }
+    if matches!(name, "water" | "bubble_column") {
+        return DH_BLOCK_WATER;
+    }
+    if matches!(name, "lava" | "magma_block") {
+        return DH_BLOCK_LAVA;
+    }
+    if matches!(
+        name,
+        "glowstone"
+            | "sea_lantern"
+            | "shroomlight"
+            | "ochre_froglight"
+            | "verdant_froglight"
+            | "pearlescent_froglight"
+            | "jack_o_lantern"
+            | "redstone_lamp"
+            | "lantern"
+            | "soul_lantern"
+            | "beacon"
+            | "end_rod"
+            | "crying_obsidian"
+            | "respawn_anchor"
+    ) || name.contains("torch")
+        || name.contains("campfire")
+        || name.contains("copper_bulb")
+    {
+        return DH_BLOCK_ILLUMINATED;
+    }
+    if matches!(
+        name,
+        "grass_block" | "moss_block" | "moss_carpet" | "mycelium" | "podzol" | "warped_nylium"
+    ) || name.contains("grass")
+    {
+        return DH_BLOCK_GRASS;
+    }
+    if name.contains("leaves") || matches!(name, "azalea" | "flowering_azalea" | "mangrove_roots") {
+        return DH_BLOCK_LEAVES;
+    }
+    if name.contains("snow") || matches!(name, "powder_snow") {
+        return DH_BLOCK_SNOW;
+    }
+    if name.contains("sand") || matches!(name, "gravel" | "suspicious_sand" | "suspicious_gravel") {
+        return DH_BLOCK_SAND;
+    }
+    if name.contains("terracotta") || name.contains("concrete") || name.contains("clay") {
+        return DH_BLOCK_TERRACOTTA;
+    }
+    if name.contains("deepslate") || matches!(name, "tuff" | "blackstone" | "gilded_blackstone") {
+        return DH_BLOCK_DEEPSLATE;
+    }
+    if matches!(
+        name,
+        "netherrack"
+            | "crimson_nylium"
+            | "nether_bricks"
+            | "red_nether_bricks"
+            | "cracked_nether_bricks"
+            | "chiseled_nether_bricks"
+            | "basalt"
+            | "polished_basalt"
+            | "smooth_basalt"
+            | "soul_soil"
+            | "nether_quartz_ore"
+            | "nether_gold_ore"
+            | "ancient_debris"
+    ) {
+        return DH_BLOCK_NETHER_STONE;
+    }
+    if matches!(
+        name,
+        "dirt"
+            | "coarse_dirt"
+            | "rooted_dirt"
+            | "dirt_path"
+            | "farmland"
+            | "mud"
+            | "packed_mud"
+            | "muddy_mangrove_roots"
+    ) {
+        return DH_BLOCK_DIRT;
+    }
+    if name.contains("log")
+        || name.contains("wood")
+        || name.contains("planks")
+        || name.contains("stem")
+        || name.contains("hyphae")
+        || name.contains("bamboo")
+        || matches!(
+            name,
+            "bookshelf" | "crafting_table" | "barrel" | "chest" | "oak_fence" | "note_block"
+        )
+    {
+        return DH_BLOCK_WOOD;
+    }
+    if name.contains("iron")
+        || name.contains("gold")
+        || name.contains("copper")
+        || name.contains("netherite")
+        || matches!(name, "anvil" | "chipped_anvil" | "damaged_anvil" | "chain")
+    {
+        return DH_BLOCK_METAL;
+    }
+    if name.contains("stone")
+        || name.contains("cobble")
+        || name.contains("granite")
+        || name.contains("diorite")
+        || name.contains("andesite")
+        || name.contains("calcite")
+        || name.contains("dripstone")
+        || name.contains("prismarine")
+        || name.contains("quartz")
+        || name.contains("brick")
+        || name.contains("ore")
+        || matches!(name, "bedrock" | "obsidian" | "end_stone" | "purpur_block")
+    {
+        return DH_BLOCK_STONE;
+    }
+    DH_BLOCK_UNKNOWN
+}
+
 /// True for air and sparse non-solid plants/decorations that an LOD column should look through
 /// to pick the terrain block underneath.
 pub fn is_skippable_for_lod(block_id: &str) -> bool {
@@ -319,5 +466,38 @@ mod tests {
         assert!(is_skippable_for_lod("minecraft:short_grass"));
         assert!(!is_skippable_for_lod("minecraft:oak_leaves"));
         assert!(is_water_block("minecraft:water"));
+        assert_eq!(
+            classify_dh_material("minecraft:grass_block"),
+            DH_BLOCK_GRASS
+        );
+        assert_eq!(
+            classify_dh_material("minecraft:oak_leaves"),
+            DH_BLOCK_LEAVES
+        );
+        assert_eq!(classify_dh_material("minecraft:stone"), DH_BLOCK_STONE);
+        assert_eq!(
+            classify_dh_material("minecraft:deepslate"),
+            DH_BLOCK_DEEPSLATE
+        );
+        assert_eq!(classify_dh_material("minecraft:water"), DH_BLOCK_WATER);
+        assert_eq!(classify_dh_material("minecraft:lava"), DH_BLOCK_LAVA);
+        assert_eq!(
+            classify_dh_material("minecraft:glowstone"),
+            DH_BLOCK_ILLUMINATED
+        );
+        assert_eq!(
+            classify_dh_material("minecraft:netherrack"),
+            DH_BLOCK_NETHER_STONE
+        );
+        assert_eq!(classify_dh_material("minecraft:snow_block"), DH_BLOCK_SNOW);
+        assert_eq!(classify_dh_material("minecraft:sand"), DH_BLOCK_SAND);
+        assert_eq!(
+            classify_dh_material("minecraft:red_terracotta"),
+            DH_BLOCK_TERRACOTTA
+        );
+        assert_eq!(classify_dh_material("minecraft:oak_log"), DH_BLOCK_WOOD);
+        assert_eq!(classify_dh_material("minecraft:iron_block"), DH_BLOCK_METAL);
+        assert_eq!(classify_dh_material("minecraft:dirt"), DH_BLOCK_DIRT);
+        assert_eq!(classify_dh_material("minecraft:air"), DH_BLOCK_AIR);
     }
 }

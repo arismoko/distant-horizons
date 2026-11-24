@@ -20,10 +20,13 @@ pub mod lod;
 pub mod mesh;
 pub mod network;
 pub mod render_bridge;
+pub mod shader_pack;
 pub mod storage;
 
 use crate::api::{LodGenRequest, LodGenStep, LodSectionPos, ingest_gen_output};
-use crate::colors::{biome_water_color, block_color, is_skippable_for_lod, is_water_block};
+use crate::colors::{
+    biome_water_color, block_color, classify_dh_material, is_skippable_for_lod, is_water_block,
+};
 use crate::commands::DhKeybinds;
 use crate::config::{DhConfig, MOD_ID};
 use crate::lod::{
@@ -209,10 +212,7 @@ impl Hooks for DistantHorizonsMod {
             if let Some(camera) = cam {
                 st.camera_pos = camera.position;
                 st.has_camera = true;
-                let opts_far = (st.vanilla_render_distance_chunks as f32) * 16.0;
-                if st.vanilla_far_blocks <= 16.0 {
-                    st.vanilla_far_blocks = opts_far;
-                }
+                st.vanilla_far_blocks = (st.vanilla_render_distance_chunks as f32) * 16.0;
             }
             if let Some(clk) = clock {
                 st.sun_brightness = sun_brightness_from_day_time_and_weather(
@@ -578,7 +578,8 @@ fn sample_loaded_chunks(
             15,
             0,
             SOURCE_LOADED_CHUNK,
-        );
+        )
+        .with_material(classify_dh_material(block_id));
 
         let sec_pos = SectionPos::from_block(0, bx, bz);
         let (lx, lz) = sec_pos.local_cell(bx, bz);
@@ -726,7 +727,8 @@ fn sample_distant_sections(
                 15,
                 0,
                 SOURCE_DISTANT_SURFACE,
-            );
+            )
+            .with_material(classify_dh_material(block_id));
             if sec.set_cell(cx, cz, lod_col) {
                 updated_any = true;
             }

@@ -21,6 +21,7 @@ out vec4 vertexColor;
 out vec3 relPos;
 out vec3 blockPos;
 flat out uint packedMeta;
+flat out int dhMaterialId;
 
 float dirShade(uint normalIdx) {
     if (normalIdx == 0u) return 0.50;
@@ -60,4 +61,5 @@ void main() {
     relPos = rel;
     blockPos = Position;
     packedMeta = PackedMeta;
+    dhMaterialId = int((PackedMeta >> 13u) & 15u);
 }

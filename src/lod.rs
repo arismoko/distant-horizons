@@ -143,7 +143,8 @@ pub struct LodColumn {
     pub fluid_rgba: [u8; 4],
     /// `SOURCE_EMPTY`, `SOURCE_DISTANT_SURFACE`, or `SOURCE_LOADED_CHUNK`.
     pub source: u8,
-    pub _pad: u8,
+    /// Iris / Distant Horizons 4-bit material ID (`DH_BLOCK_*`, `0..=15`) for solid terrain.
+    pub material_id: u8,
 }
 
 impl Default for LodColumn {
@@ -160,7 +161,7 @@ impl LodColumn {
         fluid_top_y: EMPTY_Y,
         fluid_rgba: [0, 0, 0, 0xF0],
         source: SOURCE_EMPTY,
-        _pad: 0,
+        material_id: 0,
     };
 
     pub const fn is_empty(self) -> bool {
@@ -212,8 +213,14 @@ impl LodColumn {
             fluid_top_y: fluid_top,
             fluid_rgba: [fluid_rgb[0], fluid_rgb[1], fluid_rgb[2], light],
             source,
-            _pad: 0,
+            material_id: 0,
         }
+    }
+
+    #[inline]
+    pub const fn with_material(mut self, material_id: u8) -> Self {
+        self.material_id = material_id & 0x0F;
+        self
     }
 
     pub fn to_bytes(self) -> [u8; 16] {
@@ -224,7 +231,7 @@ impl LodColumn {
         out[8..10].copy_from_slice(&self.fluid_top_y.to_le_bytes());
         out[10..14].copy_from_slice(&self.fluid_rgba);
         out[14] = self.source;
-        out[15] = 0;
+        out[15] = self.material_id & 0x0F;
         out
     }
 
@@ -236,7 +243,7 @@ impl LodColumn {
             fluid_top_y: i16::from_le_bytes([b[8], b[9]]),
             fluid_rgba: [b[10], b[11], b[12], b[13]],
             source: b[14],
-            _pad: 0,
+            material_id: b[15] & 0x0F,
         }
     }
 }
@@ -253,6 +260,8 @@ pub struct ExtraSpan {
     pub rgba: [u8; 4],
     /// `true` for translucent fluids (water/lava surface layers), `false` for solid blocks.
     pub is_fluid: bool,
+    /// Iris / Distant Horizons 4-bit material ID (`DH_BLOCK_*`, `0..=15`).
+    pub material_id: u8,
 }
 
 impl ExtraSpan {
@@ -278,7 +287,18 @@ impl ExtraSpan {
                 LodColumn::pack_light(sky_light, block_light),
             ],
             is_fluid,
+            material_id: if is_fluid {
+                crate::colors::DH_BLOCK_WATER
+            } else {
+                crate::colors::DH_BLOCK_UNKNOWN
+            },
         }
+    }
+
+    #[inline]
+    pub const fn with_material(mut self, material_id: u8) -> Self {
+        self.material_id = material_id & 0x0F;
+        self
     }
 
     pub fn to_bytes(self) -> [u8; Self::SERIALIZED_LEN] {
@@ -286,7 +306,7 @@ impl ExtraSpan {
         out[0..2].copy_from_slice(&self.top_y.to_le_bytes());
         out[2..4].copy_from_slice(&self.bottom_y.to_le_bytes());
         out[4..8].copy_from_slice(&self.rgba);
-        out[8] = u8::from(self.is_fluid);
+        out[8] = u8::from(self.is_fluid) | ((self.material_id & 0x0F) << 4);
         out
     }
 
@@ -295,7 +315,8 @@ impl ExtraSpan {
             top_y: i16::from_le_bytes([b[0], b[1]]),
             bottom_y: i16::from_le_bytes([b[2], b[3]]),
             rgba: [b[4], b[5], b[6], b[7]],
-            is_fluid: b[8] != 0,
+            is_fluid: (b[8] & 0x01) != 0,
+            material_id: (b[8] >> 4) & 0x0F,
         }
     }
 }
@@ -309,6 +330,7 @@ pub struct ColumnSample {
     pub sky_light: u8,
     pub block_light: u8,
     pub is_fluid: bool,
+    pub material_id: u8,
 }
 
 /// Extract a primary [`LodColumn`] plus up to `max_extra_spans` lower [`ExtraSpan`] layers from
@@ -348,14 +370,17 @@ pub fn extract_column_spans(
                 break;
             }
         }
-        raw_spans.push(ExtraSpan::new(
-            top_y,
-            bottom_y,
-            head.rgb,
-            head.sky_light,
-            head.block_light,
-            head.is_fluid,
-        ));
+        raw_spans.push(
+            ExtraSpan::new(
+                top_y,
+                bottom_y,
+                head.rgb,
+                head.sky_light,
+                head.block_light,
+                head.is_fluid,
+            )
+            .with_material(head.material_id),
+        );
         i = j;
     }
 
@@ -401,6 +426,7 @@ pub fn extract_column_spans(
                 LodColumn::block_light(solid.rgba),
                 source,
             )
+            .with_material(solid.material_id)
         }
         (None, Some(fluid)) => LodColumn::from_solid_and_fluid(
             fluid.bottom_y as i32,
@@ -411,7 +437,8 @@ pub fn extract_column_spans(
             LodColumn::sky_light(fluid.rgba),
             LodColumn::block_light(fluid.rgba),
             source,
-        ),
+        )
+        .with_material(fluid.material_id),
         (None, None) => LodColumn::EMPTY,
     };
 
@@ -588,6 +615,8 @@ pub fn downsample_quad(samples: [LodColumn; 4]) -> LodColumn {
     let mut sky_max = 0u8;
     let mut blk_max = 0u8;
     let mut best_source = SOURCE_EMPTY;
+    let mut mat_counts = [0u8; 16];
+    let mut mat_top_y = [EMPTY_Y; 16];
 
     let mut fluid_count = 0i32;
     let mut fluid_top_max = EMPTY_Y;
@@ -609,6 +638,9 @@ pub fn downsample_quad(samples: [LodColumn; 4]) -> LodColumn {
             b_sum += col.solid_rgba[2] as u32;
             sky_max = sky_max.max(LodColumn::sky_light(col.solid_rgba));
             blk_max = blk_max.max(LodColumn::block_light(col.solid_rgba));
+            let m = (col.material_id & 0x0F) as usize;
+            mat_counts[m] += 1;
+            mat_top_y[m] = mat_top_y[m].max(col.solid_top_y);
         }
         if col.has_fluid() {
             fluid_count += 1;
@@ -621,6 +653,18 @@ pub fn downsample_quad(samples: [LodColumn; 4]) -> LodColumn {
 
     if solid_count == 0 && fluid_count == 0 {
         return LodColumn::EMPTY;
+    }
+
+    let mut dominant_mat = 0u8;
+    let mut best_count = 0u8;
+    let mut best_y = EMPTY_Y;
+    for m in 0..16 {
+        let c = mat_counts[m];
+        if c > best_count || (c == best_count && c > 0 && mat_top_y[m] > best_y) {
+            best_count = c;
+            best_y = mat_top_y[m];
+            dominant_mat = m as u8;
+        }
     }
 
     let light = LodColumn::pack_light(sky_max, blk_max);
@@ -662,7 +706,7 @@ pub fn downsample_quad(samples: [LodColumn; 4]) -> LodColumn {
         fluid_top_y,
         fluid_rgba,
         source: best_source,
-        _pad: 0,
+        material_id: dominant_mat,
     }
 }
 
@@ -1021,6 +1065,7 @@ mod tests {
                 sky_light: 15,
                 block_light: 0,
                 is_fluid: false,
+                material_id: crate::colors::DH_BLOCK_STONE,
             });
         }
         for y in (64..=69).rev() {
@@ -1030,6 +1075,7 @@ mod tests {
                 sky_light: 8,
                 block_light: 0,
                 is_fluid: false,
+                material_id: crate::colors::DH_BLOCK_GRASS,
             });
         }
         for y in (20..=25).rev() {
@@ -1039,6 +1085,7 @@ mod tests {
                 sky_light: 0,
                 block_light: 4,
                 is_fluid: false,
+                material_id: crate::colors::DH_BLOCK_DEEPSLATE,
             });
         }
 
@@ -1046,13 +1093,19 @@ mod tests {
         let (col, extra) = extract_column_spans(&samples, SOURCE_LOADED_CHUNK, 4, true, 60, false);
         assert_eq!(col.solid_top_y, 105);
         assert_eq!(col.solid_bottom_y, 100);
+        assert_eq!(col.material_id, crate::colors::DH_BLOCK_STONE);
         assert_eq!(extra.len(), 1);
         assert_eq!((extra[0].top_y, extra[0].bottom_y), (70, 64));
+        assert_eq!(extra[0].material_id, crate::colors::DH_BLOCK_GRASS);
 
         // Nether ceiling mode ignores cave culling so deep cavern floors stay visible.
         let (_, nether_extra) =
             extract_column_spans(&samples, SOURCE_LOADED_CHUNK, 4, true, 60, true);
         assert_eq!(nether_extra.len(), 2);
         assert_eq!((nether_extra[1].top_y, nether_extra[1].bottom_y), (26, 20));
+        assert_eq!(
+            nether_extra[1].material_id,
+            crate::colors::DH_BLOCK_DEEPSLATE
+        );
     }
 }
