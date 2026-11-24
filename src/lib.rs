@@ -17,6 +17,7 @@ pub mod config;
 pub mod dh_v2;
 pub mod lod;
 pub mod mesh;
+pub mod network;
 pub mod render_bridge;
 pub mod storage;
 
@@ -59,6 +60,7 @@ struct DistantHorizonsMod;
 impl Hooks for DistantHorizonsMod {
     fn register(&self, registrar: &mut dyn Registrar, _cx: &RegistrationContext) {
         DhConfig::register_settings(registrar);
+        network::register_payloads(registrar);
     }
 
     fn register_debug_entries(
@@ -187,6 +189,8 @@ impl Hooks for DistantHorizonsMod {
             for pos in positions {
                 provider.request_section(&dim, LodSectionPos::from(pos), 0);
             }
+        } else {
+            network::poll_remote_sections(host);
         }
     }
 
