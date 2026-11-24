@@ -36,15 +36,17 @@ use crate::lod::{
     SectionPos,
 };
 use crate::render_bridge::{runtime, stats, sun_brightness_from_day_time_and_weather};
+#[cfg(not(feature = "sunrise-gaps-g1-g4"))]
+use mod_api::MAX_TERRAIN_COLUMNS;
 use mod_api::client::fog::FogType;
 use mod_api::{
     self, BlockChangedEvent, ChunkLoadEvent, ClientBlockChangedEvent, ClientChunkLoadEvent,
     ClientChunkUnloadEvent, ClientHost, ClientLevelLoadEvent, ClientLevelUnloadEvent,
     ClientSetupContext, ClientSetupEvent, ClientTickPreEvent, CommandEvent, DebugEntry, DebugGroup,
     Flow, Heightmap, Hooks, HostSide, LevelDimension, LevelHost, LevelLoadEvent,
-    LevelTickPostEvent, LevelUnloadEvent, MAX_TERRAIN_COLUMNS, RegisterClientCommandsEvent,
-    RegisterDebugEntriesEvent, Registrar, RegistrationContext, RenderFogEvent, ServerHost,
-    ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
+    LevelTickPostEvent, LevelUnloadEvent, RegisterClientCommandsEvent, RegisterDebugEntriesEvent,
+    Registrar, RegistrationContext, RenderFogEvent, ServerHost, ServerStartedEvent,
+    ServerStoppingEvent, SettingChangedEvent,
 };
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -58,8 +60,8 @@ const LOADED_SCAN_ABOVE: u32 = 2;
 /// Number of loaded chunks sampled per server tick when time remains.
 const CHUNKS_PER_TICK: usize = 4;
 
-/// Number of distant surface columns sampled per server tick (capped well under 4096 so ticks
-/// stay responsive even on software setups).
+/// Number of distant surface columns sampled per server tick in the legacy (pre-G4) path.
+#[cfg(not(feature = "sunrise-gaps-g1-g4"))]
 const DISTANT_COLS_PER_TICK: usize = 1024;
 
 #[derive(Default)]
@@ -468,12 +470,9 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     if distant_on && host.server_has_time() && dim == active_dim {
         let center = cam.unwrap_or([0.0, 64.0, 0.0]);
         #[cfg(feature = "sunrise-gaps-g1-g4")]
-        let used_offthread = tick_offthread_gap_pipeline(host, dim, center, cfg);
+        let _ = tick_offthread_gap_pipeline(host, dim, center, cfg);
         #[cfg(not(feature = "sunrise-gaps-g1-g4"))]
-        let used_offthread = false;
-        if !used_offthread {
-            sample_distant_sections(host, dim, center, cfg, &mut dirty_sections);
-        }
+        sample_distant_sections(host, dim, center, cfg, &mut dirty_sections);
     }
 
     // 3. Propagate dirty sections up the quadtree, queue meshing, and persist dirty sections.
@@ -641,6 +640,7 @@ fn sample_loaded_chunks(
     }
 }
 
+#[cfg(not(feature = "sunrise-gaps-g1-g4"))]
 fn sample_distant_sections(
     host: &dyn ServerHost,
     dim: &str,
