@@ -17,10 +17,11 @@ use crate::render_bridge::runtime;
 use crate::storage::{decode_section, encode_section};
 use mod_api::{
     ClientHost, HandlerThread, IPayloadContext, IPayloadHandler, PayloadBytes, PayloadHandleError,
-    PayloadId, Registrar,
+    PayloadId, PlayerRef, Registrar, ServerHost,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -152,6 +153,96 @@ pub fn server_storage_subdir(server_key: &str, dimension: &str) -> String {
             .collect()
     };
     format!("{}__{}", clean(server_key), clean(dimension))
+}
+
+/// Derive a collision-free, path-traversal-safe local disk cache root for a remote multiplayer
+/// server (`<instance_dir>/distant_horizons_remote/<percent-encoded server_key>`).
+pub fn remote_cache_root(instance_dir: &Path, server_key: &str) -> PathBuf {
+    let mut slug = String::with_capacity(server_key.len());
+    for b in server_key.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            slug.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut slug, "%{b:02X}");
+        }
+    }
+    if slug.is_empty() {
+        slug.push_str("remote");
+    }
+    instance_dir.join("distant_horizons_remote").join(slug)
+}
+
+/// Pending column changes for one detail-0 section to broadcast to remote DH clients.
+#[derive(Clone, Debug, Default)]
+pub struct SectionColumnDelta {
+    pub revision: u64,
+    pub columns: Vec<(u8, u8, LodColumn)>,
+}
+
+/// Broadcast incremental LOD column deltas from a published server (LAN host or dedicated server)
+/// to remote players currently in `dim` whose connections negotiated `distanthorizons:lod_sync`.
+pub fn broadcast_partial_updates(
+    host: &mut dyn ServerHost,
+    dim: &str,
+    deltas: &HashMap<SectionPos, SectionColumnDelta>,
+) -> u32 {
+    if deltas.is_empty() || !host.server_is_published() {
+        return 0;
+    }
+    {
+        let st = runtime().inner.lock().unwrap();
+        if st.disabled_builtin_net.contains(dim) {
+            return 0;
+        }
+    }
+
+    let dim_id = mod_api::Identifier::parse(dim).ok();
+    let targets: Vec<PlayerRef> = host
+        .players()
+        .server_players()
+        .into_iter()
+        .filter(|&p| {
+            !p.is_singleplayer_owner(host) && dim_id.is_some() && p.dimension(host) == dim_id
+        })
+        .collect();
+    if targets.is_empty() {
+        return 0;
+    }
+
+    let channel = lod_sync_channel_id();
+    let now = Instant::now();
+    let mut sent = 0u32;
+
+    for (&pos, delta) in deltas {
+        for chunk in delta.columns.chunks(MAX_PARTIAL_COLUMNS) {
+            let upd = PartialColumnUpdate {
+                dimension: dim.to_owned(),
+                pos,
+                revision: delta.revision,
+                columns: chunk.to_vec(),
+            };
+            let Some(wire) = encode_partial_update(&upd) else {
+                continue;
+            };
+            let allowed: Vec<PlayerRef> = {
+                let mut lim = rate_limiter().lock().unwrap();
+                targets
+                    .iter()
+                    .copied()
+                    .filter(|p| lim.allow_bytes(&format!("{p:?}"), wire.len(), now))
+                    .collect()
+            };
+            if !allowed.is_empty() {
+                sent = sent.saturating_add(host.players_send_payload(
+                    &allowed,
+                    &channel,
+                    PayloadBytes(wire),
+                ));
+            }
+        }
+    }
+    sent
 }
 
 /// Encode a `SessionConfig` handshake packet (`server -> client`).
@@ -459,6 +550,21 @@ pub fn poll_remote_sections(host: &mut dyn ClientHost) {
             st.camera_pos[2],
             st.config,
         );
+        // Trigger local disk cache loads for unseen remote sections first.
+        if let Some(cache_dir) = st.remote_cache_dir.clone() {
+            let store = st.dimensions.entry(dim.clone()).or_default();
+            let mut loads = 0usize;
+            for &pos in &desired {
+                if store.disk_checked.insert(pos) {
+                    rt.io.request_load(cache_dir.clone(), dim.clone(), pos);
+                    loads += 1;
+                    if loads >= 8 {
+                        break;
+                    }
+                }
+            }
+        }
+
         let mut batch = Vec::with_capacity(MAX_REQUESTS_PER_TICK);
         for pos in desired {
             let existing_rev = st
@@ -466,17 +572,15 @@ pub fn poll_remote_sections(host: &mut dyn ClientHost) {
                 .get(&dim)
                 .and_then(|d| d.sections.get(&pos))
                 .filter(|s| s.populated > 0)
-                .map(|s| s.revision);
-            if existing_rev.is_some() {
-                continue;
-            }
+                .map(|s| s.revision)
+                .unwrap_or(0);
             if st
                 .remote_requested
                 .entry(dim.clone())
                 .or_default()
                 .insert(pos)
             {
-                batch.push((dim.clone(), pos, 0));
+                batch.push((dim.clone(), pos, existing_rev));
                 if batch.len() >= MAX_REQUESTS_PER_TICK {
                     break;
                 }
@@ -587,6 +691,7 @@ fn ingest_partial_update(update: PartialColumnUpdate) {
     let dim = update.dimension;
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
+    let cache_dir = st.remote_cache_dir.clone();
     let max_extra = st.config.max_extra_spans();
     let store = st.dimensions.entry(dim.clone()).or_default();
     let sec = store.get_or_create_mut(pos);
@@ -611,6 +716,10 @@ fn ingest_partial_update(update: PartialColumnUpdate) {
         {
             s.dirty_mesh = false;
             rt.mesher.submit(dim.clone(), s.clone());
+            if let Some(ref dir) = cache_dir {
+                s.dirty_save = false;
+                rt.io.request_save(dir.clone(), dim.clone(), s.clone());
+            }
         }
     }
 }
@@ -622,6 +731,7 @@ fn ingest_remote_section(dim: &str, section: LodSection) {
     let pos = section.pos;
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
+    let cache_dir = st.remote_cache_dir.clone();
     let max_extra = st.config.max_extra_spans();
     let store = st.dimensions.entry(dim.to_owned()).or_default();
     store.sections.insert(pos, section);
@@ -637,6 +747,10 @@ fn ingest_remote_section(dim: &str, section: LodSection) {
         {
             sec.dirty_mesh = false;
             rt.mesher.submit(dim.to_owned(), sec.clone());
+            if let Some(ref dir) = cache_dir {
+                sec.dirty_save = false;
+                rt.io.request_save(dir.clone(), dim.to_owned(), sec.clone());
+            }
         }
     }
 }
@@ -735,5 +849,9 @@ mod tests {
             server_storage_subdir("play.example.com:25565", "minecraft:the_nether"),
             "play_example_com_25565__minecraft_the_nether"
         );
+        let root_a = remote_cache_root(Path::new("/inst"), "a:b");
+        let root_b = remote_cache_root(Path::new("/inst"), "a_b");
+        assert_ne!(root_a, root_b);
+        assert!(!root_a.to_string_lossy().contains(".."));
     }
 }

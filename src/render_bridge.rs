@@ -234,6 +234,8 @@ struct CompositeUniforms {
     flags0: vec4<u32>,
     // [height_fog_enabled, height_fog_mix_mode, ssao_samples, fog_type]
     flags1: vec4<u32>,
+    // [cas_amount, 0.0, 0.0, 0.0]
+    sharpen_and_pad: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -379,6 +381,38 @@ fn mix_height_fog(far_f: f32, height_f: f32, mode: u32) -> f32 {
     }
 }
 
+fn fetch_dh_masked(sp: vec2<i32>, dims: vec2<i32>, fallback: vec3<f32>) -> vec3<f32> {
+    let c = clamp(sp, vec2<i32>(0), dims - vec2<i32>(1));
+    if (textureLoad(t_dh_depth, c, 0) <= 0.0) {
+        return fallback;
+    }
+    return textureLoad(t_dh_color, c, 0).rgb;
+}
+
+fn apply_cas(px: vec2<i32>, dims: vec2<i32>, e: vec3<f32>, amount: f32) -> vec3<f32> {
+    if (amount <= 0.001) {
+        return e;
+    }
+    let a = fetch_dh_masked(px + vec2<i32>(-1, -1), dims, e);
+    let b = fetch_dh_masked(px + vec2<i32>( 0, -1), dims, e);
+    let c = fetch_dh_masked(px + vec2<i32>( 1, -1), dims, e);
+    let d = fetch_dh_masked(px + vec2<i32>(-1,  0), dims, e);
+    let f = fetch_dh_masked(px + vec2<i32>( 1,  0), dims, e);
+    let g = fetch_dh_masked(px + vec2<i32>(-1,  1), dims, e);
+    let h = fetch_dh_masked(px + vec2<i32>( 0,  1), dims, e);
+    let i = fetch_dh_masked(px + vec2<i32>( 1,  1), dims, e);
+
+    let mn_rgb = min(min(min(d, e), min(f, b)), h) + min(min(min(a, g), c), i);
+    let mx_rgb = max(max(max(d, e), max(f, b)), h) + max(max(max(a, g), c), i);
+
+    let rcp_mx = vec3<f32>(1.0) / max(mx_rgb, vec3<f32>(1e-4));
+    let amp = inverseSqrt(max(clamp(min(mn_rgb, vec3<f32>(2.0) - mx_rgb) * rcp_mx, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1e-4)));
+    let peak = 8.0 - 3.0 * clamp(amount, 0.0, 1.0);
+    let w_rgb = vec3<f32>(-1.0) / (amp * peak);
+    let rcp_w = vec3<f32>(1.0) / max(vec3<f32>(1.0) + 4.0 * w_rgb, vec3<f32>(1e-4));
+    return clamp(((b + d + f + h) * w_rgb + e) * rcp_w, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let dh_dims = textureDimensions(t_dh_color);
@@ -403,6 +437,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     var col = textureLoad(t_dh_color, px, 0).rgb;
+    col = apply_cas(px, i_dh_dims, col, u_comp.sharpen_and_pad.x);
 
     let near_dh = u_comp.fog_params.x;
     let far_dh = u_comp.fog_params.y;
@@ -538,6 +573,10 @@ pub struct DhState {
     pub remote_session_config: Option<SessionConfig>,
     /// Whether `MSG_SESSION_CONFIG_REQUEST` has been sent for the current remote session.
     pub remote_config_requested: bool,
+    /// Per-server local disk cache root when connected to a remote multiplayer server.
+    pub remote_cache_dir: Option<PathBuf>,
+    /// Round-robin cursor across connected players for dedicated/LAN server distant generation.
+    pub server_player_round_robin: usize,
     /// Generic box groups (beacons, clouds, and third-party mod groups) per dimension.
     pub generic_groups: HashMap<String, HashMap<String, GenericGroupMesh>>,
     pub generic_groups_revision: u64,
@@ -584,6 +623,8 @@ impl Default for DhState {
             remote_requested: HashMap::new(),
             remote_session_config: None,
             remote_config_requested: false,
+            remote_cache_dir: None,
+            server_player_round_robin: 0,
             generic_groups: HashMap::new(),
             generic_groups_revision: 0,
             last_uploaded_generic_revision: 0,

@@ -46,12 +46,12 @@ use mod_api::{
     self, BlockChangedEvent, ChunkLoadEvent, ClientBlockChangedEvent, ClientChunkLoadEvent,
     ClientChunkUnloadEvent, ClientHost, ClientLevelLoadEvent, ClientLevelUnloadEvent,
     ClientReloadHost, ClientSetupContext, ClientSetupEvent, ClientTickPreEvent, CommandEvent,
-    DebugEntry, DebugGroup, Flow, Heightmap, Hooks, HostSide, LevelDimension, LevelHost,
+    DebugEntry, DebugGroup, EntityRef, Flow, Heightmap, Hooks, HostSide, LevelDimension, LevelHost,
     LevelLoadEvent, LevelTickPostEvent, LevelUnloadEvent, MAX_TERRAIN_COLUMNS,
     RegisterClientCommandsEvent, RegisterDebugEntriesEvent, Registrar, RegistrationContext,
     RenderFogEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
@@ -138,9 +138,18 @@ impl Hooks for DistantHorizonsMod {
 
     fn client_level_load(&self, host: &mut dyn ClientHost, event: &mut ClientLevelLoadEvent<'_>) {
         sync_client_config(host);
+        let remote_cache = host
+            .client_session()
+            .client_server()
+            .filter(|s| !s.integrated_local)
+            .map(|s| {
+                let key = s.address.or(s.name).unwrap_or("remote");
+                network::remote_cache_root(&host.instance_dir(), key)
+            });
         let rt = runtime();
         let mut st = rt.inner.lock().unwrap();
         st.active_dimension = event.dimension.to_owned();
+        st.remote_cache_dir = remote_cache;
         st.client_loaded_chunks.clear();
         st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
         // Re-submit any already-known sections in this dimension to the mesher so the GPU cache
@@ -159,14 +168,19 @@ impl Hooks for DistantHorizonsMod {
         _host: &mut dyn ClientHost,
         event: &mut ClientLevelUnloadEvent<'_>,
     ) {
-        let rt = runtime();
-        let mut st = rt.inner.lock().unwrap();
-        st.remote_requested.remove(event.dimension);
-        st.remote_session_config = None;
-        st.remote_config_requested = false;
-        st.client_loaded_chunks.clear();
-        if st.active_dimension == event.dimension {
-            st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
+        let remote_cache = {
+            let mut st = runtime().inner.lock().unwrap();
+            st.remote_requested.remove(event.dimension);
+            st.remote_session_config = None;
+            st.remote_config_requested = false;
+            st.client_loaded_chunks.clear();
+            if st.active_dimension == event.dimension {
+                st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
+            }
+            st.remote_cache_dir.take()
+        };
+        if let Some(dir) = remote_cache {
+            flush_dimension_dirty(Some(dir), event.dimension);
         }
     }
 
@@ -477,14 +491,24 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     };
 
     let mut dirty_sections: HashSet<SectionPos> = HashSet::new();
+    let collect_deltas = host.server_is_published();
+    let mut partial_deltas: HashMap<SectionPos, network::SectionColumnDelta> = HashMap::new();
     if !chunks_to_sample.is_empty() {
-        sample_loaded_chunks(host, dim, &chunks_to_sample, &mut dirty_sections);
+        partial_deltas = sample_loaded_chunks(
+            host,
+            dim,
+            &chunks_to_sample,
+            &mut dirty_sections,
+            collect_deltas,
+        );
     }
 
-    // 2. If time remains and distant generation is on, sample distant terrain around the camera
-    //    using `terrain_surface` and schedule disk loads for any previously saved sections.
-    let (distant_on, cam, cfg, active_dim) = {
-        let st = rt.inner.lock().unwrap();
+    // 2. If time remains and distant generation is on, sample distant terrain around connected
+    //    players in `dim` (round-robin, supporting dedicated & LAN servers) or the local camera.
+    let (distant_on, cam, cfg, active_dim, rr_cursor) = {
+        let mut st = rt.inner.lock().unwrap();
+        let rr = st.server_player_round_robin;
+        st.server_player_round_robin = rr.wrapping_add(1);
         (
             st.config.enabled && st.config.distant_generation,
             if st.has_camera {
@@ -494,12 +518,29 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             },
             st.config,
             st.active_dimension.clone(),
+            rr,
         )
     };
 
-    if distant_on && host.server_has_time() && dim == active_dim {
-        let center = cam.unwrap_or([0.0, 64.0, 0.0]);
-        sample_distant_sections(host, dim, center, cfg, &mut dirty_sections);
+    if distant_on && host.server_has_time() {
+        let dim_id = mod_api::Identifier::parse(dim).ok();
+        let player_centers: Vec<[f64; 3]> = host
+            .players()
+            .server_players()
+            .into_iter()
+            .filter(|&p| dim_id.is_some() && p.dimension(host) == dim_id)
+            .filter_map(|p| EntityRef::from(p).position(host))
+            .collect();
+        let center_opt = if !player_centers.is_empty() {
+            Some(player_centers[rr_cursor % player_centers.len()])
+        } else if dim == active_dim {
+            cam
+        } else {
+            None
+        };
+        if let Some(center) = center_opt {
+            sample_distant_sections(host, dim, center, cfg, &mut dirty_sections);
+        }
     }
 
     // 3. Propagate dirty sections up the quadtree, queue meshing, and persist dirty sections.
@@ -529,6 +570,12 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             }
         }
     }
+
+    // 4. On published LAN/dedicated servers, stream incremental column deltas to connected remote
+    //    DH clients in this dimension.
+    if !partial_deltas.is_empty() {
+        let _ = network::broadcast_partial_updates(host, dim, &partial_deltas);
+    }
 }
 
 fn sample_loaded_chunks(
@@ -536,7 +583,9 @@ fn sample_loaded_chunks(
     dim: &str,
     chunks: &[[i32; 2]],
     dirty_sections: &mut HashSet<SectionPos>,
-) {
+    collect_deltas: bool,
+) -> HashMap<SectionPos, network::SectionColumnDelta> {
+    let mut deltas: HashMap<SectionPos, network::SectionColumnDelta> = HashMap::new();
     let level_ref = host.level(dim);
     let mut columns = Vec::with_capacity(chunks.len() * 256);
     for &[cx, cz] in chunks {
@@ -554,12 +603,12 @@ fn sample_loaded_chunks(
         Heightmap::WorldSurface,
         (LOADED_SCAN_BELOW, LOADED_SCAN_ABOVE),
     ) else {
-        return;
+        return deltas;
     };
 
     let span = (LOADED_SCAN_BELOW + LOADED_SCAN_ABOVE) as usize;
     if span == 0 || read.bases.len() != columns.len() {
-        return;
+        return deltas;
     }
 
     // Resolve palette block IDs once per batch.
@@ -693,8 +742,14 @@ fn sample_loaded_chunks(
 
         let sec_pos = SectionPos::from_block(0, bx, bz);
         let (lx, lz) = sec_pos.local_cell(bx, bz);
-        if store.get_or_create_mut(sec_pos).set_cell(lx, lz, lod_col) {
+        let sec = store.get_or_create_mut(sec_pos);
+        if sec.set_cell(lx, lz, lod_col) {
             dirty_sections.insert(sec_pos);
+            if collect_deltas {
+                let entry = deltas.entry(sec_pos).or_default();
+                entry.revision = sec.revision;
+                entry.columns.push((lx as u8, lz as u8, lod_col));
+            }
         }
     }
 
@@ -704,6 +759,7 @@ fn sample_loaded_chunks(
             tracker.replace_chunk_beacons(chunk, found);
         }
     }
+    deltas
 }
 
 fn sample_distant_sections(

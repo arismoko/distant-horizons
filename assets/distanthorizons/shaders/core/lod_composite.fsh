@@ -9,8 +9,9 @@ layout(std140) uniform DhCompositeUniforms {
     vec4 FogParams;    // x = near_dh, y = far_dh, z = fog_start, w = fog_end
     vec4 HeightAndEnv; // x = camera_y, y = height_fog_base_y, z = env_fog_start, w = env_fog_end
     vec4 SsaoParams;   // x = ssao_radius, y = ssao_strength, z = ssao_bias, w = ssao_fade_dist
-    uvec4 Flags0;      // x = fog_enabled, y = is_hdr, z = fog_falloff, w = fog_spherical
-    uvec4 Flags1;      // x = height_fog_enabled, y = height_fog_mix_mode, z = ssao_samples, w = fog_type
+    uvec4 Flags0;         // x = fog_enabled, y = is_hdr, z = fog_falloff, w = fog_spherical
+    uvec4 Flags1;         // x = height_fog_enabled, y = height_fog_mix_mode, z = ssao_samples, w = fog_type
+    vec4 SharpenAndPad;   // x = cas_amount
 };
 
 uniform sampler2D DhColorSampler;
@@ -118,6 +119,40 @@ float mixHeightFog(float farF, float heightF, uint mode) {
     return 1.0 - (1.0 - farF) * (1.0 - heightF);
 }
 
+vec3 fetchDhMasked(ivec2 sp, ivec2 dims, vec3 fallback) {
+    ivec2 c = clamp(sp, ivec2(0), dims - ivec2(1));
+    if (texelFetch(DhDepthSampler, c, 0).r <= 0.0) {
+        return fallback;
+    }
+    return texelFetch(DhColorSampler, c, 0).rgb;
+}
+
+// Contrast-Adaptive Sharpening (CAS), masked to valid DH depth pixels so sky edges do not halo.
+vec3 applyCas(ivec2 px, ivec2 dims, vec3 e, float amount) {
+    if (amount <= 0.001) {
+        return e;
+    }
+    vec3 a = fetchDhMasked(px + ivec2(-1, -1), dims, e);
+    vec3 b = fetchDhMasked(px + ivec2( 0, -1), dims, e);
+    vec3 c = fetchDhMasked(px + ivec2( 1, -1), dims, e);
+    vec3 d = fetchDhMasked(px + ivec2(-1,  0), dims, e);
+    vec3 f = fetchDhMasked(px + ivec2( 1,  0), dims, e);
+    vec3 g = fetchDhMasked(px + ivec2(-1,  1), dims, e);
+    vec3 h = fetchDhMasked(px + ivec2( 0,  1), dims, e);
+    vec3 i = fetchDhMasked(px + ivec2( 1,  1), dims, e);
+
+    vec3 mnRGB = min(min(min(d, e), min(f, b)), h) + min(min(min(a, g), c), i);
+    vec3 mxRGB = max(max(max(d, e), max(f, b)), h) + max(max(max(a, g), c), i);
+
+    vec3 rcpMxRGB = 1.0 / max(mxRGB, vec3(1e-4));
+    vec3 ampRGB = clamp(min(mnRGB, 2.0 - mxRGB) * rcpMxRGB, 0.0, 1.0);
+    ampRGB = inversesqrt(max(ampRGB, vec3(1e-4)));
+    float peak = 8.0 - 3.0 * clamp(amount, 0.0, 1.0);
+    vec3 wRGB = -1.0 / (ampRGB * peak);
+    vec3 rcpWeightRGB = 1.0 / max(1.0 + 4.0 * wRGB, vec3(1e-4));
+    return clamp(((b + d + f + h) * wRGB + e) * rcpWeightRGB, 0.0, 1.0);
+}
+
 void main() {
     ivec2 dhDims = textureSize(DhColorSampler, 0);
     ivec2 mcDims = textureSize(WorldDepthSampler, 0);
@@ -139,6 +174,7 @@ void main() {
     }
 
     vec3 col = texelFetch(DhColorSampler, px, 0).rgb;
+    col = applyCas(px, dhDims, col, SharpenAndPad.x);
     float nearDh = FogParams.x;
     float farDh = FogParams.y;
     float viewDist = (nearDh * farDh) / max(dhDepth * (farDh - nearDh) + nearDh, 1e-5);

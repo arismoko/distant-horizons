@@ -69,6 +69,8 @@
   "distanthorizons.setting.clouds_enabled.tooltip": "Render drifting 3D cloud layers out to the Distant Horizons render distance.",
   "distanthorizons.setting.beacon_beams_enabled": "Distant Beacon Beams",
   "distanthorizons.setting.beacon_beams_enabled.tooltip": "Render glowing beacon beams beyond vanilla render distance.",
+  "distanthorizons.setting.sharpening_amount": "LOD Sharpening (CAS)",
+  "distanthorizons.setting.sharpening_amount.tooltip": "Contrast-adaptive sharpening strength applied to distant LOD terrain.",
   "distanthorizons.setting.debug_mode": "Debug Render Mode",
   "distanthorizons.setting.debug_mode.tooltip": "Diagnostic visualization mode for LOD detail levels, generation provenance, lighting, or cell wireframes.",
   "distanthorizons.setting.debug.off": "Off",
@@ -100,5 +102,5 @@
   "distanthorizons.command.preset_set": "Applied Distant Horizons %s quality preset.",
   "distanthorizons.command.usage_debug": "Usage: /dh debug <off|detail|gen|light|wireframe>",
   "distanthorizons.command.usage_preset": "Usage: /dh preset <low|medium|high|extreme>",
-  "distanthorizons.command.help": "Commands: /dh <status|toggle|radius <chunks>|quality <low|medium|high>|preset <low|medium|high|extreme>|fog <on|off>|heightfog <on|off>|ssao <on|off>|clouds <on|off>|beacons <on|off>|debug <off|detail|gen|light|wireframe>|fade <on|off>|noise <on|off>|gen <on|off>|cavecull <on|off>|clear|remesh>"
+  "distanthorizons.command.help": "Commands: /dh <status|toggle|radius <chunks>|quality <low|medium|high>|preset <low|medium|high|extreme>|fog <on|off>|heightfog <on|off>|ssao <on|off>|sharpen <on|off>|clouds <on|off>|beacons <on|off>|debug <off|detail|gen|light|wireframe>|fade <on|off>|noise <on|off>|gen <on|off>|cavecull <on|off>|clear|remesh>"
 }

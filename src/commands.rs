@@ -8,7 +8,7 @@ use crate::config::{
     DEBUG_SHOW_LIGHTING, DhConfig, KEY_BEACON_BEAMS_ENABLED, KEY_CAVE_CULLING, KEY_CLOUDS_ENABLED,
     KEY_DEBUG_MODE, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FADE_ENABLED, KEY_FOG_ENABLED,
     KEY_HEIGHT_FOG_ENABLED, KEY_HORIZONTAL_QUALITY, KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE,
-    KEY_SSAO_ENABLED, KEY_SSAO_QUALITY, KEY_VERTICAL_QUALITY, MOD_ID,
+    KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED, KEY_SSAO_QUALITY, KEY_VERTICAL_QUALITY, MOD_ID,
 };
 use crate::render_bridge::{runtime, stats};
 use mod_api::{
@@ -114,6 +114,7 @@ pub fn register_client_commands(commands: &mut Vec<Command>) {
         commands.push(Command::new(&format!("{prefix} fog <mode:word>")));
         commands.push(Command::new(&format!("{prefix} heightfog <mode:word>")));
         commands.push(Command::new(&format!("{prefix} ssao <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} sharpen <mode:word>")));
         commands.push(Command::new(&format!("{prefix} clouds <mode:word>")));
         commands.push(Command::new(&format!("{prefix} beacons <mode:word>")));
         commands.push(Command::new(&format!("{prefix} debug <mode:word>")));
@@ -187,50 +188,54 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
             }
         },
         "preset" => match arg.map(str::to_ascii_lowercase).as_deref() {
-            Some("low") => {
-                apply_preset(
-                    host,
-                    64,
-                    0,
-                    0,
-                    0,
-                    false,
-                    "distanthorizons.setting.quality.low",
-                );
-            }
-            Some("medium" | "med") => {
-                apply_preset(
-                    host,
-                    128,
-                    1,
-                    1,
-                    1,
-                    true,
-                    "distanthorizons.setting.quality.medium",
-                );
-            }
-            Some("high") => {
-                apply_preset(
-                    host,
-                    256,
-                    2,
-                    2,
-                    1,
-                    true,
-                    "distanthorizons.setting.quality.high",
-                );
-            }
-            Some("extreme") => {
-                apply_preset(
-                    host,
-                    512,
-                    2,
-                    3,
-                    2,
-                    true,
-                    "distanthorizons.setting.quality.extreme",
-                );
-            }
+            Some("low") => apply_preset(
+                host,
+                QualityPreset {
+                    radius: 64,
+                    h_qual: 0,
+                    v_qual: 0,
+                    ssao_q: 0,
+                    ssao_on: false,
+                    sharpen: 0.0,
+                    label_key: "distanthorizons.setting.quality.low",
+                },
+            ),
+            Some("medium" | "med") => apply_preset(
+                host,
+                QualityPreset {
+                    radius: 128,
+                    h_qual: 1,
+                    v_qual: 1,
+                    ssao_q: 1,
+                    ssao_on: true,
+                    sharpen: 0.25,
+                    label_key: "distanthorizons.setting.quality.medium",
+                },
+            ),
+            Some("high") => apply_preset(
+                host,
+                QualityPreset {
+                    radius: 256,
+                    h_qual: 2,
+                    v_qual: 2,
+                    ssao_q: 1,
+                    ssao_on: true,
+                    sharpen: 0.35,
+                    label_key: "distanthorizons.setting.quality.high",
+                },
+            ),
+            Some("extreme") => apply_preset(
+                host,
+                QualityPreset {
+                    radius: 512,
+                    h_qual: 2,
+                    v_qual: 3,
+                    ssao_q: 2,
+                    ssao_on: true,
+                    sharpen: 0.45,
+                    label_key: "distanthorizons.setting.quality.extreme",
+                },
+            ),
             _ => {
                 let _ = host.chat_line(Text::translate(
                     "distanthorizons.command.usage_preset",
@@ -239,6 +244,30 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
             }
         },
         "ssao" => handle_bool_setting(host, KEY_SSAO_ENABLED, "ssao", arg),
+        "sharpen" => match parse_toggle_arg(arg) {
+            Some(v) => {
+                host.set_setting(
+                    MOD_ID,
+                    KEY_SHARPENING_AMOUNT,
+                    if v { "0.35" } else { "0.0" },
+                );
+                refresh_config(host);
+                let _ = host.chat_line(Text::translate(
+                    if v {
+                        "distanthorizons.command.setting_on"
+                    } else {
+                        "distanthorizons.command.setting_off"
+                    },
+                    vec![Text::literal("sharpen")],
+                ));
+            }
+            None => {
+                let _ = host.chat_line(Text::translate(
+                    "distanthorizons.command.usage_toggle",
+                    vec![Text::literal("sharpen")],
+                ));
+            }
+        },
         "heightfog" => handle_bool_setting(host, KEY_HEIGHT_FOG_ENABLED, "heightfog", arg),
         "clouds" => handle_bool_setting(host, KEY_CLOUDS_ENABLED, "clouds", arg),
         "beacons" => handle_bool_setting(host, KEY_BEACON_BEAMS_ENABLED, "beacons", arg),
@@ -493,28 +522,31 @@ fn handle_bool_setting(host: &mut dyn ClientHost, key: &str, label: &str, arg: O
     }
 }
 
-fn apply_preset(
-    host: &mut dyn ClientHost,
+struct QualityPreset {
     radius: u32,
     h_qual: u32,
     v_qual: u32,
     ssao_q: u32,
     ssao_on: bool,
-    label_key: &str,
-) {
-    host.set_setting(MOD_ID, KEY_RENDER_DISTANCE, &radius.to_string());
-    host.set_setting(MOD_ID, KEY_HORIZONTAL_QUALITY, &h_qual.to_string());
-    host.set_setting(MOD_ID, KEY_VERTICAL_QUALITY, &v_qual.to_string());
+    sharpen: f32,
+    label_key: &'static str,
+}
+
+fn apply_preset(host: &mut dyn ClientHost, p: QualityPreset) {
+    host.set_setting(MOD_ID, KEY_RENDER_DISTANCE, &p.radius.to_string());
+    host.set_setting(MOD_ID, KEY_HORIZONTAL_QUALITY, &p.h_qual.to_string());
+    host.set_setting(MOD_ID, KEY_VERTICAL_QUALITY, &p.v_qual.to_string());
     host.set_setting(
         MOD_ID,
         KEY_SSAO_ENABLED,
-        if ssao_on { "true" } else { "false" },
+        if p.ssao_on { "true" } else { "false" },
     );
-    host.set_setting(MOD_ID, KEY_SSAO_QUALITY, &ssao_q.to_string());
+    host.set_setting(MOD_ID, KEY_SSAO_QUALITY, &p.ssao_q.to_string());
+    host.set_setting(MOD_ID, KEY_SHARPENING_AMOUNT, &format!("{:.2}", p.sharpen));
     refresh_config(host);
     let _ = host.chat_line(Text::translate(
         "distanthorizons.command.preset_set",
-        vec![Text::translate(label_key, Vec::new())],
+        vec![Text::translate(p.label_key, Vec::new())],
     ));
 }
 

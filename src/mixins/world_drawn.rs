@@ -313,7 +313,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         });
         let comp_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dh-composite-uniforms"),
-            size: 160,
+            size: 176,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -814,7 +814,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
     };
     let fog_on = u32::from(params.config.fog_enabled && !debug_active);
 
-    let mut comp_bytes = [0u8; 160];
+    let mut comp_bytes = [0u8; 176];
     for (i, f) in inv_m_dh.iter().enumerate() {
         comp_bytes[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
@@ -856,6 +856,15 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
     ];
     for (i, v) in flags1.iter().enumerate() {
         comp_bytes[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let cas_amount = if debug_active {
+        0.0f32
+    } else {
+        params.config.sharpening_amount
+    };
+    let sharpen_and_pad = [cas_amount, 0.0f32, 0.0f32, 0.0f32];
+    for (i, f) in sharpen_and_pad.iter().enumerate() {
+        comp_bytes[160 + i * 4..164 + i * 4].copy_from_slice(&f.to_le_bytes());
     }
     world
         .queue

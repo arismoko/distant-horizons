@@ -29,6 +29,7 @@ pub const KEY_HEIGHT_FOG_BASE_HEIGHT: &str = "height_fog_base_height";
 pub const KEY_HEIGHT_FOG_MIX_MODE: &str = "height_fog_mix_mode";
 pub const KEY_CLOUDS_ENABLED: &str = "clouds_enabled";
 pub const KEY_BEACON_BEAMS_ENABLED: &str = "beacon_beams_enabled";
+pub const KEY_SHARPENING_AMOUNT: &str = "sharpening_amount";
 pub const KEY_DEBUG_MODE: &str = "debug_mode";
 
 /// Debug visualization modes matching upstream `EDhApiDebugRendering`.
@@ -74,6 +75,8 @@ pub struct DhConfig {
     pub height_fog_mix_mode: u32,
     pub clouds_enabled: bool,
     pub beacon_beams_enabled: bool,
+    /// FidelityFX Contrast-Adaptive Sharpening strength (0.0 = off, 1.0 = max).
+    pub sharpening_amount: f32,
     /// `DEBUG_OFF..=DEBUG_SHOW_DETAIL_WIREFRAME`.
     pub debug_mode: u32,
 }
@@ -108,6 +111,7 @@ impl Default for DhConfig {
             height_fog_mix_mode: 4,
             clouds_enabled: true,
             beacon_beams_enabled: true,
+            sharpening_amount: 0.35,
             debug_mode: DEBUG_OFF,
         }
     }
@@ -372,6 +376,15 @@ impl DhConfig {
                 true,
             )
             .tooltip("distanthorizons.setting.beacon_beams_enabled.tooltip"),
+            SettingSpec::range(
+                KEY_SHARPENING_AMOUNT,
+                "distanthorizons.setting.sharpening_amount",
+                0.0,
+                1.0,
+                0.05,
+                0.35,
+            )
+            .tooltip("distanthorizons.setting.sharpening_amount.tooltip"),
             SettingSpec::choice(
                 KEY_DEBUG_MODE,
                 "distanthorizons.setting.debug_mode",
@@ -481,6 +494,10 @@ impl DhConfig {
             beacon_beams_enabled: host
                 .setting_bool(KEY_BEACON_BEAMS_ENABLED)
                 .unwrap_or(def.beacon_beams_enabled),
+            sharpening_amount: host
+                .setting_f64(KEY_SHARPENING_AMOUNT)
+                .map(|v| (v as f32).clamp(0.0, 1.0))
+                .unwrap_or(def.sharpening_amount),
             debug_mode: host
                 .setting_choice(KEY_DEBUG_MODE)
                 .unwrap_or(def.debug_mode),
