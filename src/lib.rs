@@ -21,6 +21,7 @@ pub mod mesh;
 pub mod network;
 pub mod render_bridge;
 pub mod shader_pack;
+pub mod stage3_camera;
 pub mod storage;
 
 use crate::api::{LodGenRequest, LodGenStep, LodSectionPos, ingest_gen_output};
@@ -210,6 +211,7 @@ impl Hooks for DistantHorizonsMod {
             st.rain_level = rain_level.clamp(0.0, 1.0);
             st.thunder_level = thunder_level.clamp(0.0, 1.0);
             if let Some(camera) = cam {
+                st.camera = Some(stage3_camera::CameraMatrices::from_camera(&camera));
                 st.camera_pos = camera.position;
                 st.has_camera = true;
                 st.vanilla_far_blocks = (st.vanilla_render_distance_chunks as f32) * 16.0;
@@ -269,6 +271,32 @@ impl Hooks for DistantHorizonsMod {
             }
         } else {
             network::poll_remote_sections(host);
+        }
+    }
+
+    #[cfg(feature = "sunrise-4758-world-view")]
+    fn render_level_stage(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::RenderLevelStageEvent<'_>,
+    ) {
+        if !host.on(MOD_ID) {
+            return;
+        }
+        if matches!(
+            event.stage,
+            mod_api::RenderLevelStage::AfterOpaqueBlocks
+                | mod_api::RenderLevelStage::AfterTranslucentBlocks
+                | mod_api::RenderLevelStage::OitTranslucent(mod_api::OitStage::Accumulate)
+        ) {
+            let rt = runtime();
+            let mut st = rt.inner.lock().unwrap();
+            let matrices = stage3_camera::CameraMatrices::from_world_view(event.view);
+            st.camera = Some(matrices);
+            st.camera_pos = matrices.position;
+            st.has_camera = true;
+            st.improved_transparency = event.view.improved_transparency;
+            st.visible_section_count = event.view.sections.len();
         }
     }
 

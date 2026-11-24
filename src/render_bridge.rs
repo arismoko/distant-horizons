@@ -8,6 +8,7 @@ use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
 use crate::lod::{DimensionLodStore, SectionPos};
 use crate::mesh::{MeshWorker, SectionMeshData};
+use crate::stage3_camera::CameraMatrices;
 use crate::storage::{IoResponse, LodIoWorker};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -291,8 +292,11 @@ pub struct DhState {
     pub config: DhConfig,
     pub world_dir: Option<PathBuf>,
     pub active_dimension: String,
+    pub camera: Option<CameraMatrices>,
     pub camera_pos: [f64; 3],
     pub has_camera: bool,
+    pub improved_transparency: bool,
+    pub visible_section_count: usize,
     pub fog_color: [f32; 4],
     pub vanilla_far_blocks: f32,
     pub sun_brightness: f32,
@@ -329,8 +333,11 @@ impl Default for DhState {
             config: DhConfig::default(),
             world_dir: None,
             active_dimension: "minecraft:overworld".to_owned(),
+            camera: None,
             camera_pos: [0.0, 64.0, 0.0],
             has_camera: false,
+            improved_transparency: false,
+            visible_section_count: 0,
             fog_color: [0.75, 0.85, 1.0, 1.0],
             vanilla_far_blocks: 80.0,
             sun_brightness: 1.0,

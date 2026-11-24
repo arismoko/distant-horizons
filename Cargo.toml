@@ -9,6 +9,12 @@ description = "Distant Horizons level-of-detail terrain port for Sunrise"
 name = "distanthorizons"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Enable `#4758` `WorldRenderView<'a>` (`Camera` + 9 `RenderLevelStage` variants) hook wiring
+# once a Sunrise Dev SDK cut from `8bed1cbbd5` or newer is installed.
+sunrise-4758-world-view = []
+
 [dependencies]
 sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
