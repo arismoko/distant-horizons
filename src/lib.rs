@@ -274,32 +274,6 @@ impl Hooks for DistantHorizonsMod {
         }
     }
 
-    #[cfg(feature = "sunrise-4758-world-view")]
-    fn render_level_stage(
-        &self,
-        host: &dyn ClientHost,
-        event: &mut mod_api::RenderLevelStageEvent<'_>,
-    ) {
-        if !host.on(MOD_ID) {
-            return;
-        }
-        if matches!(
-            event.stage,
-            mod_api::RenderLevelStage::AfterOpaqueBlocks
-                | mod_api::RenderLevelStage::AfterTranslucentBlocks
-                | mod_api::RenderLevelStage::OitTranslucent(mod_api::OitStage::Accumulate)
-        ) {
-            let rt = runtime();
-            let mut st = rt.inner.lock().unwrap();
-            let matrices = stage3_camera::CameraMatrices::from_world_view(event.view);
-            st.camera = Some(matrices);
-            st.camera_pos = matrices.position;
-            st.has_camera = true;
-            st.improved_transparency = event.view.improved_transparency;
-            st.visible_section_count = event.view.sections.len();
-        }
-    }
-
     fn render_fog(&self, host: &dyn ClientHost, event: &mut RenderFogEvent<'_>) {
         if !host.on(MOD_ID) {
             return;

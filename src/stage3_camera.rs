@@ -4,8 +4,7 @@
 //!
 //! Zero `wgpu` types and zero `[[native.mixin]]` references: `CameraMatrices::from_camera` reads
 //! `#4758`'s `mod_api::Camera` fields (`position`, `view`, `projection`, `fov_degrees`, `near`,
-//! `far`, `yaw`, `pitch`) directly, and `from_world_view` (enabled under `sunrise-4758-world-view`)
-//! reads `WorldRenderView<'a>` inside `Hooks::render_level_stage`.
+//! `far`, `yaw`, `pitch`) directly.
 
 use crate::config::DhConfig;
 use crate::lod::SectionPos;
@@ -38,21 +37,6 @@ impl CameraMatrices {
             far: camera.far,
             view: camera.view,
             projection: camera.projection,
-        }
-    }
-
-    /// Extract frame camera state from `#4758`'s `mod_api::WorldRenderView<'_>`.
-    #[cfg(feature = "sunrise-4758-world-view")]
-    pub fn from_world_view(view: &mod_api::WorldRenderView<'_>) -> Self {
-        Self {
-            position: view.camera_position(),
-            yaw: view.camera.yaw,
-            pitch: view.camera.pitch,
-            fov_degrees: view.camera.fov_degrees,
-            near: view.camera.near,
-            far: view.camera.far,
-            view: view.model_view_matrix(),
-            projection: view.projection_matrix(),
         }
     }
 
