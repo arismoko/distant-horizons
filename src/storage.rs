@@ -3,7 +3,8 @@
 //! Uses compact run-length encoding over the 4096-column section grid and atomic temp-file
 //! replacement on a background IO worker thread so the game and server threads never block on disk.
 
-use crate::lod::{LodColumn, LodSection, SECTION_CELLS, SectionPos};
+use crate::lod::{ExtraSpan, LodColumn, LodSection, SECTION_CELLS, SectionPos};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,12 +12,14 @@ use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-const MAGIC: &[u8; 8] = b"DHLOD001";
+const MAGIC_V1: &[u8; 8] = b"DHLOD001";
+const MAGIC_V2: &[u8; 8] = b"DHLOD002";
 
-/// Encode a `64 x 64` LOD section into compact RLE binary format.
+/// Encode a `64 x 64` LOD section into compact RLE binary format (`DHLOD002`, primary columns
+/// plus optional extra vertical spans).
 pub fn encode_section(section: &LodSection) -> Vec<u8> {
     let mut out = Vec::with_capacity(2048);
-    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(MAGIC_V2);
     out.push(section.pos.detail);
     out.extend_from_slice(&section.pos.x.to_le_bytes());
     out.extend_from_slice(&section.pos.z.to_le_bytes());
@@ -35,14 +38,38 @@ pub fn encode_section(section: &LodSection) -> Vec<u8> {
         out.extend_from_slice(&col.to_bytes());
         i += run as usize;
     }
+
+    // Extra vertical spans tail (deterministic cell-index order).
+    let mut keys: Vec<u16> = section
+        .extra_spans
+        .iter()
+        .filter(|(_, spans)| !spans.is_empty())
+        .map(|(&idx, _)| idx)
+        .collect();
+    keys.sort_unstable();
+    out.extend_from_slice(&(keys.len() as u16).to_le_bytes());
+    for cell_idx in keys {
+        let spans = &section.extra_spans[&cell_idx];
+        let count = spans.len().min(u8::MAX as usize) as u8;
+        out.extend_from_slice(&cell_idx.to_le_bytes());
+        out.push(count);
+        for span in &spans[..count as usize] {
+            out.extend_from_slice(&span.to_bytes());
+        }
+    }
     out
 }
 
-/// Decode a binary LOD section file.
+/// Decode a `DHLOD001` or `DHLOD002` binary LOD section file.
 pub fn decode_section(bytes: &[u8]) -> Option<LodSection> {
-    if bytes.len() < 17 || &bytes[0..8] != MAGIC {
+    if bytes.len() < 17 {
         return None;
     }
+    let version = match &bytes[0..8] {
+        m if m == MAGIC_V1 => 1u8,
+        m if m == MAGIC_V2 => 2u8,
+        _ => return None,
+    };
     let detail = bytes[8];
     let x = i32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
     let z = i32::from_le_bytes([bytes[13], bytes[14], bytes[15], bytes[16]]);
@@ -63,7 +90,40 @@ pub fn decode_section(bytes: &[u8]) -> Option<LodSection> {
     if columns.len() != SECTION_CELLS {
         return None;
     }
-    Some(LodSection::from_columns(pos, columns))
+
+    let mut extra_spans = HashMap::new();
+    if version >= 2 && cursor + 2 <= bytes.len() {
+        let cell_count = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        cursor += 2;
+        for _ in 0..cell_count {
+            if cursor + 3 > bytes.len() {
+                return None;
+            }
+            let cell_idx = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+            let span_count = bytes[cursor + 2] as usize;
+            cursor += 3;
+            let byte_len = span_count * ExtraSpan::SERIALIZED_LEN;
+            if cursor + byte_len > bytes.len() || (cell_idx as usize) >= SECTION_CELLS {
+                return None;
+            }
+            let mut spans = Vec::with_capacity(span_count);
+            for _ in 0..span_count {
+                let mut sb = [0u8; ExtraSpan::SERIALIZED_LEN];
+                sb.copy_from_slice(&bytes[cursor..cursor + ExtraSpan::SERIALIZED_LEN]);
+                cursor += ExtraSpan::SERIALIZED_LEN;
+                spans.push(ExtraSpan::from_bytes(sb));
+            }
+            if !spans.is_empty() {
+                extra_spans.insert(cell_idx, spans);
+            }
+        }
+    }
+
+    Some(LodSection::from_columns_and_spans(
+        pos,
+        columns,
+        extra_spans,
+    ))
 }
 
 pub fn sanitize_dimension(dimension: &str) -> String {
@@ -240,5 +300,13 @@ mod tests {
         assert_eq!(decoded.pos, pos);
         assert_eq!(decoded.columns, section.columns);
         assert_eq!(decoded.populated, 4096);
+        assert!(decoded.extra_spans.is_empty());
+
+        // Verify extra vertical spans (overhangs/caverns) round-trip exactly in DHLOD002.
+        let floor = ExtraSpan::new(36, 28, [96, 40, 40], 0, 12, false);
+        section.set_cell_with_spans(5, 9, grass, vec![floor]);
+        let encoded_v2 = encode_section(&section);
+        let decoded_v2 = decode_section(&encoded_v2).expect("valid v2 section");
+        assert_eq!(decoded_v2.extra_spans_at(5, 9), &[floor]);
     }
 }

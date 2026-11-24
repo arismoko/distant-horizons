@@ -1,6 +1,6 @@
 //! Greedy face-culled LOD mesher and background meshing worker thread.
 
-use crate::lod::{EMPTY_Y, LodColumn, LodSection, SECTION_SIZE, SectionPos};
+use crate::lod::{EMPTY_Y, ExtraSpan, LodColumn, LodSection, SECTION_SIZE, SectionPos};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -339,6 +339,128 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                     meta,
                 );
             }
+
+            // Underside ceiling face (-Y, normal 0) when this primary span is an overhang or
+            // Nether ceiling above a lower span separated by an air gap.
+            let extra = section.extra_spans_at(gx, gz);
+            if let Some(below) = extra.first()
+                && col.solid_bottom_y > below.top_y
+            {
+                let y_bot = col.solid_bottom_y as f32;
+                min_y = min_y.min(y_bot);
+                let meta = LodVertex::pack_meta(0, sky, blk, false);
+                solid.push_quad(
+                    [
+                        [x0, y_bot, z1],
+                        [x0, y_bot, z0],
+                        [x1, y_bot, z0],
+                        [x1, y_bot, z1],
+                    ],
+                    color,
+                    meta,
+                );
+            }
+        }
+    }
+
+    // 4. Emit lower vertical spans (overhangs, caves, Nether caverns, End islands) with top,
+    //    underside (when suspended above air), and neighbor-culled side walls.
+    if !section.extra_spans.is_empty() {
+        for (&cell_idx, spans) in &section.extra_spans {
+            let idx = cell_idx as usize;
+            let gx = idx % SECTION_SIZE;
+            let gz = idx / SECTION_SIZE;
+            let x0 = gx as f32 * cell;
+            let x1 = (gx + 1) as f32 * cell;
+            let z0 = gz as f32 * cell;
+            let z1 = (gz + 1) as f32 * cell;
+
+            for (si, span) in spans.iter().enumerate() {
+                if span.top_y <= span.bottom_y {
+                    continue;
+                }
+                let y0 = span.bottom_y as f32;
+                let y1 = if span.is_fluid {
+                    span.top_y as f32 - 0.125
+                } else {
+                    span.top_y as f32
+                };
+                min_y = min_y.min(y0);
+                max_y = max_y.max(y1);
+                let alpha = if span.is_fluid { 196 } else { 255 };
+                let color = LodVertex::pack_rgba(span.rgba[0], span.rgba[1], span.rgba[2], alpha);
+                let sky = LodColumn::sky_light(span.rgba);
+                let blk = LodColumn::block_light(span.rgba);
+                let target = if span.is_fluid {
+                    &mut fluid
+                } else {
+                    &mut solid
+                };
+
+                // Top (+Y, normal 1)
+                let top_meta = LodVertex::pack_meta(1, sky, blk, span.is_fluid);
+                target.push_quad(
+                    [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
+                    color,
+                    top_meta,
+                );
+
+                // Underside (-Y, normal 0) if there is an air gap to a lower span beneath this one.
+                if !span.is_fluid
+                    && let Some(next_below) = spans.get(si + 1)
+                    && span.bottom_y > next_below.top_y
+                {
+                    let bot_meta = LodVertex::pack_meta(0, sky, blk, false);
+                    target.push_quad(
+                        [[x0, y0, z1], [x0, y0, z0], [x1, y0, z0], [x1, y0, z1]],
+                        color,
+                        bot_meta,
+                    );
+                }
+
+                if !span.is_fluid {
+                    // Emit side faces only where the neighboring cell does not cover this span.
+                    let sides: [((isize, isize), u32, [[f32; 3]; 4]); 4] = [
+                        (
+                            (0, -1),
+                            2,
+                            [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
+                        ),
+                        (
+                            (0, 1),
+                            3,
+                            [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
+                        ),
+                        (
+                            (-1, 0),
+                            4,
+                            [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]],
+                        ),
+                        (
+                            (1, 0),
+                            5,
+                            [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]],
+                        ),
+                    ];
+                    for ((dx, dz), normal, quad) in sides {
+                        let nx = gx as isize + dx;
+                        let nz = gz as isize + dz;
+                        let covered = if nx >= 0
+                            && nz >= 0
+                            && (nx as usize) < SECTION_SIZE
+                            && (nz as usize) < SECTION_SIZE
+                        {
+                            neighbor_covers_span(section, nx as usize, nz as usize, span)
+                        } else {
+                            false
+                        };
+                        if !covered {
+                            let meta = LodVertex::pack_meta(normal, sky, blk, false);
+                            target.push_quad(quad, color, meta);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -359,6 +481,38 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
         max_y,
         quad_count: solid.quad_count + fluid.quad_count,
     }
+}
+
+/// True when any solid span in neighbor `(nx, nz)` completely covers `[span.bottom_y, span.top_y]`.
+#[inline]
+fn neighbor_covers_span(section: &LodSection, nx: usize, nz: usize, span: &ExtraSpan) -> bool {
+    let col = section.get(nx, nz);
+    if col.has_solid() && col.solid_bottom_y <= span.bottom_y && col.solid_top_y >= span.top_y {
+        return true;
+    }
+    section.extra_spans_at(nx, nz).iter().any(|other| {
+        !other.is_fluid && other.bottom_y <= span.bottom_y && other.top_y >= span.top_y
+    })
+}
+
+/// Apply Distant Horizons brightness and saturation multipliers to an sRGB color.
+#[inline]
+pub fn grade_rgb(rgb: [u8; 3], brightness: f32, saturation: f32) -> [u8; 3] {
+    if (brightness - 1.0).abs() < 1e-4 && (saturation - 1.0).abs() < 1e-4 {
+        return rgb;
+    }
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let sr = (luma + (r - luma) * saturation) * brightness;
+    let sg = (luma + (g - luma) * saturation) * brightness;
+    let sb = (luma + (b - luma) * saturation) * brightness;
+    [
+        (sr.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (sg.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (sb.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
 }
 
 #[inline]
@@ -443,5 +597,30 @@ mod tests {
         assert_eq!(mesh.solid_indices.len(), 257 * 6);
         assert_eq!(mesh.solid_vertex_bytes.len(), 257 * 4 * LodVertex::STRIDE);
         assert!(mesh.fluid_indices.is_empty());
+    }
+
+    #[test]
+    fn overhang_and_lower_cavern_emit_underside_and_cull_shared_neighbor_walls() {
+        let mut section = LodSection::new(SectionPos::new(0, 0, 0));
+        let roof = LodColumn::from_solid_and_fluid(
+            128,
+            120,
+            [110, 45, 45],
+            None,
+            [0, 0, 0],
+            0,
+            0,
+            SOURCE_LOADED_CHUNK,
+        );
+        let floor = ExtraSpan::new(40, 32, [90, 35, 35], 0, 8, false);
+        section.set_cell_with_spans(10, 10, roof, vec![floor]);
+        section.set_cell_with_spans(11, 10, roof, vec![floor]);
+
+        let mesh = build_section_mesh("minecraft:the_nether".into(), &section);
+        // Should emit overhang underside faces + lower cavern floor top & outer walls, while
+        // culling the shared interior wall between (10,10) and (11,10).
+        assert!(mesh.quad_count > 10);
+        assert!(mesh.min_y <= 32.0);
+        assert!(mesh.max_y >= 128.0);
     }
 }

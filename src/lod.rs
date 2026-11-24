@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet};
 /// Width/depth in cells of one LOD section (`64 x 64`, matching DH `FullDataSourceV2.WIDTH`).
 pub const SECTION_SIZE: usize = 64;
 pub const SECTION_CELLS: usize = SECTION_SIZE * SECTION_SIZE;
-pub const MAX_DETAIL: u8 = 4;
+/// Up to `d6` (`64 << 6 = 4096` blocks per section), covering render distances past 512 chunks.
+pub const MAX_DETAIL: u8 = 6;
 
 /// Sentinel Y value indicating no solid or fluid block in a column.
 pub const EMPTY_Y: i16 = i16::MIN;
@@ -239,11 +240,191 @@ impl LodColumn {
     }
 }
 
+/// One additional vertical terrain or fluid span beneath the primary surface of an LOD column
+/// (overhangs, bridges, caves, Nether caverns beneath the bedrock ceiling, End floating islands).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtraSpan {
+    /// Exclusive top Y of this span in blocks.
+    pub top_y: i16,
+    /// Inclusive bottom Y of this span in blocks (`bottom_y < top_y`).
+    pub bottom_y: i16,
+    /// RGB + packed light byte (`(sky_light << 4) | block_light`).
+    pub rgba: [u8; 4],
+    /// `true` for translucent fluids (water/lava surface layers), `false` for solid blocks.
+    pub is_fluid: bool,
+}
+
+impl ExtraSpan {
+    pub const SERIALIZED_LEN: usize = 9;
+
+    pub fn new(
+        top_y: i32,
+        bottom_y: i32,
+        rgb: [u8; 3],
+        sky_light: u8,
+        block_light: u8,
+        is_fluid: bool,
+    ) -> Self {
+        let top = top_y.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
+        let bot = bottom_y.clamp(i16::MIN as i32 + 1, (top as i32) - 1) as i16;
+        Self {
+            top_y: top,
+            bottom_y: bot,
+            rgba: [
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                LodColumn::pack_light(sky_light, block_light),
+            ],
+            is_fluid,
+        }
+    }
+
+    pub fn to_bytes(self) -> [u8; Self::SERIALIZED_LEN] {
+        let mut out = [0u8; Self::SERIALIZED_LEN];
+        out[0..2].copy_from_slice(&self.top_y.to_le_bytes());
+        out[2..4].copy_from_slice(&self.bottom_y.to_le_bytes());
+        out[4..8].copy_from_slice(&self.rgba);
+        out[8] = u8::from(self.is_fluid);
+        out
+    }
+
+    pub fn from_bytes(b: [u8; Self::SERIALIZED_LEN]) -> Self {
+        Self {
+            top_y: i16::from_le_bytes([b[0], b[1]]),
+            bottom_y: i16::from_le_bytes([b[2], b[3]]),
+            rgba: [b[4], b[5], b[6], b[7]],
+            is_fluid: b[8] != 0,
+        }
+    }
+}
+
+/// One vertical block sample used when extracting stacked spans from a chunk column.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnSample {
+    /// Block Y coordinate (top of block is `y + 1`, bottom is `y`).
+    pub y: i32,
+    pub rgb: [u8; 3],
+    pub sky_light: u8,
+    pub block_light: u8,
+    pub is_fluid: bool,
+}
+
+/// Extract a primary [`LodColumn`] plus up to `max_extra_spans` lower [`ExtraSpan`] layers from
+/// a top-down list of non-air block samples in one `(x, z)` column.
+///
+/// Handles:
+/// - Overhangs, arches, bridges, floating islands (multiple solid spans separated by air gaps);
+/// - Water/fluid surfaces above submerged floors;
+/// - Cave culling below `cave_culling_height` in sunlit dimensions (`!has_ceiling`);
+/// - Nether-style ceiling dimensions (`has_ceiling == true`), keeping cavern spans beneath the roof.
+pub fn extract_column_spans(
+    top_down_samples: &[ColumnSample],
+    source: u8,
+    max_extra_spans: usize,
+    cave_culling_enabled: bool,
+    cave_culling_height: i32,
+    has_ceiling: bool,
+) -> (LodColumn, Vec<ExtraSpan>) {
+    if top_down_samples.is_empty() {
+        return (LodColumn::EMPTY, Vec::new());
+    }
+
+    // Group contiguous vertical runs of solid or fluid blocks (top-down).
+    let mut raw_spans: Vec<ExtraSpan> = Vec::new();
+    let mut i = 0;
+    while i < top_down_samples.len() {
+        let head = top_down_samples[i];
+        let top_y = head.y + 1;
+        let mut bottom_y = head.y;
+        let mut j = i + 1;
+        while j < top_down_samples.len() {
+            let next = top_down_samples[j];
+            if next.is_fluid == head.is_fluid && next.y == bottom_y - 1 {
+                bottom_y = next.y;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        raw_spans.push(ExtraSpan::new(
+            top_y,
+            bottom_y,
+            head.rgb,
+            head.sky_light,
+            head.block_light,
+            head.is_fluid,
+        ));
+        i = j;
+    }
+
+    // Apply cave culling to lower spans in open-sky dimensions (never cull the topmost solid/fluid
+    // surface, and never cull Nether cavern floors where `has_ceiling` is true).
+    let mut primary_fluid: Option<ExtraSpan> = None;
+    let mut primary_solid: Option<ExtraSpan> = None;
+    let mut extra: Vec<ExtraSpan> = Vec::new();
+
+    for span in raw_spans {
+        if span.is_fluid {
+            if primary_solid.is_none() && primary_fluid.is_none() {
+                primary_fluid = Some(span);
+                continue;
+            }
+        } else if primary_solid.is_none() {
+            primary_solid = Some(span);
+            continue;
+        }
+        if !has_ceiling && cave_culling_enabled && (span.top_y as i32) <= cave_culling_height {
+            continue;
+        }
+        if extra.len() < max_extra_spans {
+            extra.push(span);
+        }
+    }
+
+    let col = match (primary_solid, primary_fluid) {
+        (Some(solid), fluid) => {
+            let (fy, frgb) = match fluid {
+                Some(f) if f.top_y > solid.top_y => {
+                    (Some(f.top_y as i32), [f.rgba[0], f.rgba[1], f.rgba[2]])
+                }
+                _ => (None, [0, 0, 0]),
+            };
+            LodColumn::from_solid_and_fluid(
+                solid.top_y as i32,
+                solid.bottom_y as i32,
+                [solid.rgba[0], solid.rgba[1], solid.rgba[2]],
+                fy,
+                frgb,
+                LodColumn::sky_light(solid.rgba),
+                LodColumn::block_light(solid.rgba),
+                source,
+            )
+        }
+        (None, Some(fluid)) => LodColumn::from_solid_and_fluid(
+            fluid.bottom_y as i32,
+            fluid.bottom_y as i32 - 4,
+            [fluid.rgba[0], fluid.rgba[1], fluid.rgba[2]],
+            Some(fluid.top_y as i32),
+            [fluid.rgba[0], fluid.rgba[1], fluid.rgba[2]],
+            LodColumn::sky_light(fluid.rgba),
+            LodColumn::block_light(fluid.rgba),
+            source,
+        ),
+        (None, None) => LodColumn::EMPTY,
+    };
+
+    (col, extra)
+}
+
 /// One `64 x 64` cell LOD section in memory.
 #[derive(Clone, Debug)]
 pub struct LodSection {
     pub pos: SectionPos,
     pub columns: Vec<LodColumn>,
+    /// Optional additional vertical spans per cell (`0..SECTION_CELLS`), kept empty for simple
+    /// single-surface Overworld columns so memory stays flat and cache-friendly.
+    pub extra_spans: HashMap<u16, Vec<ExtraSpan>>,
     pub populated: u16,
     pub revision: u64,
     pub dirty_mesh: bool,
@@ -255,6 +436,7 @@ impl LodSection {
         Self {
             pos,
             columns: vec![LodColumn::EMPTY; SECTION_CELLS],
+            extra_spans: HashMap::new(),
             populated: 0,
             revision: 0,
             dirty_mesh: false,
@@ -263,10 +445,19 @@ impl LodSection {
     }
 
     pub fn from_columns(pos: SectionPos, columns: Vec<LodColumn>) -> Self {
+        Self::from_columns_and_spans(pos, columns, HashMap::new())
+    }
+
+    pub fn from_columns_and_spans(
+        pos: SectionPos,
+        columns: Vec<LodColumn>,
+        extra_spans: HashMap<u16, Vec<ExtraSpan>>,
+    ) -> Self {
         let populated = columns.iter().filter(|c| !c.is_empty()).count() as u16;
         Self {
             pos,
             columns,
+            extra_spans,
             populated,
             revision: 1,
             dirty_mesh: populated > 0,
@@ -284,8 +475,25 @@ impl LodSection {
         self.columns[Self::index(cx, cz)]
     }
 
+    #[inline]
+    pub fn extra_spans_at(&self, cx: usize, cz: usize) -> &[ExtraSpan] {
+        let idx = Self::index(cx, cz) as u16;
+        self.extra_spans.get(&idx).map_or(&[], Vec::as_slice)
+    }
+
     /// Sets cell `(cx, cz)` if `col.source >= existing.source`. Returns `true` if modified.
     pub fn set_cell(&mut self, cx: usize, cz: usize, col: LodColumn) -> bool {
+        self.set_cell_with_spans(cx, cz, col, Vec::new())
+    }
+
+    /// Sets cell `(cx, cz)` and its lower vertical spans if `col.source >= existing.source`.
+    pub fn set_cell_with_spans(
+        &mut self,
+        cx: usize,
+        cz: usize,
+        col: LodColumn,
+        spans: Vec<ExtraSpan>,
+    ) -> bool {
         if cx >= SECTION_SIZE || cz >= SECTION_SIZE || col.is_empty() {
             return false;
         }
@@ -294,13 +502,21 @@ impl LodSection {
         if cur.source > col.source {
             return false;
         }
-        if cur == col {
+        let key = idx as u16;
+        let same_spans =
+            self.extra_spans.get(&key).map_or(&[][..], Vec::as_slice) == spans.as_slice();
+        if cur == col && same_spans {
             return false;
         }
         if cur.is_empty() {
             self.populated = self.populated.saturating_add(1);
         }
         self.columns[idx] = col;
+        if spans.is_empty() {
+            self.extra_spans.remove(&key);
+        } else {
+            self.extra_spans.insert(key, spans);
+        }
         self.revision = self.revision.wrapping_add(1);
         self.dirty_mesh = true;
         self.dirty_save = true;
@@ -316,6 +532,46 @@ impl LodSection {
             self.get(cx + 1, cz + 1),
         ];
         downsample_quad(samples)
+    }
+
+    /// Downsamples both primary columns and extra vertical spans for a 2x2 child block.
+    pub fn downsample_2x2_with_spans(
+        &self,
+        cx: usize,
+        cz: usize,
+        max_extra_spans: usize,
+    ) -> (LodColumn, Vec<ExtraSpan>) {
+        let col = self.downsample_2x2(cx, cz);
+        if col.is_empty() || max_extra_spans == 0 || self.extra_spans.is_empty() {
+            return (col, Vec::new());
+        }
+        let coords = [(cx, cz), (cx + 1, cz), (cx, cz + 1), (cx + 1, cz + 1)];
+        let mut all_extra: Vec<ExtraSpan> = Vec::new();
+        for (x, z) in coords {
+            all_extra.extend_from_slice(self.extra_spans_at(x, z));
+        }
+        if all_extra.is_empty() {
+            return (col, Vec::new());
+        }
+        // Sort descending by top_y and merge vertically overlapping spans of the same material kind.
+        all_extra.sort_by(|a, b| b.top_y.cmp(&a.top_y));
+        let mut merged: Vec<ExtraSpan> = Vec::new();
+        for span in all_extra {
+            if col.has_solid() && span.top_y >= col.solid_bottom_y && !span.is_fluid {
+                continue;
+            }
+            if let Some(last) = merged.last_mut()
+                && last.is_fluid == span.is_fluid
+                && span.top_y >= last.bottom_y
+            {
+                last.bottom_y = last.bottom_y.min(span.bottom_y);
+                continue;
+            }
+            if merged.len() < max_extra_spans {
+                merged.push(span);
+            }
+        }
+        (col, merged)
     }
 }
 
@@ -427,16 +683,30 @@ impl DimensionLodStore {
 
     /// Propagate dirty detail `d` updates up to parent detail `d + 1`..=`MAX_DETAIL`.
     pub fn propagate_up(&mut self, start_pos: SectionPos) -> Vec<SectionPos> {
+        self.propagate_up_with_quality(start_pos, DhConfig::default().max_extra_spans())
+    }
+
+    /// Propagate dirty detail `d` updates up to parent detail `d + 1`..=`MAX_DETAIL`, preserving
+    /// up to `max_extra_spans` stacked vertical spans per column.
+    pub fn propagate_up_with_quality(
+        &mut self,
+        start_pos: SectionPos,
+        max_extra_spans: usize,
+    ) -> Vec<SectionPos> {
         let mut updated = Vec::new();
         let mut cur_pos = start_pos;
         while let Some(parent_pos) = cur_pos.parent() {
-            let Some(child_snapshot) = self.sections.get(&cur_pos).map(|s| s.columns.clone())
+            let Some((child_columns, child_extra)) = self
+                .sections
+                .get(&cur_pos)
+                .map(|s| (s.columns.clone(), s.extra_spans.clone()))
             else {
                 break;
             };
             let child_tmp = LodSection {
                 pos: cur_pos,
-                columns: child_snapshot,
+                columns: child_columns,
+                extra_spans: child_extra,
                 populated: 0,
                 revision: 0,
                 dirty_mesh: false,
@@ -448,8 +718,11 @@ impl DimensionLodStore {
             let mut changed = false;
             for pz in 0..(SECTION_SIZE / 2) {
                 for px in 0..(SECTION_SIZE / 2) {
-                    let down = child_tmp.downsample_2x2(px * 2, pz * 2);
-                    if !down.is_empty() && parent.set_cell(qx + px, qz + pz, down) {
+                    let (down, down_spans) =
+                        child_tmp.downsample_2x2_with_spans(px * 2, pz * 2, max_extra_spans);
+                    if !down.is_empty()
+                        && parent.set_cell_with_spans(qx + px, qz + pz, down, down_spans)
+                    {
                         changed = true;
                     }
                 }
@@ -675,5 +948,52 @@ mod tests {
         ready.insert(root);
         let vis = DimensionLodStore::select_visible_sections(10.0, 10.0, cfg, &ready);
         assert_eq!(vis, vec![root]);
+    }
+
+    #[test]
+    fn multi_span_extraction_handles_overhangs_cave_culling_and_nether_ceiling() {
+        // Column with an overhang at Y=100..=104, air at Y=70..=99, ground at Y=64..=69,
+        // and a deep cave floor at Y=20..=25.
+        let mut samples = Vec::new();
+        for y in (100..=104).rev() {
+            samples.push(ColumnSample {
+                y,
+                rgb: [140, 140, 140],
+                sky_light: 15,
+                block_light: 0,
+                is_fluid: false,
+            });
+        }
+        for y in (64..=69).rev() {
+            samples.push(ColumnSample {
+                y,
+                rgb: [120, 180, 90],
+                sky_light: 8,
+                block_light: 0,
+                is_fluid: false,
+            });
+        }
+        for y in (20..=25).rev() {
+            samples.push(ColumnSample {
+                y,
+                rgb: [80, 80, 80],
+                sky_light: 0,
+                block_light: 4,
+                is_fluid: false,
+            });
+        }
+
+        // Open-sky with cave culling at Y=60 keeps the overhang + ground (Y=64..70), culls Y=20..26.
+        let (col, extra) = extract_column_spans(&samples, SOURCE_LOADED_CHUNK, 4, true, 60, false);
+        assert_eq!(col.solid_top_y, 105);
+        assert_eq!(col.solid_bottom_y, 100);
+        assert_eq!(extra.len(), 1);
+        assert_eq!((extra[0].top_y, extra[0].bottom_y), (70, 64));
+
+        // Nether ceiling mode ignores cave culling so deep cavern floors stay visible.
+        let (_, nether_extra) =
+            extract_column_spans(&samples, SOURCE_LOADED_CHUNK, 4, true, 60, true);
+        assert_eq!(nether_extra.len(), 2);
+        assert_eq!((nether_extra[1].top_y, nether_extra[1].bottom_y), (26, 20));
     }
 }
