@@ -9,6 +9,7 @@ use crate::config::DhConfig;
 use crate::generic_render::{BeaconTracker, CloudField, GenericGroupMesh};
 use crate::lod::{DimensionLodStore, SectionPos};
 use crate::mesh::{MeshWorker, SectionMeshData};
+use crate::network::SessionConfig;
 use crate::stage3_camera::CameraMatrices;
 use crate::storage::{IoResponse, LodIoWorker};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -533,6 +534,10 @@ pub struct DhState {
     pub disabled_builtin_net: HashSet<String>,
     /// Public API: section positions already requested from a registered `RemoteLodProvider`.
     pub remote_requested: HashMap<String, HashSet<SectionPos>>,
+    /// Server-enforced multiplayer session policy received via `MSG_SESSION_CONFIG`.
+    pub remote_session_config: Option<SessionConfig>,
+    /// Whether `MSG_SESSION_CONFIG_REQUEST` has been sent for the current remote session.
+    pub remote_config_requested: bool,
     /// Generic box groups (beacons, clouds, and third-party mod groups) per dimension.
     pub generic_groups: HashMap<String, HashMap<String, GenericGroupMesh>>,
     pub generic_groups_revision: u64,
@@ -577,6 +582,8 @@ impl Default for DhState {
             disabled_builtin_gen: HashSet::new(),
             disabled_builtin_net: HashSet::new(),
             remote_requested: HashMap::new(),
+            remote_session_config: None,
+            remote_config_requested: false,
             generic_groups: HashMap::new(),
             generic_groups_revision: 0,
             last_uploaded_generic_revision: 0,
@@ -666,13 +673,20 @@ pub fn begin_render_frame(
         .filter(|m| m.dimension == dim_name)
         .collect();
 
+    let mut effective_cfg = st.config;
+    if let Some(scfg) = st.remote_session_config {
+        effective_cfg.render_distance_chunks = effective_cfg
+            .render_distance_chunks
+            .min(scfg.max_render_distance_chunks);
+    }
+
     let ready_set = st
         .meshed_sections
         .get(&dim_name)
         .cloned()
         .unwrap_or_default();
-    let visible_sections = if st.config.enabled {
-        DimensionLodStore::select_visible_sections(camera[0], camera[2], st.config, &ready_set)
+    let visible_sections = if effective_cfg.enabled {
+        DimensionLodStore::select_visible_sections(camera[0], camera[2], effective_cfg, &ready_set)
     } else {
         Vec::new()
     };
@@ -699,9 +713,9 @@ pub fn begin_render_frame(
         .unwrap_or_default();
 
     let params = RenderFrameParams {
-        enabled: st.config.enabled,
+        enabled: effective_cfg.enabled,
         active_dimension: dim_name,
-        config: st.config,
+        config: effective_cfg,
         fog_color: st.fog_color,
         fog_type: st.fog_type,
         env_fog_start: st.env_fog_start,

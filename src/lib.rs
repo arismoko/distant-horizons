@@ -21,6 +21,7 @@ pub mod lod;
 pub mod mesh;
 pub mod network;
 pub mod render_bridge;
+pub mod resource_colors;
 pub mod shader_pack;
 pub mod stage3_camera;
 pub mod storage;
@@ -44,11 +45,11 @@ use mod_api::client::fog::FogType;
 use mod_api::{
     self, BlockChangedEvent, ChunkLoadEvent, ClientBlockChangedEvent, ClientChunkLoadEvent,
     ClientChunkUnloadEvent, ClientHost, ClientLevelLoadEvent, ClientLevelUnloadEvent,
-    ClientSetupContext, ClientSetupEvent, ClientTickPreEvent, CommandEvent, DebugEntry, DebugGroup,
-    Flow, Heightmap, Hooks, HostSide, LevelDimension, LevelHost, LevelLoadEvent,
-    LevelTickPostEvent, LevelUnloadEvent, MAX_TERRAIN_COLUMNS, RegisterClientCommandsEvent,
-    RegisterDebugEntriesEvent, Registrar, RegistrationContext, RenderFogEvent, ServerHost,
-    ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
+    ClientReloadHost, ClientSetupContext, ClientSetupEvent, ClientTickPreEvent, CommandEvent,
+    DebugEntry, DebugGroup, Flow, Heightmap, Hooks, HostSide, LevelDimension, LevelHost,
+    LevelLoadEvent, LevelTickPostEvent, LevelUnloadEvent, MAX_TERRAIN_COLUMNS,
+    RegisterClientCommandsEvent, RegisterDebugEntriesEvent, Registrar, RegistrationContext,
+    RenderFogEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
 };
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -81,6 +82,16 @@ impl Hooks for DistantHorizonsMod {
 
     fn client_setup(&self, host: &mut dyn ClientSetupContext, _event: &mut ClientSetupEvent) {
         *self.keybinds.lock().unwrap() = DhKeybinds::resolve(host);
+        let _ = resource_colors::reload_from_resources(host);
+    }
+
+    fn client_resources_reloaded(
+        &self,
+        host: &dyn ClientReloadHost,
+        _event: &mut mod_api::ClientResourcesReloadedEvent,
+    ) {
+        let _ = resource_colors::reload_from_resources(host);
+        let _ = commands::remesh_active_dimension();
     }
 
     fn register_client_commands(
@@ -151,6 +162,8 @@ impl Hooks for DistantHorizonsMod {
         let rt = runtime();
         let mut st = rt.inner.lock().unwrap();
         st.remote_requested.remove(event.dimension);
+        st.remote_session_config = None;
+        st.remote_config_requested = false;
         st.client_loaded_chunks.clear();
         if st.active_dimension == event.dimension {
             st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
