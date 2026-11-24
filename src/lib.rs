@@ -323,6 +323,7 @@ fn sample_loaded_chunks(
     chunks: &[[i32; 2]],
     dirty_sections: &mut HashSet<SectionPos>,
 ) {
+    let level_ref = host.level(dim);
     let mut columns = Vec::with_capacity(chunks.len() * 256);
     for &[cx, cz] in chunks {
         let bx0 = cx << 4;
@@ -354,6 +355,29 @@ fn sample_loaded_chunks(
         .map(|state| state.block().id(host).unwrap_or("minecraft:stone"))
         .collect();
 
+    // Sample biomes on the vanilla 4x4 quart grid per chunk (16 calls/chunk vs 256) so grass,
+    // foliage, and water tints on loaded chunks match surrounding distant terrain seamlessly.
+    let mut chunk_biomes: Vec<[String; 16]> = Vec::with_capacity(chunks.len());
+    for (ci, &[cx, cz]) in chunks.iter().enumerate() {
+        let bx0 = cx << 4;
+        let bz0 = cz << 4;
+        let mut grid: [String; 16] = std::array::from_fn(|_| "minecraft:plains".to_owned());
+        if let Some(level) = level_ref {
+            for qz in 0..4 {
+                for qx in 0..4 {
+                    let lx = qx * 4 + 2;
+                    let lz = qz * 4 + 2;
+                    let col_idx = ci * 256 + lz * 16 + lx;
+                    let y = read.bases.get(col_idx).and_then(|b| *b).unwrap_or(64);
+                    if let Some(b) = level.biome_at(host, [bx0 + lx as i32, y, bz0 + lz as i32]) {
+                        grid[qz * 4 + qx] = b;
+                    }
+                }
+            }
+        }
+        chunk_biomes.push(grid);
+    }
+
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
     let store = st.dimensions.entry(dim.to_owned()).or_default();
@@ -368,6 +392,15 @@ fn sample_loaded_chunks(
         }
         let col_blocks = &read.blocks[slice_start..slice_start + span];
         let water_hint = read.water_colors.get(col_idx).copied().unwrap_or(0);
+
+        let ci = col_idx / 256;
+        let local_idx = col_idx % 256;
+        let qx = (local_idx % 16) / 4;
+        let qz = (local_idx / 16) / 4;
+        let biome_id = chunk_biomes
+            .get(ci)
+            .map(|g| g[qz * 4 + qx].as_str())
+            .unwrap_or("minecraft:plains");
 
         let mut fluid_top: Option<i32> = None;
         let mut solid_top: Option<(i32, &str)> = None;
@@ -398,8 +431,8 @@ fn sample_loaded_chunks(
             },
         };
 
-        let solid_rgb = block_color(block_id, "minecraft:plains", water_hint);
-        let fluid_rgb = biome_water_color("minecraft:plains", water_hint);
+        let solid_rgb = block_color(block_id, biome_id, water_hint);
+        let fluid_rgb = biome_water_color(biome_id, water_hint);
         let lod_col = LodColumn::from_solid_and_fluid(
             top_y,
             top_y - 8,

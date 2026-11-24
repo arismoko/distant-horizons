@@ -14,7 +14,42 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         fluid_vb: Option<wgpu::Buffer>,
         fluid_ib: Option<wgpu::Buffer>,
         fluid_indices: u32,
+        min_y: f32,
+        max_y: f32,
         quad_count: u32,
+    }
+
+    /// Extract the 4 side frustum planes (left, right, bottom, top) from `world.jittered`
+    /// (column-major projection*view matrix). Each plane `[a, b, c, d]` accepts a camera-relative
+    /// point `p` when `a*p.x + b*p.y + c*p.z + d >= 0`.
+    fn extract_side_frustum_planes(mat: [f32; 16]) -> [[f32; 4]; 4] {
+        // Row i of column-major mat is [mat[i], mat[4+i], mat[8+i], mat[12+i]].
+        let row = |r: usize| [mat[r], mat[4 + r], mat[8 + r], mat[12 + r]];
+        let r0 = row(0);
+        let r1 = row(1);
+        let r3 = row(3);
+        let add = |a: [f32; 4], b: [f32; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+        let sub = |a: [f32; 4], b: [f32; 4]| [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]];
+        [
+            add(r3, r0), // left:   x + w >= 0
+            sub(r3, r0), // right:  w - x >= 0
+            add(r3, r1), // bottom: y + w >= 0
+            sub(r3, r1), // top:    w - y >= 0
+        ]
+    }
+
+    /// Returns `true` if the camera-relative AABB `[min_x..max_x, min_y..max_y, min_z..max_z]`
+    /// intersects the 4 side frustum planes (extended far plane is handled separately by distance).
+    fn aabb_in_side_frustum(planes: &[[f32; 4]; 4], min_p: [f32; 3], max_p: [f32; 3]) -> bool {
+        for p in planes {
+            let px = if p[0] >= 0.0 { max_p[0] } else { min_p[0] };
+            let py = if p[1] >= 0.0 { max_p[1] } else { min_p[1] };
+            let pz = if p[2] >= 0.0 { max_p[2] } else { min_p[2] };
+            if p[0] * px + p[1] * py + p[2] * pz + p[3] < 0.0 {
+                return false;
+            }
+        }
+        true
     }
 
     struct DhGpuState {
@@ -424,6 +459,8 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
             fluid_vb,
             fluid_ib,
             fluid_indices,
+            min_y: mesh.min_y,
+            max_y: mesh.max_y,
             quad_count: mesh.quad_count,
         }
     }
@@ -472,7 +509,9 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         state.sections.insert(mesh.pos, gpu_sec);
     }
 
-    // Build ordered draw list and per-section camera-relative instance offsets.
+    // Build frustum-culled draw list and per-section camera-relative instance offsets.
+    let mat_cols = world.jittered.to_cols_array();
+    let frustum_planes = extract_side_frustum_planes(mat_cols);
     let mut draw_list: Vec<SectionPos> = Vec::with_capacity(params.visible_sections.len());
     let mut instance_bytes: Vec<u8> = Vec::with_capacity(params.visible_sections.len() * 16);
     let mut total_quads: u64 = 0;
@@ -485,9 +524,15 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
             continue;
         }
         let (ox, oz) = pos.block_origin();
+        let span = pos.block_span() as f32;
         let rel_x = (ox as f64 - world.camera.x) as f32;
         let rel_y = (-world.camera.y) as f32;
         let rel_z = (oz as f64 - world.camera.z) as f32;
+        let min_p = [rel_x, sec.min_y + rel_y, rel_z];
+        let max_p = [rel_x + span, sec.max_y + rel_y, rel_z + span];
+        if !aabb_in_side_frustum(&frustum_planes, min_p, max_p) {
+            continue;
+        }
         let cell_sz = pos.cell_size() as f32;
         instance_bytes.extend_from_slice(&rel_x.to_le_bytes());
         instance_bytes.extend_from_slice(&rel_y.to_le_bytes());
@@ -524,7 +569,6 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
 
     // Pack Terrain FrameUniforms (112 bytes)
     let mut u_bytes = [0u8; 112];
-    let mat_cols = world.jittered.to_cols_array();
     for (i, f) in mat_cols.iter().enumerate() {
         u_bytes[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
