@@ -13,10 +13,12 @@ pub const MAX_DETAIL: u8 = 6;
 pub const EMPTY_Y: i16 = i16::MIN;
 
 /// Provenance priority for an LOD column: finer/authoritative sources never get overwritten by
-/// coarser generator estimates.
+/// coarser generator estimates (`Loaded > SavedRegion > DetachedGen > DistantSurface`).
 pub const SOURCE_EMPTY: u8 = 0;
 pub const SOURCE_DISTANT_SURFACE: u8 = 1;
-pub const SOURCE_LOADED_CHUNK: u8 = 2;
+pub const SOURCE_DETACHED_GEN: u8 = 2;
+pub const SOURCE_SAVED_REGION: u8 = 3;
+pub const SOURCE_LOADED_CHUNK: u8 = 4;
 
 /// Unique key for one `64 x 64` cell section at a given detail level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

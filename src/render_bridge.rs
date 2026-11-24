@@ -6,6 +6,11 @@
 
 use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
+#[cfg(feature = "sunrise-gaps-g1-g4")]
+use crate::data_pipeline::sunrise_adapters::{BlockVisualTable, DimensionGapHandles};
+use crate::data_pipeline::{
+    DataPipelineWorker, PipelineBatch, apply_coarse_section, apply_extracted_chunk,
+};
 use crate::lod::{DimensionLodStore, SectionPos};
 use crate::mesh::{MeshWorker, SectionMeshData};
 use crate::stage3_camera::CameraMatrices;
@@ -285,6 +290,7 @@ pub struct DhRuntime {
     pub frames_drawn: AtomicU64,
     pub io: LodIoWorker,
     pub mesher: MeshWorker,
+    pub data_pipeline: DataPipelineWorker,
     pub inner: Mutex<DhState>,
 }
 
@@ -325,6 +331,12 @@ pub struct DhState {
     pub disabled_builtin_net: HashSet<String>,
     /// Public API: section positions already requested from a registered `RemoteLodProvider`.
     pub remote_requested: HashMap<String, HashSet<SectionPos>>,
+    /// Stage 2b (G1–G4): immutable block visual table built once from `Host` for worker threads.
+    #[cfg(feature = "sunrise-gaps-g1-g4")]
+    pub block_visuals: Option<BlockVisualTable>,
+    /// Stage 2b (G2–G4): per-dimension saved-region readers, detached generators & chunk request drivers.
+    #[cfg(feature = "sunrise-gaps-g1-g4")]
+    pub gap_handles: HashMap<String, DimensionGapHandles>,
 }
 
 impl Default for DhState {
@@ -356,6 +368,10 @@ impl Default for DhState {
             disabled_builtin_gen: HashSet::new(),
             disabled_builtin_net: HashSet::new(),
             remote_requested: HashMap::new(),
+            #[cfg(feature = "sunrise-gaps-g1-g4")]
+            block_visuals: None,
+            #[cfg(feature = "sunrise-gaps-g1-g4")]
+            gap_handles: HashMap::new(),
         }
     }
 }
@@ -372,6 +388,7 @@ pub fn runtime() -> &'static Arc<DhRuntime> {
             frames_drawn: AtomicU64::new(0),
             io: LodIoWorker::spawn(),
             mesher: MeshWorker::spawn(),
+            data_pipeline: DataPipelineWorker::spawn(),
             inner: Mutex::new(DhState::default()),
         })
     })
@@ -387,13 +404,61 @@ pub fn needs_world_depth() -> bool {
 pub fn begin_render_frame(camera: [f64; 3]) -> (RenderFrameParams, Vec<SectionMeshData>, u64) {
     let rt = runtime();
 
-    // First pull any newly finished CPU meshes from the background meshing worker.
+    // First pull any newly finished CPU meshes, IO responses, and off-thread data pipeline batches.
     let finished_meshes = rt.mesher.drain_finished();
     let io_responses = rt.io.drain_responses();
+    let pipeline_batches = rt.data_pipeline.drain_finished();
 
     let mut st = rt.inner.lock().unwrap();
     st.camera_pos = camera;
     st.has_camera = true;
+
+    if !pipeline_batches.is_empty() {
+        let save_root = st.world_dir.clone();
+        let mut dirty_by_dim: HashMap<String, HashSet<SectionPos>> = HashMap::new();
+        for batch in pipeline_batches {
+            match batch {
+                PipelineBatch::Chunk(extracted) => {
+                    let dim = extracted.dimension.clone();
+                    let store = st.dimensions.entry(dim.clone()).or_default();
+                    for pos in apply_extracted_chunk(store, extracted) {
+                        dirty_by_dim.entry(dim.clone()).or_default().insert(pos);
+                    }
+                }
+                PipelineBatch::CoarseSection(coarse) => {
+                    let dim = coarse.dimension.clone();
+                    let store = st.dimensions.entry(dim.clone()).or_default();
+                    if let Some(pos) = apply_coarse_section(store, coarse) {
+                        dirty_by_dim.entry(dim).or_default().insert(pos);
+                    }
+                }
+            }
+        }
+        for (dim, dirty_sections) in dirty_by_dim {
+            let store = st.dimensions.entry(dim.clone()).or_default();
+            let mut to_mesh: HashSet<SectionPos> = dirty_sections.clone();
+            for &pos in &dirty_sections {
+                for parent_pos in store.propagate_up(pos) {
+                    to_mesh.insert(parent_pos);
+                }
+            }
+            for pos in to_mesh {
+                if let Some(sec) = store.sections.get_mut(&pos) {
+                    if sec.dirty_mesh && sec.populated > 0 {
+                        sec.dirty_mesh = false;
+                        rt.mesher.submit(dim.clone(), sec.clone());
+                    }
+                    if sec.dirty_save
+                        && sec.populated > 0
+                        && let Some(ref dir) = save_root
+                    {
+                        sec.dirty_save = false;
+                        rt.io.request_save(dir.clone(), dim.clone(), sec.clone());
+                    }
+                }
+            }
+        }
+    }
 
     for res in io_responses {
         match res {

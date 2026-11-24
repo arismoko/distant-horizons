@@ -163,6 +163,8 @@ impl Hooks for DistantHorizonsMod {
             .unwrap()
             .client_loaded_chunks
             .insert(event.chunk);
+        #[cfg(feature = "sunrise-gaps-g1-g4")]
+        submit_client_chunk_snapshot(host, event.dimension, event.chunk);
     }
 
     fn client_chunk_unload(
@@ -182,7 +184,9 @@ impl Hooks for DistantHorizonsMod {
         if !host.on(MOD_ID) || event.predicted {
             return;
         }
-        // Record chunk coordinate for future client-side ChunkSnapshot refresh (G1/#5233).
+        #[cfg(feature = "sunrise-gaps-g1-g4")]
+        submit_client_chunk_snapshot(host, event.dimension, [event.pos.x >> 4, event.pos.z >> 4]);
+        #[cfg(not(feature = "sunrise-gaps-g1-g4"))]
         let _ = (event.dimension, [event.pos.x >> 4, event.pos.z >> 4]);
     }
 
@@ -341,15 +345,28 @@ impl Hooks for DistantHorizonsMod {
             st.world_dir = world_dir;
         }
         st.dimensions.entry(event.dimension.to_owned()).or_default();
+        drop(st);
+        #[cfg(feature = "sunrise-gaps-g1-g4")]
+        init_server_gap_handles(host, event.dimension);
     }
 
     fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
         let world_dir = host.world_dir();
         flush_dimension_dirty(world_dir, event.dimension);
+        let rt = runtime();
+        rt.data_pipeline.clear_dimension(event.dimension);
+        #[cfg(feature = "sunrise-gaps-g1-g4")]
+        {
+            rt.inner.lock().unwrap().gap_handles.remove(event.dimension);
+        }
     }
 
     fn chunk_load(&self, host: &mut dyn ServerHost, event: &mut ChunkLoadEvent<'_>) {
         if !host.on(MOD_ID) {
+            return;
+        }
+        #[cfg(feature = "sunrise-gaps-g1-g4")]
+        if submit_server_chunk_snapshot(host, event.dimension, event.chunk) {
             return;
         }
         enqueue_chunk(event.dimension, event.chunk);
@@ -450,7 +467,13 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
 
     if distant_on && host.server_has_time() && dim == active_dim {
         let center = cam.unwrap_or([0.0, 64.0, 0.0]);
-        sample_distant_sections(host, dim, center, cfg, &mut dirty_sections);
+        #[cfg(feature = "sunrise-gaps-g1-g4")]
+        let used_offthread = tick_offthread_gap_pipeline(host, dim, center, cfg);
+        #[cfg(not(feature = "sunrise-gaps-g1-g4"))]
+        let used_offthread = false;
+        if !used_offthread {
+            sample_distant_sections(host, dim, center, cfg, &mut dirty_sections);
+        }
     }
 
     // 3. Propagate dirty sections up the quadtree, queue meshing, and persist dirty sections.
@@ -805,4 +828,217 @@ fn flush_dirty_sections(world_dir: Option<std::path::PathBuf>) {
             }
         }
     }
+}
+
+#[cfg(feature = "sunrise-gaps-g1-g4")]
+fn ensure_block_visuals(
+    host: &dyn mod_api::Host,
+) -> data_pipeline::sunrise_adapters::BlockVisualTable {
+    let rt = runtime();
+    let existing = rt.inner.lock().unwrap().block_visuals.clone();
+    if let Some(table) = existing {
+        return table;
+    }
+    let built = data_pipeline::sunrise_adapters::build_block_visual_table(host);
+    rt.inner.lock().unwrap().block_visuals = Some(std::sync::Arc::clone(&built));
+    built
+}
+
+#[cfg(feature = "sunrise-gaps-g1-g4")]
+fn submit_client_chunk_snapshot(host: &dyn ClientHost, dimension: &str, chunk: [i32; 2]) {
+    let Some(level) = host.level(dimension) else {
+        return;
+    };
+    let Some(chunk_ref) = level.chunk_ref(host, chunk) else {
+        return;
+    };
+    let Some(snapshot) = chunk_ref.snapshot(host) else {
+        return;
+    };
+    let blocks = ensure_block_visuals(host);
+    let rt = runtime();
+    let cfg = rt.inner.lock().unwrap().config;
+    rt.data_pipeline.submit_snapshot(
+        dimension.to_owned(),
+        data_pipeline::sunrise_adapters::ModChunkSnapshot::new(snapshot, blocks),
+        cfg,
+        SOURCE_LOADED_CHUNK,
+    );
+}
+
+#[cfg(feature = "sunrise-gaps-g1-g4")]
+fn submit_server_chunk_snapshot(host: &dyn ServerHost, dimension: &str, chunk: [i32; 2]) -> bool {
+    let Some(level) = host.level(dimension) else {
+        return false;
+    };
+    let Some(chunk_ref) = level.chunk_ref(host, chunk) else {
+        return false;
+    };
+    let Some(snapshot) = chunk_ref.snapshot(host) else {
+        return false;
+    };
+    let blocks = ensure_block_visuals(host);
+    let rt = runtime();
+    let cfg = rt.inner.lock().unwrap().config;
+    rt.data_pipeline.submit_snapshot(
+        dimension.to_owned(),
+        data_pipeline::sunrise_adapters::ModChunkSnapshot::new(snapshot, blocks),
+        cfg,
+        SOURCE_LOADED_CHUNK,
+    );
+    true
+}
+
+#[cfg(feature = "sunrise-gaps-g1-g4")]
+fn init_server_gap_handles(host: &dyn ServerHost, dimension: &str) {
+    let Some(level) = host.level(dimension) else {
+        return;
+    };
+    let blocks = ensure_block_visuals(host);
+    let saved_reader = level.saved_chunk_reader(host).map(|r| {
+        std::sync::Arc::new(data_pipeline::sunrise_adapters::ModSavedRegionSource::new(
+            r,
+            std::sync::Arc::clone(&blocks),
+        ))
+    });
+    let detached_gen = level.detached_generator(host).map(|g| {
+        std::sync::Arc::new(
+            data_pipeline::sunrise_adapters::ModDetachedGeneratorSource::new(g, blocks),
+        )
+    });
+    let rt = runtime();
+    let mut st = rt.inner.lock().unwrap();
+    let entry = st.gap_handles.entry(dimension.to_owned()).or_default();
+    entry.saved_reader = saved_reader;
+    entry.detached_gen = detached_gen;
+}
+
+#[cfg(feature = "sunrise-gaps-g1-g4")]
+fn tick_offthread_gap_pipeline(
+    host: &mut dyn ServerHost,
+    dim: &str,
+    cam: [f64; 3],
+    cfg: DhConfig,
+) -> bool {
+    let rt = runtime();
+    let Some(level) = host.level(dim) else {
+        return false;
+    };
+    let blocks = ensure_block_visuals(host);
+
+    // Ensure handles exist even if level_load ran before the mod was enabled.
+    let (saved_reader, detached_gen, builtin_disabled) = {
+        let st = rt.inner.lock().unwrap();
+        let handles = st.gap_handles.get(dim);
+        (
+            handles.and_then(|h| h.saved_reader.clone()),
+            handles.and_then(|h| h.detached_gen.clone()),
+            st.disabled_builtin_gen.contains(dim),
+        )
+    };
+    if saved_reader.is_none() && detached_gen.is_none() {
+        init_server_gap_handles(host, dim);
+    }
+
+    // Drain any completed G2 non-blocking server chunk requests and cancel far ones.
+    let center_chunk = [(cam[0].floor() as i32) >> 4, (cam[2].floor() as i32) >> 4];
+    {
+        let mut st = rt.inner.lock().unwrap();
+        if let Some(handles) = st.gap_handles.get_mut(dim) {
+            handles.chunk_requests.drain_into_worker(
+                host,
+                level,
+                dim,
+                &rt.data_pipeline,
+                &blocks,
+                cfg,
+            );
+            handles
+                .chunk_requests
+                .cancel_far(host, center_chunk, cfg.render_distance_chunks + 8);
+        }
+    }
+
+    // G3: schedule up to 2 nearby Anvil regions per tick on the background worker.
+    if let Some(reader) = saved_reader {
+        let regions =
+            data_pipeline::nearby_regions_sorted(cam[0], cam[2], cfg.render_distance_chunks);
+        let mut scheduled = 0usize;
+        for region in regions {
+            if rt.data_pipeline.schedule_saved_region(
+                dim.to_owned(),
+                region,
+                std::sync::Arc::clone(&reader),
+                cfg,
+            ) {
+                scheduled += 1;
+                if scheduled >= 2 {
+                    break;
+                }
+            }
+        }
+    }
+
+    if builtin_disabled {
+        return true;
+    }
+
+    // G4: schedule inner detail-0 chunks on full detached generation and outer coarse sections on
+    // off-thread `sample_surface_columns`.
+    let Some(generator) = detached_gen else {
+        return false;
+    };
+    let stage = data_pipeline::DistantGenStage::from_config_mode(cfg.distant_generation_mode);
+    let desired = DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg);
+    let mut inner_chunks = Vec::new();
+    let mut outer_sections = Vec::new();
+    {
+        let st = rt.inner.lock().unwrap();
+        let store = st.dimensions.get(dim);
+        for pos in desired {
+            let populated = store
+                .and_then(|d| d.sections.get(&pos))
+                .map(|s| s.populated)
+                .unwrap_or(0);
+            if populated >= (SECTION_SIZE * SECTION_SIZE) as u16 {
+                continue;
+            }
+            if pos.detail == 0 {
+                if inner_chunks.len() < 8 {
+                    let (ox, oz) = pos.block_origin();
+                    let base_cx = ox >> 4;
+                    let base_cz = oz >> 4;
+                    for dz in 0..4 {
+                        for dx in 0..4 {
+                            inner_chunks.push([base_cx + dx, base_cz + dz]);
+                        }
+                    }
+                }
+            } else if outer_sections.len() < 4 {
+                outer_sections.push(pos);
+            }
+        }
+    }
+
+    if rt.data_pipeline.inflight_detached_count(dim) < 32 {
+        for chunk_pos in inner_chunks.into_iter().take(8) {
+            rt.data_pipeline.schedule_detached_chunk(
+                dim.to_owned(),
+                chunk_pos,
+                stage,
+                std::sync::Arc::clone(&generator),
+                cfg,
+            );
+        }
+    }
+    if rt.data_pipeline.inflight_coarse_count(dim) < 16 {
+        for sec_pos in outer_sections {
+            rt.data_pipeline.schedule_coarse_section(
+                dim.to_owned(),
+                sec_pos,
+                std::sync::Arc::clone(&generator),
+            );
+        }
+    }
+    true
 }
