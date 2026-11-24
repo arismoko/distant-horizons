@@ -11,12 +11,16 @@
 //! - `sunrise-mod-render` mixins (`render_needs`, `world_drawn`) render LOD geometry with an
 //!   independent reversed-Z depth buffer and sky-masked atmospheric fog compositing.
 
+pub mod api;
 pub mod colors;
 pub mod config;
+pub mod dh_v2;
 pub mod lod;
 pub mod mesh;
 pub mod render_bridge;
 pub mod storage;
+
+use crate::api::{LodGenRequest, LodGenStep, LodSectionPos, ingest_gen_output};
 
 use crate::colors::{biome_water_color, block_color, is_skippable_for_lod, is_water_block};
 use crate::config::{DhConfig, MOD_ID};
@@ -111,6 +115,7 @@ impl Hooks for DistantHorizonsMod {
     ) {
         let rt = runtime();
         let mut st = rt.inner.lock().unwrap();
+        st.remote_requested.remove(event.dimension);
         if st.active_dimension == event.dimension {
             st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
         }
@@ -123,17 +128,65 @@ impl Hooks for DistantHorizonsMod {
 
         let cam = host.camera();
         let clock = host.clock();
-        let mut st = rt.inner.lock().unwrap();
-        st.config = cfg;
-        if let Some(camera) = cam {
-            st.camera_pos = camera.position;
-            st.has_camera = true;
-            if st.vanilla_far_blocks <= 16.0 && camera.far.is_finite() && camera.far > 64.0 {
-                st.vanilla_far_blocks = camera.far * 0.25;
+        let remote_batch = {
+            let mut st = rt.inner.lock().unwrap();
+            st.config = cfg;
+            if let Some(camera) = cam {
+                st.camera_pos = camera.position;
+                st.has_camera = true;
+                if st.vanilla_far_blocks <= 16.0 && camera.far.is_finite() && camera.far > 64.0 {
+                    st.vanilla_far_blocks = camera.far * 0.25;
+                }
             }
-        }
-        if let Some(clk) = clock {
-            st.sun_brightness = sun_brightness_from_day_time(clk.day_time, &st.active_dimension);
+            if let Some(clk) = clock {
+                st.sun_brightness =
+                    sun_brightness_from_day_time(clk.day_time, &st.active_dimension);
+            }
+
+            let active_dim = st.active_dimension.clone();
+            if cfg.enabled && st.has_camera {
+                if let Some(provider) = st.remote_providers.get(&active_dim).cloned() {
+                    let desired = DimensionLodStore::desired_sections_coarse_to_fine(
+                        st.camera_pos[0],
+                        st.camera_pos[2],
+                        cfg,
+                    );
+                    let mut to_request = Vec::with_capacity(4);
+                    for pos in desired {
+                        let populated = st
+                            .dimensions
+                            .get(&active_dim)
+                            .and_then(|d| d.sections.get(&pos))
+                            .map(|s| s.populated > 0)
+                            .unwrap_or(false);
+                        if populated {
+                            continue;
+                        }
+                        if st
+                            .remote_requested
+                            .entry(active_dim.clone())
+                            .or_default()
+                            .insert(pos)
+                        {
+                            to_request.push(pos);
+                            if to_request.len() >= 4 {
+                                break;
+                            }
+                        }
+                    }
+                    Some((provider, active_dim, to_request))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some((provider, dim, positions)) = remote_batch {
+            for pos in positions {
+                provider.request_section(&dim, LodSectionPos::from(pos), 0);
+            }
         }
     }
 
@@ -306,11 +359,12 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
                     sec.dirty_mesh = false;
                     rt.mesher.submit(dim.to_owned(), sec.clone());
                 }
-                if sec.dirty_save && sec.populated > 0 {
-                    if let Some(ref dir) = save_root {
-                        sec.dirty_save = false;
-                        rt.io.request_save(dir.clone(), dim.to_owned(), sec.clone());
-                    }
+                if sec.dirty_save
+                    && sec.populated > 0
+                    && let Some(ref dir) = save_root
+                {
+                    sec.dirty_save = false;
+                    rt.io.request_save(dir.clone(), dim.to_owned(), sec.clone());
                 }
             }
         }
@@ -463,9 +517,12 @@ fn sample_distant_sections(
     let desired = DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg);
 
     // Pick the nearest desired section that still has unpopulated cells, and issue async disk
-    // load checks for unseen sections first.
-    let target_section: Option<(SectionPos, Vec<(usize, usize)>)> = {
+    // load checks for unseen sections first. Also capture any registered external world generator
+    // override or built-in generation disable flag.
+    let (target_section, custom_gen, builtin_disabled) = {
         let mut st = rt.inner.lock().unwrap();
+        let custom_gen = st.world_generators.get(dim).cloned();
+        let builtin_disabled = st.disabled_builtin_gen.contains(dim);
         let save_root = st.world_dir.clone();
         let store = st.dimensions.entry(dim.to_owned()).or_default();
 
@@ -511,12 +568,40 @@ fn sample_distant_sections(
                 break;
             }
         }
-        picked
+        (picked, custom_gen, builtin_disabled)
     };
 
     let Some((pos, cells)) = target_section else {
         return;
     };
+
+    // If a mod registered a custom `LodWorldGenerator` covering this detail level, delegate
+    // generation to it instead of calling built-in `terrain_surface`.
+    if let Some(generator) = custom_gen
+        && generator.detail_range().contains(&pos.detail)
+    {
+        generator.pre_task_start();
+        let req = LodGenRequest {
+            dimension: dim.to_owned(),
+            pos: LodSectionPos::from(pos),
+            target_step: LodGenStep::Surface,
+        };
+        let mut produced = 0usize;
+        generator.generate(&req, &mut |out| {
+            if let Ok(n) = ingest_gen_output(dim, out) {
+                produced = produced.saturating_add(n);
+            }
+        });
+        let mut st = rt.inner.lock().unwrap();
+        let store = st.dimensions.entry(dim.to_owned()).or_default();
+        store.sampled_distant_sections.insert(pos);
+        store.generated_columns = store.generated_columns.saturating_add(produced as u64);
+        return;
+    }
+
+    if builtin_disabled {
+        return;
+    }
 
     let (ox, oz) = pos.block_origin();
     let step = pos.cell_size();

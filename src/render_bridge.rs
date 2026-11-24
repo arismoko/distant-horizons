@@ -4,6 +4,7 @@
 //! Keeps all `wgpu` types inside `src/mixins/world_drawn.rs` while the mod crate owns LOD data,
 //! settings, visibility selection, shaders, and telemetry.
 
+use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
 use crate::lod::{DimensionLodStore, SectionPos};
 use crate::mesh::{MeshWorker, SectionMeshData};
@@ -298,6 +299,16 @@ pub struct DhState {
     pub meshed_sections: HashMap<String, HashSet<SectionPos>>,
     /// Counter bumped when active dimension resets so the GPU cache drops stale buffers.
     pub gpu_reset_epoch: u64,
+    /// Public API: per-dimension custom world generators overriding built-in distant sampling.
+    pub world_generators: HashMap<String, Arc<dyn LodWorldGenerator>>,
+    /// Public API: per-dimension client-side remote LOD providers.
+    pub remote_providers: HashMap<String, Arc<dyn RemoteLodProvider>>,
+    /// Public API: dimensions where built-in distant generation is explicitly disabled.
+    pub disabled_builtin_gen: HashSet<String>,
+    /// Public API: dimensions where built-in multiplayer LOD networking is explicitly disabled.
+    pub disabled_builtin_net: HashSet<String>,
+    /// Public API: section positions already requested from a registered `RemoteLodProvider`.
+    pub remote_requested: HashMap<String, HashSet<SectionPos>>,
 }
 
 impl Default for DhState {
@@ -317,6 +328,11 @@ impl Default for DhState {
             pending_gpu_uploads: Vec::new(),
             meshed_sections: HashMap::new(),
             gpu_reset_epoch: 0,
+            world_generators: HashMap::new(),
+            remote_providers: HashMap::new(),
+            disabled_builtin_gen: HashSet::new(),
+            disabled_builtin_net: HashSet::new(),
+            remote_requested: HashMap::new(),
         }
     }
 }

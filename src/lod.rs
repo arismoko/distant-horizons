@@ -187,6 +187,7 @@ impl LodColumn {
         rgba[3] & 0x0F
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_solid_and_fluid(
         solid_top_y: i32,
         solid_bottom_y: i32,
@@ -554,7 +555,7 @@ impl LodSection {
             return (col, Vec::new());
         }
         // Sort descending by top_y and merge vertically overlapping spans of the same material kind.
-        all_extra.sort_by(|a, b| b.top_y.cmp(&a.top_y));
+        all_extra.sort_by_key(|s| std::cmp::Reverse(s.top_y));
         let mut merged: Vec<ExtraSpan> = Vec::new();
         for span in all_extra {
             if col.has_solid() && span.top_y >= col.solid_bottom_y && !span.is_fluid {
@@ -845,24 +846,25 @@ fn select_node(
     if dist > max_dist {
         return;
     }
-    if pos.detail > 0 && dist < config.detail_split_distance_blocks(pos.detail) as f64 {
-        if let Some(children) = pos.children() {
-            // Subdivide if at least one child is ready (or if parent itself isn't ready).
-            let any_child_ready = children.iter().any(|c| ready_meshes.contains(c));
-            let all_children_ready = children.iter().all(|c| ready_meshes.contains(c));
-            if all_children_ready || (!ready_meshes.contains(&pos) && any_child_ready) {
-                for child in children {
-                    select_node(child, cam_x, cam_z, max_dist, config, ready_meshes, out);
-                }
-                return;
+    if pos.detail > 0
+        && dist < config.detail_split_distance_blocks(pos.detail) as f64
+        && let Some(children) = pos.children()
+    {
+        // Subdivide if at least one child is ready (or if parent itself isn't ready).
+        let any_child_ready = children.iter().any(|c| ready_meshes.contains(c));
+        let all_children_ready = children.iter().all(|c| ready_meshes.contains(c));
+        if all_children_ready || (!ready_meshes.contains(&pos) && any_child_ready) {
+            for child in children {
+                select_node(child, cam_x, cam_z, max_dist, config, ready_meshes, out);
             }
-            // Also check grandchildren when parent isn't ready so finer meshes always show.
-            if !ready_meshes.contains(&pos) {
-                for child in children {
-                    select_node(child, cam_x, cam_z, max_dist, config, ready_meshes, out);
-                }
-                return;
+            return;
+        }
+        // Also check grandchildren when parent isn't ready so finer meshes always show.
+        if !ready_meshes.contains(&pos) {
+            for child in children {
+                select_node(child, cam_x, cam_z, max_dist, config, ready_meshes, out);
             }
+            return;
         }
     }
     if ready_meshes.contains(&pos) {
@@ -883,11 +885,12 @@ fn collect_progressive_nodes(
         return;
     }
     by_detail[pos.detail as usize].push(pos);
-    if pos.detail > 0 && dist < config.detail_split_distance_blocks(pos.detail) as f64 {
-        if let Some(children) = pos.children() {
-            for child in children {
-                collect_progressive_nodes(child, cam_x, cam_z, max_dist, config, by_detail);
-            }
+    if pos.detail > 0
+        && dist < config.detail_split_distance_blocks(pos.detail) as f64
+        && let Some(children) = pos.children()
+    {
+        for child in children {
+            collect_progressive_nodes(child, cam_x, cam_z, max_dist, config, by_detail);
         }
     }
 }

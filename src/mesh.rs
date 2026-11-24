@@ -420,7 +420,8 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
 
                 if !span.is_fluid {
                     // Emit side faces only where the neighboring cell does not cover this span.
-                    let sides: [((isize, isize), u32, [[f32; 3]; 4]); 4] = [
+                    type SideQuad = ((isize, isize), u32, [[f32; 3]; 4]);
+                    let sides: [SideQuad; 4] = [
                         (
                             (0, -1),
                             2,

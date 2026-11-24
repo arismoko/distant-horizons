@@ -11,3 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+ruzstd = "0.9"
+xz4rust = { version = "0.2.3", default-features = false, features = ["std", "crc64"] }
