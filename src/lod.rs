@@ -738,8 +738,9 @@ impl DimensionLodStore {
     }
 
     /// Returns the desired LOD sections covering the player's render distance via top-down
-    /// quadtree traversal. If a node should subdivide but its children aren't ready yet,
-    /// `ready_meshes` lets the parent render as a seamless fallback until children arrive.
+    /// quadtree traversal. A node within its split distance subdivides whenever any descendant
+    /// mesh is ready, preventing partially populated coarse ancestors from hiding ready detail-0
+    /// and detail-1 sections behind a single 4096-block root.
     pub fn select_visible_sections(
         cam_x: f64,
         cam_z: f64,
@@ -833,6 +834,25 @@ impl DimensionLodStore {
     }
 }
 
+/// Returns `true` if `pos` or any descendant of `pos` has a ready mesh in `ready_meshes`.
+fn has_ready_descendant(pos: SectionPos, ready_meshes: &HashSet<SectionPos>) -> bool {
+    if ready_meshes.contains(&pos) {
+        return true;
+    }
+    if let Some(children) = pos.children() {
+        children
+            .iter()
+            .any(|&c| has_ready_descendant(c, ready_meshes))
+    } else {
+        false
+    }
+}
+
+/// Returns `true` if `pos` should subdivide at `(cam_x, cam_z)`: a node subdivides into its
+/// children whenever it is within its split distance and at least one child subtree is ready
+/// (avoiding sticking on a partially-populated coarse ancestor while finer detail-0/detail-1
+/// children have already been built and meshed). If some sibling quadrants are not yet ready,
+/// only the ready children are emitted so no child is silently hidden behind a 4096-block root.
 fn select_node(
     pos: SectionPos,
     cam_x: f64,
@@ -850,21 +870,26 @@ fn select_node(
         && dist < config.detail_split_distance_blocks(pos.detail) as f64
         && let Some(children) = pos.children()
     {
-        // Subdivide if at least one child is ready (or if parent itself isn't ready).
-        let any_child_ready = children.iter().any(|c| ready_meshes.contains(c));
-        let all_children_ready = children.iter().all(|c| ready_meshes.contains(c));
-        if all_children_ready || (!ready_meshes.contains(&pos) && any_child_ready) {
+        let any_descendant_ready = children
+            .iter()
+            .any(|&c| has_ready_descendant(c, ready_meshes));
+        if any_descendant_ready {
+            let mut sub_out = Vec::new();
             for child in children {
-                select_node(child, cam_x, cam_z, max_dist, config, ready_meshes, out);
+                select_node(
+                    child,
+                    cam_x,
+                    cam_z,
+                    max_dist,
+                    config,
+                    ready_meshes,
+                    &mut sub_out,
+                );
             }
-            return;
-        }
-        // Also check grandchildren when parent isn't ready so finer meshes always show.
-        if !ready_meshes.contains(&pos) {
-            for child in children {
-                select_node(child, cam_x, cam_z, max_dist, config, ready_meshes, out);
+            if !sub_out.is_empty() {
+                out.extend(sub_out);
+                return;
             }
-            return;
         }
     }
     if ready_meshes.contains(&pos) {
@@ -951,6 +976,37 @@ mod tests {
         ready.insert(root);
         let vis = DimensionLodStore::select_visible_sections(10.0, 10.0, cfg, &ready);
         assert_eq!(vis, vec![root]);
+    }
+
+    #[test]
+    fn quadtree_selection_subdivides_to_ready_detail0_children_even_when_partial_siblings_missing()
+    {
+        let cfg = DhConfig::default();
+        let mut ready = HashSet::new();
+        // Simulate 4 detail-0 sections around origin propagated up to detail-6 root (all ancestors
+        // ready, but only 1 of 4 quadrants populated at detail 5/4/3/2/1).
+        let d0_sections = [
+            SectionPos::new(0, 0, 0),
+            SectionPos::new(0, 1, 0),
+            SectionPos::new(0, 0, 1),
+            SectionPos::new(0, 1, 1),
+        ];
+        for s in d0_sections {
+            ready.insert(s);
+            let mut cur = s;
+            while let Some(p) = cur.parent() {
+                ready.insert(p);
+                cur = p;
+            }
+        }
+        let vis = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
+        assert_eq!(vis.len(), 4);
+        for s in d0_sections {
+            assert!(
+                vis.contains(&s),
+                "expected detail-0 section {s:?} in {vis:?}"
+            );
+        }
     }
 
     #[test]
