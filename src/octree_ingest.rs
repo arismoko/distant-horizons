@@ -134,6 +134,11 @@ impl OctreeIngestStore {
         self.sections.get(&pos)
     }
 
+    /// Every stored section position, for a full re-mesh.
+    pub fn section_positions(&self) -> Vec<OctreeSectionPos> {
+        self.sections.keys().copied().collect()
+    }
+
     pub fn source_of(&self, chunk: [i32; 2]) -> Option<IngestSource> {
         self.chunk_sources.get(&chunk).copied()
     }

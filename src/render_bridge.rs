@@ -203,6 +203,14 @@ struct ArenaState {
     ids: HashMap<SectionKey, u32>,
 }
 
+static PENDING_TABLES: Mutex<Option<(Vec<u32>, Vec<u32>)>> = Mutex::new(None);
+
+/// Queues the baked model words and biome tint words for the next `upload_pending` (they replace
+/// the previous tables, which a resource reload or new block id makes stale).
+pub fn queue_model_tables(model_words: Vec<u32>, biome_tint_words: Vec<u32>) {
+    *PENDING_TABLES.lock().unwrap() = Some((model_words, biome_tint_words));
+}
+
 /// Called by the bakery / mesher worker for each finished section (empty = remove).
 pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
     PENDING_SECTIONS.lock().unwrap().push((key, section));
@@ -223,6 +231,10 @@ pub fn upload_pending(
         });
     }
     let state = guard.as_mut().unwrap();
+    if let Some((models, tints)) = PENDING_TABLES.lock().unwrap().take() {
+        state.arena.write_models(host, 0, &models)?;
+        state.arena.write_biome_tints(host, 0, &tints)?;
+    }
     for (key, section) in std::mem::take(&mut *PENDING_SECTIONS.lock().unwrap()) {
         let old = state.ids.remove(&key);
         if section.is_empty() {

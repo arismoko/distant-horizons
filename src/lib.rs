@@ -25,6 +25,7 @@ pub mod mesh;
 pub mod network;
 pub mod octree;
 pub mod octree_ingest;
+pub mod pipeline;
 pub mod render_bridge;
 pub mod resource_colors;
 pub mod shader_pack;
@@ -120,6 +121,7 @@ impl Hooks for DistantHorizonsMod {
         _event: &mut mod_api::ClientResourcesReloadedEvent,
     ) {
         let _ = resource_colors::reload_from_resources(host);
+        pipeline::invalidate_models();
         let _ = commands::remesh_active_dimension();
     }
 
@@ -245,6 +247,8 @@ impl Hooks for DistantHorizonsMod {
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
         if host.on(MOD_ID) {
+            let dim = runtime().inner.lock().unwrap().active_dimension.clone();
+            pipeline::client_tick(host, &dim);
             let limits = host.device_buffer_limits();
             let _ = render_bridge::upload_pending(
                 host,
@@ -458,6 +462,7 @@ impl Hooks for DistantHorizonsMod {
     fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
         let world_dir = host.world_dir();
         runtime().gen_pool.reset_dimension(event.dimension);
+        pipeline::clear_dimension(event.dimension);
         flush_dimension_dirty(world_dir, event.dimension);
     }
 
@@ -672,6 +677,11 @@ fn sample_loaded_chunks(
             )
         })
         .collect();
+    for (chunk, snapshot) in &snapshots {
+        if let Some(snapshot) = snapshot {
+            pipeline::ingest_loaded_chunk(host, dim, *chunk, snapshot);
+        }
+    }
     ingest_chunk_snapshots(host, dim, &snapshots, dirty_sections, collect_deltas)
 }
 
