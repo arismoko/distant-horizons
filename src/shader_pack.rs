@@ -219,9 +219,9 @@ pub fn mul_mat4_vec4(m: Mat4, v: [f32; 4]) -> [f32; 4] {
 
 /// GLSL vertex entrypoints for `PackProgramMode::ModVertexPackFragment` (`#5700` part C). Each
 /// links directly against the active pack's `dh_terrain` / `dh_water` / `dh_shadow` fragment shader.
-pub const VOXY_PACK_TERRAIN_VSH: &str = "distantsunrises:core/voxy_pack_terrain.vsh";
-pub const VOXY_PACK_WATER_VSH: &str = "distantsunrises:core/voxy_pack_water.vsh";
-pub const VOXY_PACK_SHADOW_VSH: &str = "distantsunrises:core/voxy_pack_shadow.vsh";
+pub const VOXY_PACK_TERRAIN_VSH: &str = "distantsunrises:core/voxy_pack_terrain";
+pub const VOXY_PACK_WATER_VSH: &str = "distantsunrises:core/voxy_pack_water";
+pub const VOXY_PACK_SHADOW_VSH: &str = "distantsunrises:core/voxy_pack_shadow";
 
 /// Voxy `PackedQuad` bit layout (`lod/quad_format.glsl`, 64-bit / `ivec2` path, little endian).
 /// The `.vsh` files decode exactly these fields from an `uvec2` (`x` = bits 0..31).
