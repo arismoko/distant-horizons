@@ -239,6 +239,7 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
     }
 
     // 2. Greedy-merge translucent fluid top faces (+Y, normal index 1).
+    let water_alpha = crate::resource_colors::water_still_rgba()[3];
     let mut visited_fluid = [false; SECTION_SIZE * SECTION_SIZE];
     for gz in 0..SECTION_SIZE {
         for gx in 0..SECTION_SIZE {
@@ -298,7 +299,6 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             min_y = min_y.min(y);
             max_y = max_y.max(y);
 
-            let water_alpha = crate::resource_colors::water_still_rgba()[3];
             let color = LodVertex::pack_rgba(key.rgba[0], key.rgba[1], key.rgba[2], water_alpha);
             let meta = LodVertex::pack_meta_ext(
                 1,
@@ -516,11 +516,7 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                 };
                 min_y = min_y.min(y0);
                 max_y = max_y.max(y1);
-                let alpha = if span.is_fluid {
-                    crate::resource_colors::water_still_rgba()[3]
-                } else {
-                    255
-                };
+                let alpha = if span.is_fluid { water_alpha } else { 255 };
                 let color = LodVertex::pack_rgba(span.rgba[0], span.rgba[1], span.rgba[2], alpha);
                 let sky = LodColumn::sky_light(span.rgba);
                 let blk = LodColumn::block_light(span.rgba);

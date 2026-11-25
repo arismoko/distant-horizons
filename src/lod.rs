@@ -1043,32 +1043,28 @@ mod tests {
     }
 
     #[test]
-    fn quadtree_selection_subdivides_to_ready_detail0_children_even_when_partial_siblings_missing()
-    {
+    fn quadtree_selection_keeps_ready_parent_until_all_in_range_children_are_covered() {
         let cfg = DhConfig::default();
+        let d1 = SectionPos::new(1, 0, 0);
+        let d0_children = d1.children().unwrap();
         let mut ready = HashSet::new();
-        // Simulate 4 detail-0 sections around origin propagated up to detail-6 root (all ancestors
-        // ready, but only 1 of 4 quadrants populated at detail 5/4/3/2/1).
-        let d0_sections = [
-            SectionPos::new(0, 0, 0),
-            SectionPos::new(0, 1, 0),
-            SectionPos::new(0, 0, 1),
-            SectionPos::new(0, 1, 1),
-        ];
-        for s in d0_sections {
-            ready.insert(s);
-            let mut cur = s;
-            while let Some(p) = cur.parent() {
-                ready.insert(p);
-                cur = p;
-            }
+        ready.insert(d1);
+        // Only 1 of 4 detail-0 children ready: parent d1 must stay rendered so 3 quadrants
+        // do not become empty holes.
+        ready.insert(d0_children[0]);
+        let vis_partial = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
+        assert_eq!(vis_partial, vec![d1]);
+
+        // Once all 4 detail-0 children are ready, d1 subdivides cleanly into its 4 children.
+        for c in d0_children {
+            ready.insert(c);
         }
-        let vis = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
-        assert_eq!(vis.len(), 4);
-        for s in d0_sections {
+        let vis_full = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
+        assert_eq!(vis_full.len(), 4);
+        for c in d0_children {
             assert!(
-                vis.contains(&s),
-                "expected detail-0 section {s:?} in {vis:?}"
+                vis_full.contains(&c),
+                "expected detail-0 child {c:?} in {vis_full:?}"
             );
         }
     }
