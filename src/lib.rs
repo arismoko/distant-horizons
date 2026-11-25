@@ -12,6 +12,7 @@
 //!   independent reversed-Z depth buffer and sky-masked atmospheric fog compositing.
 
 pub mod api;
+pub mod bakery;
 pub mod colors;
 pub mod commands;
 pub mod config;
@@ -21,6 +22,7 @@ pub mod generic_render;
 pub mod lod;
 pub mod mesh;
 pub mod network;
+pub mod octree;
 pub mod render_bridge;
 pub mod resource_colors;
 pub mod shader_pack;

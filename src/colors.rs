@@ -558,6 +558,188 @@ fn scale_rgb(rgb: [u8; 3], factor: f32) -> [u8; 3] {
     ]
 }
 
+/// What colours a baked face at draw time (`ModelFactory.getTintSources`; Voxy keeps a per-model
+/// biome colour LUT indexed by biome id, `quads3.vert` `colourData[tintColour + biomeId]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TintSource {
+    None,
+    /// `BiomeColors.getAverageGrassColor` (grass block top, grass, ferns, sugar cane...).
+    Grass,
+    /// `BiomeColors.getAverageFoliageColor` (oak/jungle/acacia/dark oak/mangrove leaves, vines).
+    Foliage,
+    /// `BiomeColors.getAverageWaterColor` times `water_still.png`.
+    Water,
+    /// A constant colour (spruce and birch leaves use fixed foliage colours in vanilla).
+    Fixed([u8; 3]),
+}
+
+/// Tint source vanilla's block colour providers assign to a block id.
+pub fn tint_source_for_block(block_id: &str) -> TintSource {
+    let name = strip_mc_namespace(block_id);
+    match name {
+        "water" | "bubble_column" | "water_cauldron" => TintSource::Water,
+        "grass_block" | "short_grass" | "grass" | "tall_grass" | "fern" | "large_fern"
+        | "sugar_cane" | "potted_fern" => TintSource::Grass,
+        "spruce_leaves" => TintSource::Fixed([97, 153, 97]),
+        "birch_leaves" => TintSource::Fixed([128, 167, 85]),
+        "oak_leaves" | "jungle_leaves" | "acacia_leaves" | "dark_oak_leaves"
+        | "mangrove_leaves" | "vine" => TintSource::Foliage,
+        _ => TintSource::None,
+    }
+}
+
+/// Grass, foliage and water colours of one biome (one row of the GPU biome tint table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BiomeTints {
+    pub grass: [u8; 3],
+    pub foliage: [u8; 3],
+    pub water: [u8; 3],
+}
+
+impl BiomeTints {
+    pub fn for_biome(biome_id: &str, water_color_hint: u32) -> Self {
+        Self {
+            grass: biome_grass_tint(biome_id),
+            foliage: biome_foliage_tint(biome_id),
+            water: biome_water_color(biome_id, water_color_hint),
+        }
+    }
+
+    /// Multiplier colour for `source` in this biome (`[255; 3]` for untinted).
+    pub fn colour_for(&self, source: TintSource) -> [u8; 3] {
+        match source {
+            TintSource::None => [255, 255, 255],
+            TintSource::Grass => self.grass,
+            TintSource::Foliage => self.foliage,
+            TintSource::Water => self.water,
+            TintSource::Fixed(c) => c,
+        }
+    }
+}
+
+/// `lightmap.fsh` `get_brightness`: `level / (4 - 3 * level)` for `level` in `0..=1`.
+#[inline]
+pub fn lightmap_brightness(level: f32) -> f32 {
+    level / (4.0 - 3.0 * level)
+}
+
+/// Inputs of vanilla 26.3's `lightmap.fsh` (`LightmapInfo`), filled from
+/// `LightmapRenderStateExtractor.extract` (environment attributes, gamma and effects). The
+/// caller owns the values: nothing here assumes a dimension or time of day.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LightmapParams {
+    pub sky_factor: f32,
+    /// `blockLightFlicker + 1.4` in vanilla.
+    pub block_factor: f32,
+    pub night_vision_factor: f32,
+    pub darkness_scale: f32,
+    pub boss_overlay_world_darkening: f32,
+    /// The gamma option minus the darkness effect modifier (`renderState.brightness`).
+    pub brightness_factor: f32,
+    pub block_light_tint: [f32; 3],
+    pub sky_light_color: [f32; 3],
+    pub ambient_color: [f32; 3],
+    pub night_vision_color: [f32; 3],
+}
+
+/// CPU port of `lightmap.fsh`: the lit colour for 4-bit block and sky light levels. Voxy samples
+/// the live lightmap texture at the voxel's light byte (`lighting.glsl getLightmapUv`); this
+/// reproduces the texel for CPU-side previews and tests.
+pub fn vanilla_lightmap_color(block_light: u8, sky_light: u8, p: &LightmapParams) -> [f32; 3] {
+    let block_level = f32::from(block_light.min(15)) / 15.0;
+    let sky_level = f32::from(sky_light.min(15)) / 15.0;
+    let block_brightness = lightmap_brightness(block_level) * p.block_factor;
+    let sky_brightness = lightmap_brightness(sky_level) * p.sky_factor;
+    let mut color = [0.0f32; 3];
+    let mix_f = 0.9 * (2.0 * block_level - 1.0) * (2.0 * block_level - 1.0);
+    for i in 0..3 {
+        let nv = p.night_vision_color[i] * p.night_vision_factor;
+        let mut c = p.ambient_color[i].max(nv);
+        c += p.sky_light_color[i] * sky_brightness;
+        let block_color = p.block_light_tint[i] + (1.0 - p.block_light_tint[i]) * mix_f;
+        c += block_color * block_brightness;
+        let dark = c * [0.7, 0.6, 0.6][i];
+        c += (dark - c) * p.boss_overlay_world_darkening;
+        c -= p.darkness_scale;
+        color[i] = c.clamp(0.0, 1.0);
+    }
+    let max_c = color[0].max(color[1]).max(color[2]);
+    if max_c > 0.0 && p.brightness_factor != 0.0 {
+        let inv = 1.0 - max_c;
+        let scaled = 1.0 - inv * inv * inv * inv;
+        for c in &mut color {
+            let ng = *c * (scaled / max_c);
+            *c += (ng - *c) * p.brightness_factor;
+        }
+    }
+    color
+}
+
+#[cfg(test)]
+mod tint_lightmap_tests {
+    use super::*;
+
+    fn params() -> LightmapParams {
+        LightmapParams {
+            sky_factor: 1.0,
+            block_factor: 1.5,
+            night_vision_factor: 0.0,
+            darkness_scale: 0.0,
+            boss_overlay_world_darkening: 0.0,
+            brightness_factor: 0.0,
+            block_light_tint: [1.0, 0.9, 0.7],
+            sky_light_color: [1.0, 1.0, 1.0],
+            ambient_color: [0.05, 0.05, 0.05],
+            night_vision_color: [0.0; 3],
+        }
+    }
+
+    #[test]
+    fn brightness_curve_is_vanilla_rational() {
+        assert_eq!(lightmap_brightness(0.0), 0.0);
+        assert!((lightmap_brightness(1.0) - 1.0).abs() < 1e-6);
+        assert!((lightmap_brightness(0.5) - 0.5 / 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lightmap_monotone_in_sky_and_clamped() {
+        let p = params();
+        let dark = vanilla_lightmap_color(0, 0, &p);
+        let mid = vanilla_lightmap_color(0, 8, &p);
+        let full = vanilla_lightmap_color(15, 15, &p);
+        assert!(dark[0] < mid[0] && mid[0] < full[0] + 1e-6);
+        assert!(full.iter().all(|c| (0.0..=1.0).contains(c)));
+        assert!((dark[0] - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tint_sources_follow_vanilla_providers() {
+        assert_eq!(
+            tint_source_for_block("minecraft:grass_block"),
+            TintSource::Grass
+        );
+        assert_eq!(
+            tint_source_for_block("minecraft:oak_leaves"),
+            TintSource::Foliage
+        );
+        assert_eq!(
+            tint_source_for_block("minecraft:spruce_leaves"),
+            TintSource::Fixed([97, 153, 97])
+        );
+        assert_eq!(tint_source_for_block("minecraft:water"), TintSource::Water);
+        assert_eq!(tint_source_for_block("minecraft:stone"), TintSource::None);
+        let t = BiomeTints::for_biome("minecraft:swamp", 0);
+        assert_eq!(t.colour_for(TintSource::Water), [97, 123, 100]);
+        assert_eq!(t.colour_for(TintSource::None), [255, 255, 255]);
+    }
+
+    #[test]
+    fn water_surface_uses_still_texture_multiplied_by_biome_tint() {
+        // Vanilla water_still average [177,177,177,180] times plains water [63,118,228].
+        assert_eq!(water_surface_color("minecraft:plains", 0), [43, 81, 158]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
