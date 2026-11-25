@@ -342,6 +342,12 @@ impl GenWorkerPool {
     }
 }
 
+impl Default for GenWorkerPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn is_job_valid(shared: &Shared, job: &GenJob) -> bool {
     if shared.stop.load(Ordering::Acquire) {
         return false;
