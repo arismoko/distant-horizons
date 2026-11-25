@@ -601,7 +601,7 @@ pub fn setup_compute(
         .after_stage(RenderLevelStage::AfterOpaqueBlocks)
         .before_stage(OPAQUE_STAGE);
     let slices = arena.slices;
-    let _ = graph.add_compute_pass(desc, &mut |ctx| {
+    let added = graph.add_compute_pass(desc, &mut |ctx| {
         let groups = |n: u32| n.div_ceil(HIZ_WORKGROUP);
         let (mut sw, mut sh) = (w, h);
         for level in 0..mips {
@@ -622,10 +622,13 @@ pub fn setup_compute(
                 .inline_uniform("HizParams", &params)
                 .texture("HizSource", source)
                 .storage_image("HizDest", hiz.dest(level));
-            let _ = ctx.dispatch(
-                if level == 0 { copy } else { reduce },
-                &bindings,
-                [groups(dw), groups(dh), 1],
+            report(
+                "hiz dispatch",
+                ctx.dispatch(
+                    if level == 0 { copy } else { reduce },
+                    &bindings,
+                    [groups(dw), groups(dh), 1],
+                ),
             );
             (sw, sh) = (dw, dh);
         }
@@ -636,12 +639,16 @@ pub fn setup_compute(
             .storage_buffer("OpaqueCommands", slices.opaque_commands)
             .storage_buffer("TranslucentCommands", slices.translucent_commands)
             .texture("HizPyramid", hiz.all_mips());
-        let _ = ctx.dispatch(
-            cmdgen,
-            &bindings,
-            [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
+        report(
+            "cmdgen dispatch",
+            ctx.dispatch(
+                cmdgen,
+                &bindings,
+                [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
+            ),
         );
     });
+    report("add_compute_pass", added);
 }
 
 /// Prepares this frame's two indirect draws (opaque in [`OPAQUE_STAGE`], translucent in
@@ -744,7 +751,7 @@ pub fn prepare_draws(
                 .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
         };
         let draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(state.quad_mesh);
-        if let Ok(batch) = context.draw_indirect(stage, &draw) {
+        if let Some(batch) = report("draw_indirect", context.draw_indirect(stage, &draw)) {
             PREPARED.lock().unwrap().push((stage, batch));
         }
     }
@@ -782,7 +789,10 @@ pub fn prepare_draws(
             &bindings,
         )
         .with_mesh(state.quad_mesh);
-        if let Ok(batch) = context.draw_indirect(OPAQUE_STAGE, &draw) {
+        if let Some(batch) = report(
+            "shadow draw_indirect",
+            context.draw_indirect(OPAQUE_STAGE, &draw),
+        ) {
             PREPARED.lock().unwrap().push((OPAQUE_STAGE, batch));
         }
     }
@@ -809,7 +819,7 @@ pub fn draw_stage(
     };
     for (s, batch) in PREPARED.lock().unwrap().iter() {
         if *s == stage {
-            let _ = pass.draw(*batch);
+            report("pass.draw", pass.draw(*batch));
         }
     }
 }
@@ -1179,6 +1189,20 @@ pub fn sun_brightness_from_day_time_and_weather(
 /// Compute sun brightness `0.2..=1.0` from Minecraft's `day_time` (`0..24000`) in clear weather.
 pub fn sun_brightness_from_day_time(day_time: i64, dimension: &str) -> f32 {
     sun_brightness_from_day_time_and_weather(day_time, dimension, 0.0, 0.0)
+}
+
+/// Logs the first few errors of a render call the frame cannot recover from, then stays quiet.
+fn report<T, E: std::fmt::Debug>(what: &str, result: Result<T, E>) -> Option<T> {
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
+                eprintln!("distantsunrises: {what} failed: {e:?}");
+            }
+            None
+        }
+    }
 }
 
 #[cfg(test)]
