@@ -83,6 +83,7 @@ impl Hooks for DistantHorizonsMod {
         DhConfig::register_settings(registrar);
         commands::register_key_mappings(registrar);
         network::register_payloads(registrar);
+        network::octree_sync::register_payloads(registrar);
     }
 
     fn register_render_pipelines(
