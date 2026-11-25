@@ -276,6 +276,10 @@ impl Std140 {
 }
 
 /// `QuadParams` (160 bytes), shared by `voxy_quads.vsh` / `.fsh`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the 160-byte QuadParams block field by field"
+)]
 pub fn quad_params_bytes(
     view_proj: [f32; 16],
     camera: [f64; 3],
@@ -474,7 +478,6 @@ pub fn upload_pending(
         state.arena.write_biome_tints(host, 0, &tints)?;
         let id = mod_api::Identifier::parse(ATLAS_TEXTURE).expect("static texture id");
         let side = crate::pipeline::ATLAS_SIDE as u32;
-        use mod_api::prelude::ClientRenderClientHost;
         let done = if ATLAS_CREATED.load(std::sync::atomic::Ordering::Relaxed) {
             host.update_dynamic_texture(&id, side, side, &atlas)
         } else {

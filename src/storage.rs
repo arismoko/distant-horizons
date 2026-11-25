@@ -512,15 +512,15 @@ fn xxh32_short(data: &[u8], seed: u32) -> u32 {
     const P5: u32 = 374_761_393;
     debug_assert!(data.len() < 16);
     let mut h = seed.wrapping_add(P5).wrapping_add(data.len() as u32);
-    let mut chunks = data.chunks_exact(4);
-    for c in &mut chunks {
+    let (lanes, remainder) = data.as_chunks::<4>();
+    for c in lanes {
         let lane = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
         h = h
             .wrapping_add(lane.wrapping_mul(P3))
             .rotate_left(17)
             .wrapping_mul(P4);
     }
-    for &b in chunks.remainder() {
+    for &b in remainder {
         h = h
             .wrapping_add((b as u32).wrapping_mul(P5))
             .rotate_left(11)
