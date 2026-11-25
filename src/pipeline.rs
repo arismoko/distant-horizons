@@ -10,11 +10,21 @@ use crate::bakery::{
 };
 use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
 use crate::mesh::{SectionQuads, mesh_octree_section};
+use crate::network::octree_sync::{ClientEvent, MappingEntry, OctreeSectionDto, ServerSource};
+use crate::octree::Voxel;
 use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
+use crate::octree_ingest::DistantColumn;
 use crate::octree_ingest::{OctreeIngestStore, ingest_chunk_snapshot, ingest_saved_chunk};
 use crate::render_bridge::submit_built_section;
-use mod_api::{BlockState, ChunkSnapshot, ClientHost, Direction, ServerHost};
+use crate::storage::{DEFAULT_OCTREE_COMPRESSION, LodIoWorker, OctreeMapping};
+use mod_api::{
+    HostBlockStates, BlockKey, BlockState, ChunkSnapshot, ClientHost, Direction, Host, PlayerRef, ServerHost,
+    TerrainColumn,
+};
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 
 /// Block models baked per client tick (each bake reads sprite pixels on the CPU).
@@ -33,7 +43,7 @@ pub struct Mapper {
 }
 
 impl Mapper {
-    fn block(&mut self, host: &dyn ServerHost, state: BlockState) -> u32 {
+    fn block(&mut self, host: &dyn Host, state: BlockState) -> u32 {
         if let Some(&id) = self.by_state.get(&state) {
             return id;
         }
@@ -62,6 +72,93 @@ impl Mapper {
         id
     }
 
+    /// The octree id of `key`'s first (default) state; air and unknown blocks are `0`.
+    fn block_key(&mut self, host: &dyn Host, key: BlockKey) -> u32 {
+        match host
+            .block_states()
+            .states_of(key)
+            .and_then(|r| r.iter().next())
+        {
+            Some(state) => self.block(host, state),
+            None => 0,
+        }
+    }
+
+    /// The octree id of the block called `name`. A file or a server names blocks, not states, so
+    /// a block's default state stands for all of its states.
+    fn block_named(&mut self, host: &dyn Host, name: &str) -> u32 {
+        match host.block_key(name) {
+            Some(key) => self.block_key(host, key),
+            None => 0,
+        }
+    }
+
+    /// Names of the ids `section` uses, for a save or a network message.
+    fn mapping_of(&self, section: &OctreeSection) -> (Vec<MappingEntry>, OctreeMapping) {
+        let mut entries = Vec::new();
+        let mut mapping = OctreeMapping::default();
+        for voxel in section.to_rle().palette {
+            let (block, biome) = (voxel.block_id(), voxel.biome_id());
+            if let Some(name) = block
+                .checked_sub(1)
+                .and_then(|i| self.names.get(i as usize))
+                && mapping.blocks.insert(block, name.clone()).is_none()
+            {
+                entries.push(MappingEntry {
+                    kind: 0,
+                    id: block,
+                    name: name.clone(),
+                });
+            }
+            if let Some(name) = self.biomes.get(biome as usize)
+                && mapping.biomes.insert(biome, name.clone()).is_none()
+            {
+                entries.push(MappingEntry {
+                    kind: 1,
+                    id: u32::from(biome),
+                    name: name.clone(),
+                });
+            }
+        }
+        (entries, mapping)
+    }
+
+    /// Translate a section whose ids come from another mapping (a file, a server) into this
+    /// session's ids by name.
+    fn remap(
+        &mut self,
+        host: &dyn Host,
+        section: &OctreeSection,
+        blocks: &BTreeMap<u32, String>,
+        biomes: &BTreeMap<u16, String>,
+    ) -> OctreeSection {
+        let mut block_ids: HashMap<u32, u32> = HashMap::new();
+        let mut biome_ids: HashMap<u16, u16> = HashMap::new();
+        let dense: Vec<Voxel> = section
+            .to_dense()
+            .into_iter()
+            .map(|v| {
+                let block = match v.block_id() {
+                    0 => 0,
+                    id => *block_ids.entry(id).or_insert_with(|| {
+                        blocks.get(&id).map_or(0, |n| self.block_named(host, n))
+                    }),
+                };
+                let biome = *biome_ids
+                    .entry(v.biome_id())
+                    .or_insert_with(|| biomes.get(&v.biome_id()).map_or(0, |n| self.biome(n)));
+                if block == 0 {
+                    Voxel::air_with_light(v.sky_light(), v.block_light())
+                } else {
+                    Voxel::new(block, biome, v.sky_light(), v.block_light())
+                }
+            })
+            .collect();
+        let mut out = OctreeSection::from_dense(section.pos, &dense);
+        out.revision = section.revision;
+        out
+    }
+
     /// `Mapper.getBlockStateOpacity`: translucent blocks let light through, the rest block it.
     fn opacity(&self, id: u32) -> u8 {
         match id.checked_sub(1).and_then(|i| self.names.get(i as usize)) {
@@ -81,6 +178,10 @@ struct Pipeline {
     models_dirty: bool,
     dirty: HashMap<String, VecDeque<OctreeSectionPos>>,
     queued: HashMap<String, HashSet<OctreeSectionPos>>,
+    /// Sections changed since their last save.
+    unsaved: HashMap<String, HashSet<OctreeSectionPos>>,
+    /// Sections already asked of disk or of the server, per dimension.
+    requested: HashMap<String, HashSet<OctreeSectionPos>>,
 }
 
 static PIPELINE: LazyLock<Mutex<Pipeline>> = LazyLock::new(Default::default);
@@ -136,6 +237,10 @@ pub fn ingest_chunk(
             .get_mut(dim)
             .expect("store inserted above")
             .propagate_dirty(&|id| mapper.opacity(id));
+        p.unsaved
+            .entry(dim.to_owned())
+            .or_default()
+            .extend(touched.iter().copied());
         p.queue(dim, touched);
     }
     accepted
@@ -147,6 +252,8 @@ pub fn clear_dimension(dim: &str) {
     p.stores.remove(dim);
     p.dirty.remove(dim);
     p.queued.remove(dim);
+    p.unsaved.remove(dim);
+    p.requested.remove(dim);
 }
 
 /// A resource reload or shader-pack change invalidates every baked model: bake them all again and
@@ -200,7 +307,12 @@ impl SpriteSource for AtlasSprites<'_> {
     }
 }
 
-fn bake_request(host: &dyn ClientHost, block_id: u32, name: &str, state: BlockState) -> BakeRequest {
+fn bake_request(
+    host: &dyn ClientHost,
+    block_id: u32,
+    name: &str,
+    state: BlockState,
+) -> BakeRequest {
     let assets = host.render_assets();
     let fluid = match name {
         "minecraft:water" => Some(FluidKind::Water),
@@ -284,7 +396,11 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
         counts[i] = bucket.len() as u16;
         all.extend(bucket.into_iter().map(arena_quad));
     }
-    let size = |i: usize| quads.aabb_max[i].saturating_sub(quads.aabb_min[i]).clamp(1, 32);
+    let size = |i: usize| {
+        quads.aabb_max[i]
+            .saturating_sub(quads.aabb_min[i])
+            .clamp(1, 32)
+    };
     BuiltSection {
         level: quads.pos.detail,
         pos: [quads.pos.x, quads.pos.y, quads.pos.z],
@@ -362,4 +478,269 @@ fn empty_section(pos: OctreeSectionPos) -> BuiltSection {
         quads: Vec::new(),
         counts: [0; BUCKETS],
     }
+}
+
+/// G4: ingest one finished distant-generation job. `cells` are `(cx, cz)` cells of the
+/// `64 x 64` grid whose block origin is `origin`, each `1 << detail` blocks wide; `samples` run in
+/// the same order. A sample covering `2^detail` blocks is one voxel of a level-`detail` section.
+pub fn ingest_distant(
+    host: &dyn ServerHost,
+    dim: &str,
+    detail: u8,
+    origin: (i32, i32),
+    cells: &[(usize, usize)],
+    samples: &[Option<TerrainColumn>],
+) {
+    let mut guard = PIPELINE.lock().unwrap();
+    let p = &mut *guard;
+    let step = 1i32 << detail;
+    let columns: Vec<DistantColumn<'_, BlockKey>> = cells
+        .iter()
+        .zip(samples)
+        .filter_map(|(&(cx, cz), sample)| {
+            let col = sample.as_ref()?;
+            Some(DistantColumn {
+                x: origin.0 + cx as i32 * step,
+                z: origin.1 + cz as i32 * step,
+                height: col.height,
+                water: col.water,
+                block: col.block,
+                biome: &col.biome,
+            })
+        })
+        .collect();
+    if columns.is_empty() {
+        return;
+    }
+    let water = p.mapper.block_named(host, "minecraft:water");
+    let store = p.stores.entry(dim.to_owned()).or_default();
+    let mapper = std::cell::RefCell::new(&mut p.mapper);
+    let mut block = |key| mapper.borrow_mut().block_key(host, key);
+    let mut biome = |name: &str| mapper.borrow_mut().biome(name);
+    let touched = if detail == 0 {
+        crate::octree_ingest::ingest_distant_columns(
+            store, &columns, water, &mut block, &mut biome,
+        );
+        let mapper = &p.mapper;
+        p.stores
+            .get_mut(dim)
+            .expect("store inserted above")
+            .propagate_dirty(&|id| mapper.opacity(id))
+    } else {
+        store.ingest_coarse_columns(detail, &columns, water, &mut block, &mut biome)
+    };
+    p.unsaved
+        .entry(dim.to_owned())
+        .or_default()
+        .extend(touched.iter().copied());
+    p.queue(dim, touched);
+}
+
+/// Hand up to `limit` changed sections of every dimension to the I/O worker (it coalesces newer
+/// saves of one section). Returns how many were queued.
+pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
+    let mut guard = PIPELINE.lock().unwrap();
+    let p = &mut *guard;
+    let mut queued = 0;
+    for (dim, set) in p.unsaved.iter_mut() {
+        let Some(store) = p.stores.get(dim) else {
+            set.clear();
+            continue;
+        };
+        while queued < limit {
+            let Some(&pos) = set.iter().next() else { break };
+            set.remove(&pos);
+            let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let (_, mapping) = p.mapper.mapping_of(section);
+            io.save_octree_section(world_dir.to_owned(), dim.clone(), section.clone(), mapping);
+            queued += 1;
+        }
+    }
+    queued
+}
+
+/// Ask disk (single player and server) for stored sections around `center` that the store does not
+/// hold yet: every level from fine to coarse, `radius` sections out, at most `budget` requests.
+pub fn request_stored_sections(
+    io: &LodIoWorker,
+    world_dir: &Path,
+    dim: &str,
+    center: [f64; 3],
+    radius: i32,
+    budget: usize,
+) {
+    const Y_SECTIONS: std::ops::RangeInclusive<i32> = -2..=9;
+    let mut guard = PIPELINE.lock().unwrap();
+    let p = &mut *guard;
+    let requested = p.requested.entry(dim.to_owned()).or_default();
+    let store = p.stores.get(dim);
+    let mut left = budget;
+    for level in 0..=crate::octree::MAX_OCTREE_DETAIL {
+        let edge = (crate::octree::SECTION_EDGE as f64) * f64::from(1u32 << level);
+        let (cx, cz) = (
+            (center[0] / edge).floor() as i32,
+            (center[2] / edge).floor() as i32,
+        );
+        for sx in cx - radius..=cx + radius {
+            for sz in cz - radius..=cz + radius {
+                for sy in (Y_SECTIONS.start() >> level)..=(Y_SECTIONS.end() >> level) {
+                    let pos = OctreeSectionPos::new(level, sx, sy, sz);
+                    if left == 0 {
+                        return;
+                    }
+                    if store.is_some_and(|s| s.section(pos).is_some()) || !requested.insert(pos) {
+                        continue;
+                    }
+                    io.load_octree_section(world_dir.to_owned(), dim.to_owned(), pos);
+                    left -= 1;
+                }
+            }
+        }
+    }
+}
+
+/// Adopt sections the I/O worker finished loading, translating their ids to this session's.
+pub fn adopt_loaded(host: &dyn Host, io: &LodIoWorker) {
+    let loaded = io.drain_octree_responses();
+    if loaded.is_empty() {
+        return;
+    }
+    let mut guard = PIPELINE.lock().unwrap();
+    let p = &mut *guard;
+    for l in loaded {
+        let section = p
+            .mapper
+            .remap(host, &l.section, &l.mapping.blocks, &l.mapping.biomes);
+        let pos = section.pos;
+        if p.stores
+            .entry(l.dimension.clone())
+            .or_default()
+            .adopt_section(section)
+        {
+            p.queue(&l.dimension, [pos]);
+        }
+    }
+}
+
+/// Client side of `octree_sync`: adopt what the server sent and ask for sections around `center`
+/// that the store lacks (at most `budget` new requests; a cached timestamp is not tracked).
+pub fn client_sync(
+    host: &mut dyn ClientHost,
+    dim: &str,
+    center: [f64; 3],
+    radius: i32,
+    budget: usize,
+) {
+    let events = crate::network::octree_sync::drain_client_events();
+    {
+        let mut guard = PIPELINE.lock().unwrap();
+        let p = &mut *guard;
+        for event in events {
+            let (level, section, mapping) = match event {
+                ClientEvent::Section {
+                    level,
+                    section,
+                    mapping,
+                }
+                | ClientEvent::PartialUpdate {
+                    level,
+                    section,
+                    mapping,
+                } => (level, section, mapping),
+                ClientEvent::Lost { level, pos } | ClientEvent::Failed { level, pos, .. } => {
+                    // Ask again later.
+                    if let Some(r) = p.requested.get_mut(&level) {
+                        r.remove(&pos);
+                    }
+                    continue;
+                }
+                ClientEvent::Config(_) | ClientEvent::UpToDate { .. } => continue,
+            };
+            let blocks = mapping
+                .iter()
+                .filter(|e| e.kind == 0)
+                .map(|e| (e.id, e.name.clone()))
+                .collect();
+            let biomes = mapping
+                .iter()
+                .filter(|e| e.kind == 1)
+                .map(|e| (e.id as u16, e.name.clone()))
+                .collect();
+            let section = p.mapper.remap(host, &section, &blocks, &biomes);
+            let pos = section.pos;
+            let store = p.stores.entry(level.clone()).or_default();
+            // A newer server copy replaces ours.
+            store.replace_section(section);
+            p.queue(&level, [pos]);
+        }
+    }
+    let mut want = Vec::new();
+    {
+        let mut guard = PIPELINE.lock().unwrap();
+        let p = &mut *guard;
+        let requested = p.requested.entry(dim.to_owned()).or_default();
+        let store = p.stores.get(dim);
+        let edge = crate::octree::SECTION_EDGE as f64;
+        let (cx, cz) = (
+            (center[0] / edge).floor() as i32,
+            (center[2] / edge).floor() as i32,
+        );
+        'scan: for sx in cx - radius..=cx + radius {
+            for sz in cz - radius..=cz + radius {
+                for sy in -2..=9 {
+                    let pos = OctreeSectionPos::new(0, sx, sy, sz);
+                    if store.is_some_and(|s| s.section(pos).is_some()) || !requested.insert(pos) {
+                        continue;
+                    }
+                    want.push(pos);
+                    if want.len() >= budget {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+    }
+    for pos in want {
+        crate::network::octree_sync::client_send_request(host, dim, pos, None);
+    }
+}
+
+static PLAYER_XZ: Mutex<Vec<(PlayerRef, (i32, i32))>> = Mutex::new(Vec::new());
+
+/// The server tick records where each player is, for the sync distance checks.
+pub fn set_player_positions(positions: Vec<(PlayerRef, (i32, i32))>) {
+    *PLAYER_XZ.lock().unwrap() = positions;
+}
+
+/// What `octree_sync` serves from: the pipeline's own sections, named by block and biome.
+struct PipelineSource;
+
+impl ServerSource<PlayerRef> for PipelineSource {
+    fn section_timestamp(&self, level: &str, pos: OctreeSectionPos) -> Option<i64> {
+        let p = PIPELINE.lock().unwrap();
+        p.stores.get(level)?.section(pos).map(|s| s.revision as i64)
+    }
+
+    fn section_dto(&self, level: &str, pos: OctreeSectionPos) -> Option<OctreeSectionDto> {
+        let p = PIPELINE.lock().unwrap();
+        let section = p.stores.get(level)?.section(pos)?;
+        let (entries, _) = p.mapper.mapping_of(section);
+        OctreeSectionDto::from_section(section, &entries, DEFAULT_OCTREE_COMPRESSION, 0).ok()
+    }
+
+    fn player_block_xz(&self, player: PlayerRef) -> Option<(i32, i32)> {
+        PLAYER_XZ
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| *p == player)
+            .map(|(_, xz)| *xz)
+    }
+}
+
+/// Serve octree sections to connected players (call once when the server starts).
+pub fn install_sync_source() {
+    crate::network::octree_sync::install_server_source(Arc::new(PipelineSource));
 }

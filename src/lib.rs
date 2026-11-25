@@ -83,7 +83,6 @@ impl Hooks for DistantHorizonsMod {
     fn register(&self, registrar: &mut dyn Registrar, _cx: &RegistrationContext) {
         DhConfig::register_settings(registrar);
         commands::register_key_mappings(registrar);
-        network::register_payloads(registrar);
         network::octree_sync::register_payloads(registrar);
     }
 
@@ -196,6 +195,7 @@ impl Hooks for DistantHorizonsMod {
         event: &mut ClientLevelUnloadEvent<'_>,
     ) {
         let _ = render_bridge::clear_dimension(event.dimension);
+        network::octree_sync::client_reset();
         let remote_cache = {
             let mut st = runtime().inner.lock().unwrap();
             st.remote_requested.remove(event.dimension);
@@ -207,9 +207,7 @@ impl Hooks for DistantHorizonsMod {
             }
             st.remote_cache_dir.take()
         };
-        if let Some(dir) = remote_cache {
-            flush_dimension_dirty(Some(dir), event.dimension);
-        }
+        let _ = remote_cache;
     }
 
     fn client_chunk_load(&self, host: &mut dyn ClientHost, event: &mut ClientChunkLoadEvent<'_>) {
@@ -388,7 +386,7 @@ impl Hooks for DistantHorizonsMod {
                 provider.request_section(&dim, LodSectionPos::from(pos), 0);
             }
         } else {
-            network::poll_remote_sections(host);
+            poll_remote_octree(host);
         }
     }
 
@@ -434,6 +432,7 @@ impl Hooks for DistantHorizonsMod {
         rt.gen_pool.ensure_started();
         let mut st = rt.inner.lock().unwrap();
         st.world_dir = world_dir;
+        pipeline::install_sync_source();
     }
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
@@ -456,7 +455,7 @@ impl Hooks for DistantHorizonsMod {
         let world_dir = host.world_dir();
         runtime().gen_pool.reset_dimension(event.dimension);
         pipeline::clear_dimension(event.dimension);
-        flush_dimension_dirty(world_dir, event.dimension);
+        flush_dirty_sections(world_dir);
     }
 
     fn chunk_load(&self, host: &mut dyn ServerHost, event: &mut ChunkLoadEvent<'_>) {
@@ -489,6 +488,37 @@ impl Hooks for DistantHorizonsMod {
     }
 }
 
+/// Client side of `octree_sync` on a remote server: send our config once, then ask for the
+/// sections around the camera and adopt what comes back.
+fn poll_remote_octree(host: &mut dyn ClientHost) {
+    let is_remote = host
+        .client_session()
+        .client_server()
+        .is_some_and(|s| !s.integrated_local);
+    if !is_remote || !host.has_channel(&network::octree_sync::octree_sync_channel_id()) {
+        return;
+    }
+    let (enabled, dim, camera) = {
+        let st = runtime().inner.lock().unwrap();
+        (
+            st.config.enabled && st.has_camera,
+            st.active_dimension.clone(),
+            st.camera_pos,
+        )
+    };
+    if !enabled {
+        return;
+    }
+    network::octree_sync::client_send_config_once(host);
+    pipeline::client_sync(
+        host,
+        &dim,
+        camera,
+        STORED_RADIUS_SECTIONS,
+        SYNC_REQUESTS_PER_TICK,
+    );
+}
+
 fn sync_client_config(host: &dyn Host) {
     let cfg = DhConfig::read_from_host(host);
     let rt = runtime();
@@ -511,6 +541,12 @@ fn enqueue_chunk(dimension: &str, chunk: [i32; 2]) {
             .push_back(chunk);
     }
 }
+
+/// Level-0 sections around a player asked of disk per tick budget / radius.
+const STORED_RADIUS_SECTIONS: i32 = 8;
+const STORED_REQUESTS_PER_TICK: usize = 64;
+const SYNC_REQUESTS_PER_TICK: usize = 16;
+const SAVES_PER_TICK: usize = 32;
 
 fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     let rt = runtime();
@@ -618,7 +654,6 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     // 3. Propagate dirty sections up the quadtree, queue meshing, and persist dirty sections.
     if !dirty_sections.is_empty() {
         let mut st = rt.inner.lock().unwrap();
-        let save_root = st.world_dir.clone().or(world_dir);
         let store = st.dimensions.entry(dim.to_owned()).or_default();
         let mut to_mesh: HashSet<SectionPos> = dirty_sections.clone();
         for &pos in &dirty_sections {
@@ -632,21 +667,41 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
                     sec.dirty_mesh = false;
                     rt.mesher.submit(dim.to_owned(), sec.clone());
                 }
-                if sec.dirty_save
-                    && sec.populated > 0
-                    && let Some(ref dir) = save_root
-                {
-                    sec.dirty_save = false;
-                    rt.io.request_save(dir.clone(), dim.to_owned(), sec.clone());
-                }
             }
         }
     }
 
-    // 4. On published LAN/dedicated servers, stream incremental column deltas to connected remote
-    //    DH clients in this dimension.
-    if !partial_deltas.is_empty() {
-        let _ = network::broadcast_partial_updates(host, dim, &partial_deltas);
+    // 4. Octree persistence and sync: adopt stored sections near the players, save changed ones,
+    //    and serve connected clients.
+    let players: Vec<_> = host
+        .players()
+        .server_players()
+        .into_iter()
+        .filter_map(|p| EntityRef::from(p).position(host).map(|pos| (p, pos)))
+        .collect();
+    pipeline::set_player_positions(
+        players
+            .iter()
+            .map(|&(p, pos)| (p, (pos[0] as i32, pos[2] as i32)))
+            .collect(),
+    );
+    if let Some(dir) = rt.inner.lock().unwrap().world_dir.clone() {
+        pipeline::adopt_loaded(host, &rt.io);
+        let center = players.first().map(|&(_, pos)| pos).or(cam);
+        if let Some(center) = center {
+            pipeline::request_stored_sections(
+                &rt.io,
+                &dir,
+                dim,
+                center,
+                STORED_RADIUS_SECTIONS,
+                STORED_REQUESTS_PER_TICK,
+            );
+        }
+        pipeline::flush_saves(&rt.io, &dir, SAVES_PER_TICK);
+    }
+    if dim == "minecraft:overworld" && host.server_is_published() {
+        network::octree_sync::server_tick(host);
     }
 }
 
@@ -672,7 +727,13 @@ fn sample_loaded_chunks(
         .collect();
     for (chunk, snapshot) in &snapshots {
         if let Some(snapshot) = snapshot {
-            pipeline::ingest_chunk(host, dim, *chunk, snapshot, pipeline::SnapshotSource::Loaded);
+            pipeline::ingest_chunk(
+                host,
+                dim,
+                *chunk,
+                snapshot,
+                pipeline::SnapshotSource::Loaded,
+            );
         }
     }
     ingest_chunk_snapshots(host, dim, &snapshots, dirty_sections, collect_deltas)
@@ -1123,6 +1184,17 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
         ingest_chunk_snapshots(host, dim, &saved, dirty_sections, false);
     }
 
+    for res in &results {
+        pipeline::ingest_distant(
+            host,
+            dim,
+            res.pos.detail,
+            res.pos.block_origin(),
+            &res.cells,
+            &res.samples,
+        );
+    }
+
     let mut block_id_cache: HashMap<mod_api::BlockKey, &str> = HashMap::new();
     let mut st = rt.inner.lock().unwrap();
     let mut had_error = false;
@@ -1198,40 +1270,11 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
     }
 }
 
-fn flush_dimension_dirty(world_dir: Option<std::path::PathBuf>, dim: &str) {
-    let rt = runtime();
-    {
-        let mut st = rt.inner.lock().unwrap();
-        let Some(dir) = world_dir.or_else(|| st.world_dir.clone()) else {
-            return;
-        };
-        if let Some(store) = st.dimensions.get_mut(dim) {
-            for sec in store.sections.values_mut() {
-                if sec.dirty_save && sec.populated > 0 {
-                    sec.dirty_save = false;
-                    rt.io.request_save(dir.clone(), dim.to_owned(), sec.clone());
-                }
-            }
-        }
-    }
-    rt.io.flush();
-}
-
 fn flush_dirty_sections(world_dir: Option<std::path::PathBuf>) {
     let rt = runtime();
-    {
-        let mut st = rt.inner.lock().unwrap();
-        let Some(dir) = world_dir.or_else(|| st.world_dir.clone()) else {
-            return;
-        };
-        for (dim, store) in st.dimensions.iter_mut() {
-            for sec in store.sections.values_mut() {
-                if sec.dirty_save && sec.populated > 0 {
-                    sec.dirty_save = false;
-                    rt.io.request_save(dir.clone(), dim.clone(), sec.clone());
-                }
-            }
-        }
-    }
+    let Some(dir) = world_dir.or_else(|| rt.inner.lock().unwrap().world_dir.clone()) else {
+        return;
+    };
+    while pipeline::flush_saves(&rt.io, &dir, usize::MAX) > 0 {}
     rt.io.flush();
 }

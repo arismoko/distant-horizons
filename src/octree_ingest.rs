@@ -209,6 +209,87 @@ impl OctreeIngestStore {
         });
     }
 
+    /// Insert a section loaded from disk or the network when nothing newer holds its position.
+    /// Not marked dirty: the caller queues it for meshing.
+    pub fn adopt_section(&mut self, section: OctreeSection) -> bool {
+        match self.sections.entry(section.pos) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(section);
+                true
+            }
+        }
+    }
+
+    /// Replace a section with a newer copy from the server. Not marked dirty.
+    pub fn replace_section(&mut self, section: OctreeSection) {
+        self.sections.insert(section.pos, section);
+    }
+
+    /// G4 at a coarse step: a sample covering `2^level` blocks is exactly one voxel of a level-`level`
+    /// section, so it is written there directly (no detail-0 expansion, no mip propagation: the
+    /// generator supplies every level itself). Columns whose chunk a loaded or saved source owns
+    /// are skipped. Returns the sections written.
+    pub fn ingest_coarse_columns<B: Copy + Eq + Hash>(
+        &mut self,
+        level: u8,
+        columns: &[DistantColumn<'_, B>],
+        water_block: u32,
+        block_id: &mut dyn FnMut(B) -> u32,
+        biome_id: &mut dyn FnMut(&str) -> u16,
+    ) -> Vec<OctreeSectionPos> {
+        let edge = SECTION_EDGE as i32;
+        let mut touched = HashSet::new();
+        let mut set = |store: &mut Self, vx: i32, vy: i32, vz: i32, voxel: Voxel| {
+            let pos = OctreeSectionPos::new(
+                level,
+                vx.div_euclid(edge),
+                vy.div_euclid(edge),
+                vz.div_euclid(edge),
+            );
+            let section = store
+                .sections
+                .entry(pos)
+                .or_insert_with(|| OctreeSection::new(pos));
+            section.set(
+                vx.rem_euclid(edge) as usize,
+                vy.rem_euclid(edge) as usize,
+                vz.rem_euclid(edge) as usize,
+                voxel,
+            );
+            touched.insert(pos);
+        };
+        for col in columns {
+            if self
+                .chunk_sources
+                .get(&[col.x >> 4, col.z >> 4])
+                .is_some_and(|&s| s > IngestSource::Distant)
+            {
+                continue;
+            }
+            let id = block_id(col.block);
+            if id == 0 {
+                continue;
+            }
+            let biome = biome_id(col.biome);
+            let (vx, vz) = (col.x >> level, col.z >> level);
+            let height = col.height >> level;
+            let water_top = col.water.map(|w| w >> level).filter(|&w| w > height);
+            let top = water_top.unwrap_or(height);
+            for y in (height - DISTANT_SOLID_DEPTH + 1)..=height {
+                set(self, vx, y, vz, Voxel::new(id, biome, 0, 0));
+            }
+            if let Some(w) = water_top {
+                for y in (height + 1)..=w {
+                    let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
+                    set(self, vx, y, vz, Voxel::new(water_block, biome, sky, 0));
+                }
+            }
+            set(self, vx, top + 1, vz, Voxel::air_with_light(15, 0));
+        }
+        touched.into_iter().collect()
+    }
+
     /// Rebuild every ancestor of the dirty detail-0 sections up to `MAX_OCTREE_DETAIL` through
     /// `downsample_2x2x2` (`FullDataSourceV2.java:605-616`). Returns every touched position, the
     /// dirty detail-0 sections first. `opacity` is `Mapper.getBlockStateOpacity`.
