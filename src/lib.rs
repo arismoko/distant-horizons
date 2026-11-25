@@ -62,15 +62,16 @@ const LOADED_SCAN_ABOVE: u32 = 2;
 
 /// Number of loaded chunks sampled per server tick when time remains.
 const CHUNKS_PER_TICK: usize = 4;
-/// Minimum quiet time after a built-in distant sampling call on the server thread before
-/// starting the next one. Matches DH's `FullDataUpdatePropagatorV2.PROPAGATE_QUEUE_THREAD_DELAY_IN_MS`
-/// (250 ms) so synchronous `terrain_surface` fallback work (before detached off-thread generation)
-/// leaves the server thread idle between small batches.
-const DISTANT_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Minimum and maximum quiet interval after a synchronous `terrain_surface` batch on the server
+/// thread. Actual cooldown is `batch_duration * DISTANT_SAMPLE_COOLDOWN_MULT` clamped to this
+/// range, keeping synchronous fallback generation (until off-thread detached generation lands)
+/// at ~10% of the server thread on slow CPUs while still filling quickly on fast CPUs.
+const DISTANT_SAMPLE_MIN_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(20);
+const DISTANT_SAMPLE_MAX_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(250);
+const DISTANT_SAMPLE_COOLDOWN_MULT: u32 = 9;
 
-/// Number of distant surface columns sampled per server-thread batch (one 64-column row of a
-/// `SECTION_SIZE` section). Kept small so each synchronous `terrain_surface` call stays well
-/// within a single 50 ms server tick instead of pegging the server thread.
+/// Number of empty cells sampled per synchronous server-thread `terrain_surface` batch (taken in
+/// row-major order from the nearest unsampled section).
 const DISTANT_COLS_PER_TICK: usize = 64;
 
 #[derive(Default)]
@@ -512,9 +513,7 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     // 2. If time remains and distant generation is on, sample distant terrain around connected
     //    players in `dim` (round-robin, supporting dedicated & LAN servers) or the local camera.
     let (distant_on, cam, cfg, active_dim, rr_cursor) = {
-        let mut st = rt.inner.lock().unwrap();
-        let rr = st.server_player_round_robin;
-        st.server_player_round_robin = rr.wrapping_add(1);
+        let st = rt.inner.lock().unwrap();
         (
             st.config.enabled && st.config.distant_generation,
             if st.has_camera {
@@ -524,7 +523,7 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             },
             st.config,
             st.active_dimension.clone(),
-            rr,
+            st.server_player_round_robin,
         )
     };
 
@@ -544,8 +543,11 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         } else {
             None
         };
-        if let Some(center) = center_opt {
-            sample_distant_sections(host, dim, center, cfg, &mut dirty_sections);
+        if let Some(center) = center_opt
+            && sample_distant_sections(host, dim, center, cfg, &mut dirty_sections)
+        {
+            let mut st = rt.inner.lock().unwrap();
+            st.server_player_round_robin = st.server_player_round_robin.wrapping_add(1);
         }
     }
 
@@ -768,76 +770,83 @@ fn sample_loaded_chunks(
     deltas
 }
 
+/// Advances unthrottled async disk-load checks and, when this dimension's cooldown has elapsed,
+/// runs one small distant-sampling batch. Returns `true` when sampling work actually ran (so
+/// callers can advance multi-player round-robin fairly).
 fn sample_distant_sections(
     host: &dyn ServerHost,
     dim: &str,
     cam: [f64; 3],
     cfg: DhConfig,
     dirty_sections: &mut HashSet<SectionPos>,
-) {
+) -> bool {
     let rt = runtime();
-    // Sampling a section calls the generator's density functions on the server thread, so enforce
-    // a quiet interval measured from completion of the previous batch.
-    {
-        let st = rt.inner.lock().unwrap();
-        let now = std::time::Instant::now();
-        if st
-            .last_distant_sample
-            .is_some_and(|t| now.duration_since(t) < DISTANT_SAMPLE_INTERVAL)
-        {
-            return;
-        }
-    }
-    // Rebuild the desired order only when the camera crosses a 64-block (`SECTION_SIZE`, matching
-    // DH's `LodQuadTree` passing `FullDataSourceV2.WIDTH` = 64 to `QuadTree.setCenterBlockPos`)
-    // cell or the config changes.
-    let desired: Vec<SectionPos> = {
-        let cell = ((cam[0].floor() as i32) >> 6, (cam[2].floor() as i32) >> 6);
-        let mut st = rt.inner.lock().unwrap();
-        match st.desired_cache.get(dim) {
-            Some(c) if c.cell == cell && c.config == cfg => c.list.clone(),
-            _ => {
-                let list = DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg);
-                st.desired_cache.insert(
-                    dim.to_owned(),
-                    render_bridge::DesiredCache {
-                        cell,
-                        config: cfg,
-                        list: list.clone(),
-                    },
-                );
-                list
-            }
-        }
-    };
+    let cam_block = [cam[0].floor() as i32, cam[2].floor() as i32];
 
-    // Pick the nearest desired section that still has unpopulated cells, and issue async disk
-    // load checks for unseen sections first. Also capture any registered external world generator
-    // override or built-in generation disable flag.
+    // Refresh the cached desired-section list when config changes or the camera moves at least
+    // `SECTION_SIZE` (64) blocks Manhattan distance (matching DH's `QuadTree.setCenterBlockPos`
+    // using `FullDataSourceV2.WIDTH` = 64 for `blockDistanceForNodeClearing`). Within that
+    // 64-block window, section ordering and detail splits may lag by up to 63 blocks.
+    // Issue async disk loads unthrottled; throttle only the synchronous sampling batch per dim.
     let (target_section, custom_gen, builtin_disabled) = {
         let mut st = rt.inner.lock().unwrap();
+        let needs_rebuild = match st.desired_cache.get(dim) {
+            Some(c) => {
+                c.config != cfg
+                    || (c.center[0] - cam_block[0]).abs() + (c.center[1] - cam_block[1]).abs()
+                        >= SECTION_SIZE as i32
+            }
+            None => true,
+        };
+        if needs_rebuild {
+            let list = DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg);
+            st.desired_cache.insert(
+                dim.to_owned(),
+                render_bridge::DesiredCache {
+                    center: cam_block,
+                    config: cfg,
+                    list,
+                    disk_cursor: 0,
+                    sample_cursor: 0,
+                },
+            );
+        }
+
         let custom_gen = st.world_generators.get(dim).cloned();
         let builtin_disabled = st.disabled_builtin_gen.contains(dim);
         let save_root = st.world_dir.clone();
-        let store = st.dimensions.entry(dim.to_owned()).or_default();
+        let now = std::time::Instant::now();
+        let sample_due = st
+            .next_distant_sample
+            .get(dim)
+            .is_none_or(|&next| now >= next);
 
-        // Trigger background disk loads for up to 8 unseen sections per tick.
+        let st_ref = &mut *st;
+        let cache = st_ref.desired_cache.get_mut(dim).unwrap();
+        let store = st_ref.dimensions.entry(dim.to_owned()).or_default();
+
+        // Trigger background disk loads for up to 8 unseen sections per tick (unthrottled).
         if let Some(ref dir) = save_root {
             let mut loads = 0;
-            for &pos in &desired {
+            while cache.disk_cursor < cache.list.len() && loads < 8 {
+                let pos = cache.list[cache.disk_cursor];
+                cache.disk_cursor += 1;
                 if store.disk_checked.insert(pos) {
                     rt.io.request_load(dir.clone(), dim.to_owned(), pos);
                     loads += 1;
-                    if loads >= 8 {
-                        break;
-                    }
                 }
             }
         }
 
+        if !sample_due {
+            return false;
+        }
+
         let mut picked = None;
-        for pos in desired {
+        while cache.sample_cursor < cache.list.len() {
+            let pos = cache.list[cache.sample_cursor];
             if store.sampled_distant_sections.contains(&pos) {
+                cache.sample_cursor += 1;
                 continue;
             }
             let sec = store.sections.get(&pos);
@@ -858,6 +867,7 @@ fn sample_distant_sections(
             }
             if missing.is_empty() {
                 store.sampled_distant_sections.insert(pos);
+                cache.sample_cursor += 1;
             } else {
                 picked = Some((pos, missing));
                 break;
@@ -867,8 +877,7 @@ fn sample_distant_sections(
     };
 
     let Some((pos, cells)) = target_section else {
-        rt.inner.lock().unwrap().last_distant_sample = Some(std::time::Instant::now());
-        return;
+        return false;
     };
 
     // If a mod registered a custom `LodWorldGenerator` covering this detail level, delegate
@@ -876,6 +885,7 @@ fn sample_distant_sections(
     if let Some(generator) = custom_gen
         && generator.detail_range().contains(&pos.detail)
     {
+        let t0 = std::time::Instant::now();
         generator.pre_task_start();
         let req = LodGenRequest {
             dimension: dim.to_owned(),
@@ -888,15 +898,24 @@ fn sample_distant_sections(
                 produced = produced.saturating_add(n);
             }
         });
+        let cooldown = (t0.elapsed() * DISTANT_SAMPLE_COOLDOWN_MULT)
+            .clamp(DISTANT_SAMPLE_MIN_COOLDOWN, DISTANT_SAMPLE_MAX_COOLDOWN);
         let mut st = rt.inner.lock().unwrap();
+        st.next_distant_sample
+            .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
         let store = st.dimensions.entry(dim.to_owned()).or_default();
         store.sampled_distant_sections.insert(pos);
         store.generated_columns = store.generated_columns.saturating_add(produced as u64);
-        return;
+        return true;
     }
 
     if builtin_disabled {
-        return;
+        let mut st = rt.inner.lock().unwrap();
+        st.next_distant_sample.insert(
+            dim.to_owned(),
+            std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
+        );
+        return false;
     }
 
     let (ox, oz) = pos.block_origin();
@@ -912,13 +931,23 @@ fn sample_distant_sections(
         })
         .collect();
 
-    let Ok(samples) = host.terrain_surface(dim, &query_cols) else {
-        rt.inner.lock().unwrap().last_distant_sample = Some(std::time::Instant::now());
-        return;
+    let t0 = std::time::Instant::now();
+    let samples_res = host.terrain_surface(dim, &query_cols);
+    let cooldown = (t0.elapsed() * DISTANT_SAMPLE_COOLDOWN_MULT)
+        .clamp(DISTANT_SAMPLE_MIN_COOLDOWN, DISTANT_SAMPLE_MAX_COOLDOWN);
+
+    let Ok(samples) = samples_res else {
+        rt.inner
+            .lock()
+            .unwrap()
+            .next_distant_sample
+            .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
+        return true;
     };
 
     let mut st = rt.inner.lock().unwrap();
-    st.last_distant_sample = Some(std::time::Instant::now());
+    st.next_distant_sample
+        .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
     let store = st.dimensions.entry(dim.to_owned()).or_default();
     let mut updated_any = false;
     let mut non_empty_count = 0u64;
@@ -959,6 +988,7 @@ fn sample_distant_sections(
     if updated_any {
         dirty_sections.insert(pos);
     }
+    true
 }
 
 fn flush_dimension_dirty(world_dir: Option<std::path::PathBuf>, dim: &str) {
