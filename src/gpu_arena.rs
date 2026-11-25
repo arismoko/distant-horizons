@@ -33,7 +33,7 @@ pub const SECTION_METADATA_BYTES: u64 = 32;
 /// Bytes per indexed indirect command: vanilla `RenderPass.INDIRECT_INDEXED_DRAW_SIZE = 20`.
 pub const DRAW_INDEXED_INDIRECT_BYTES: u64 = 20;
 /// Voxy's `maxSectionCount` (`VoxyRenderSystem.java:119`).
-pub const VOXY_MAX_SECTIONS: u32 = 1 << 20;
+pub const VOXY_MAX_SECTIONS: u32 = 1 << 19;
 /// Quad buckets per section: translucent, double-sided, down, up, north, south, west, east.
 pub const BUCKETS: usize = 8;
 /// Opaque command slots per section (every bucket but translucent).
@@ -46,10 +46,10 @@ pub const MODEL_WORDS: u64 = 16;
 pub const MODEL_COUNT: u64 = 1 << 20;
 pub const BIOME_COUNT: u64 = 1 << 9;
 
-/// Geometry arena size requested first: Voxy's cap (`min(next_pow2(ssbo_max) << 1, 1<<32) - 1024`)
-/// assuming a 2 GiB binding limit. The game reports no device limits, so [`GpuArena::new`] halves
-/// the request until `create_storage_buffer` accepts it.
-pub const VOXY_GEOMETRY_BYTES: u64 = (1 << 32) - 1024;
+/// Geometry arena size requested first. Each arena buffer is bound whole, so it must fit the
+/// device's `max_storage_buffer_binding_size` (128 MiB by default); `create_storage_buffer` only
+/// checks `max_buffer_size` and the game reports no limits to mods, so this stays at the default.
+pub const VOXY_GEOMETRY_BYTES: u64 = 128 << 20;
 
 /// Smallest geometry arena worth running with.
 const MIN_GEOMETRY_BYTES: u64 = 64 << 20;
