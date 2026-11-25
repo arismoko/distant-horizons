@@ -19,3 +19,7 @@ issues = "https://github.com/arismoko/distant-sunrises/issues"
 api = "0.2"
 side = "both"
 capabilities = ["registries"]
+
+[native]
+game = "26.3"
+sunrise = "7a090ee762e0f07e4a7f1ec9f8d5ac28e3407422"
