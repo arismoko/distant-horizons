@@ -1,4 +1,4 @@
-//! Wire codec and decoder for Distant Horizons' `FullDataSourceV2DTO` and `DhSectionPos`
+//! Wire codec and decoder for Distant Sunrises' `FullDataSourceV2DTO` and `DhSectionPos`
 //! formats, allowing server-sent LOD payloads in upstream DH's format to be ingested directly
 //! by external Sunrise mods via [`crate::api::submit_dh_v2_bytes`] and
 //! [`crate::api::submit_dh_v2_dto`].
@@ -132,7 +132,7 @@ pub struct DecodedDhV2Section {
     pub created_unix_ms: i64,
 }
 
-/// Raw wire container matching upstream Distant Horizons `FullDataSourceV2DTO`.
+/// Raw wire container matching upstream Distant Sunrises `FullDataSourceV2DTO`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DhV2FullDataDto {
     pub pos: i64,

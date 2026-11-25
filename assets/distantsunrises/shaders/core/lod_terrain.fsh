@@ -1,20 +1,20 @@
 #version 330
 
-// Distant Horizons LOD terrain fragment shader (vanilla Sunrise core-shader GLSL style).
-// Applies near-edge dither fade (matching vanilla render distance transition) and subtle
-// per-block procedural surface noise on opaque LOD terrain.
+// Distant Sunrises LOD terrain fragment shader (vanilla Sunrise core-shader GLSL style).
+// Applies near-edge dither fade, debug cell wireframes, and procedural surface noise.
 
 layout(std140) uniform DhFrameUniforms {
     mat4 ViewProjMat;
     vec4 ClipAndLight;   // x = near_dh, y = far_dh, z = clip_dist, w = sun_brightness
     vec4 NoiseAndFade;   // x = noise_intensity, y = fade_band, z = brightness_mul, w = saturation_mul
-    uvec4 Flags;         // x = shading_enabled, y = noise_enabled, z = fade_enabled, w = is_hdr
+    uvec4 Flags;         // x = shading_enabled, y = noise_enabled, z = fade_enabled, w = debug_mode
 };
 
 in vec4 vertexColor;
 in vec3 relPos;
 in vec3 blockPos;
 flat in uint packedMeta;
+flat in float cellSize;
 
 out vec4 fragColor;
 
@@ -37,10 +37,11 @@ float bayer4x4(vec2 p) {
 }
 
 void main() {
+    uint skipClip = (packedMeta >> 24u) & 1u;
     float dist = length(relPos.xz);
     float clipDist = ClipAndLight.z;
     float fadeBand = NoiseAndFade.y;
-    if (clipDist > 0.0) {
+    if (skipClip == 0u && clipDist > 0.0) {
         if (Flags.z != 0u && fadeBand > 0.5) {
             float t = smoothstep(clipDist, clipDist + fadeBand, dist);
             if (t <= bayer4x4(gl_FragCoord.xy)) {
@@ -52,8 +53,17 @@ void main() {
     }
 
     vec3 rgb = vertexColor.rgb;
+    uint debugMode = Flags.w;
     uint isFluid = (packedMeta >> 12u) & 1u;
-    if (Flags.y != 0u && isFluid == 0u) {
+    uint isGeneric = (packedMeta >> 22u) & 1u;
+
+    if (debugMode == 4u) {
+        vec2 f = fract(blockPos.xz / cellSize);
+        float edge = min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y));
+        if (edge < 0.05) {
+            rgb = vec3(0.05, 0.05, 0.05);
+        }
+    } else if (debugMode == 0u && Flags.y != 0u && isFluid == 0u && isGeneric == 0u) {
         float intensity = NoiseAndFade.x;
         float lum = (rgb.r + rgb.g + rgb.b) / 3.0;
         float amp = (1.0 - pow(lum * 2.0 - 1.0, 2.0)) * intensity;

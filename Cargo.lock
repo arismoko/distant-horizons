@@ -96,9 +96,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "distanthorizons"
+name = "distantsunrises"
 version = "3.3.5"
 dependencies = [
+ "crc32fast",
  "lz4_flex",
  "ruzstd",
  "sunrise-mod-api",

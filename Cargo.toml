@@ -1,12 +1,12 @@
 [package]
-name = "distanthorizons"
+name = "distantsunrises"
 version = "3.3.5"
 edition = "2024"
 license = "LGPL-3.0-or-later"
-description = "Distant Horizons level-of-detail terrain port for Sunrise"
+description = "Distant Sunrises level-of-detail terrain port for Sunrise"
 
 [lib]
-name = "distanthorizons"
+name = "distantsunrises"
 path = "src/lib.rs"
 
 [dependencies]
@@ -14,3 +14,4 @@ sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 ruzstd = "0.9"
 xz4rust = { version = "0.2.3", default-features = false, features = ["std", "crc64"] }
+crc32fast = "1.5"

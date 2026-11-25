@@ -1,12 +1,14 @@
-//! Client commands (`/dh` / `/distanthorizons`) and Controls keybind handling.
+//! Client commands (`/ds` / `/distantsunrises`) and Controls keybind handling.
 //!
 //! Uses Sunrise's `register_client_commands` / `command` hooks and `Registrar::register_key_mapping`
 //! so every action works in single-player, LAN, and multiplayer without needing a server-side mod.
 
 use crate::config::{
-    DhConfig, KEY_CAVE_CULLING, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FADE_ENABLED,
-    KEY_FOG_ENABLED, KEY_HORIZONTAL_QUALITY, KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE,
-    KEY_VERTICAL_QUALITY, MOD_ID,
+    DEBUG_OFF, DEBUG_SHOW_DETAIL, DEBUG_SHOW_DETAIL_WIREFRAME, DEBUG_SHOW_GEN_MODE,
+    DEBUG_SHOW_LIGHTING, DhConfig, KEY_BEACON_BEAMS_ENABLED, KEY_CAVE_CULLING, KEY_CLOUDS_ENABLED,
+    KEY_DEBUG_MODE, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FADE_ENABLED, KEY_FOG_ENABLED,
+    KEY_HEIGHT_FOG_ENABLED, KEY_HORIZONTAL_QUALITY, KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE,
+    KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED, KEY_SSAO_QUALITY, KEY_VERTICAL_QUALITY, MOD_ID,
 };
 use crate::render_bridge::{runtime, stats};
 use mod_api::{
@@ -19,24 +21,24 @@ pub const KEYBIND_TOGGLE_RENDERING: &str = "toggle_rendering";
 pub const KEYBIND_CYCLE_QUALITY: &str = "cycle_quality";
 pub const KEYBIND_CLEAR_CACHE: &str = "clear_cache";
 
-/// Register Controls keybinds for Distant Horizons.
+/// Register Controls keybinds for Distant Sunrises.
 pub fn register_key_mappings(registrar: &mut dyn Registrar) {
     registrar.register_key_mapping(
         KeyRegistration::new(KEYBIND_TOGGLE_RENDERING, "key.keyboard.unknown")
-            .label("distanthorizons.key.toggle_rendering")
-            .category("distanthorizons.key.category")
+            .label("distantsunrises.key.toggle_rendering")
+            .category("distantsunrises.key.category")
             .context(KeyConflictContext::InGame),
     );
     registrar.register_key_mapping(
         KeyRegistration::new(KEYBIND_CYCLE_QUALITY, "key.keyboard.unknown")
-            .label("distanthorizons.key.cycle_quality")
-            .category("distanthorizons.key.category")
+            .label("distantsunrises.key.cycle_quality")
+            .category("distantsunrises.key.category")
             .context(KeyConflictContext::InGame),
     );
     registrar.register_key_mapping(
         KeyRegistration::new(KEYBIND_CLEAR_CACHE, "key.keyboard.unknown")
-            .label("distanthorizons.key.clear_cache")
-            .category("distanthorizons.key.category")
+            .label("distantsunrises.key.clear_cache")
+            .category("distantsunrises.key.category")
             .context(KeyConflictContext::InGame),
     );
 }
@@ -64,9 +66,9 @@ impl DhKeybinds {
         {
             let now_enabled = toggle_enabled(host);
             let key = if now_enabled {
-                "distanthorizons.command.toggled_on"
+                "distantsunrises.command.toggled_on"
             } else {
-                "distanthorizons.command.toggled_off"
+                "distantsunrises.command.toggled_off"
             };
             let _ = host.set_overlay_message(Text::translate(key, Vec::new()), false);
         }
@@ -78,7 +80,7 @@ impl DhKeybinds {
             let label_key = quality_label_key(next);
             let _ = host.set_overlay_message(
                 Text::translate(
-                    "distanthorizons.command.quality_set",
+                    "distantsunrises.command.quality_set",
                     vec![Text::translate(label_key, Vec::new())],
                 ),
                 false,
@@ -91,7 +93,7 @@ impl DhKeybinds {
             let cleared = clear_active_dimension_cache();
             let _ = host.set_overlay_message(
                 Text::translate(
-                    "distanthorizons.command.cleared",
+                    "distantsunrises.command.cleared",
                     vec![Text::literal(cleared.to_string())],
                 ),
                 false,
@@ -100,15 +102,22 @@ impl DhKeybinds {
     }
 }
 
-/// Register client command completions for `/dh` and `/distanthorizons`.
+/// Register client command completions for `/ds` and `/distantsunrises`.
 pub fn register_client_commands(commands: &mut Vec<Command>) {
-    for prefix in ["dh", "distanthorizons"] {
+    for prefix in ["ds", "distantsunrises"] {
         commands.push(Command::new(prefix));
         commands.push(Command::new(&format!("{prefix} status")));
         commands.push(Command::new(&format!("{prefix} toggle")));
         commands.push(Command::new(&format!("{prefix} radius <chunks:integer>")));
         commands.push(Command::new(&format!("{prefix} quality <preset:word>")));
+        commands.push(Command::new(&format!("{prefix} preset <preset:word>")));
         commands.push(Command::new(&format!("{prefix} fog <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} heightfog <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} ssao <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} sharpen <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} clouds <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} beacons <mode:word>")));
+        commands.push(Command::new(&format!("{prefix} debug <mode:word>")));
         commands.push(Command::new(&format!("{prefix} gen <mode:word>")));
         commands.push(Command::new(&format!("{prefix} cavecull <mode:word>")));
         commands.push(Command::new(&format!("{prefix} clear")));
@@ -117,14 +126,14 @@ pub fn register_client_commands(commands: &mut Vec<Command>) {
     }
 }
 
-/// Execute `/dh ...` or `/distanthorizons ...` typed in chat.
+/// Execute `/ds ...` or `/distantsunrises ...` typed in chat.
 pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
     let trimmed = raw.trim().trim_start_matches('/');
     let mut parts = trimmed.split_whitespace();
     let Some(root) = parts.next() else {
         return Flow::Continue;
     };
-    if !root.eq_ignore_ascii_case("dh") && !root.eq_ignore_ascii_case("distanthorizons") {
+    if !root.eq_ignore_ascii_case("ds") && !root.eq_ignore_ascii_case("distantsunrises") {
         return Flow::Continue;
     }
 
@@ -138,9 +147,9 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         "toggle" => {
             let enabled = toggle_enabled(host);
             let key = if enabled {
-                "distanthorizons.command.toggled_on"
+                "distantsunrises.command.toggled_on"
             } else {
-                "distanthorizons.command.toggled_off"
+                "distantsunrises.command.toggled_off"
             };
             let _ = host.chat_line(Text::translate(key, Vec::new()));
         }
@@ -150,13 +159,13 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
                 host.set_setting(MOD_ID, KEY_RENDER_DISTANCE, &clamped.to_string());
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.radius_set",
+                    "distantsunrises.command.radius_set",
                     vec![Text::literal(clamped.to_string())],
                 ));
             }
             None => {
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.usage_radius",
+                    "distantsunrises.command.usage_radius",
                     Vec::new(),
                 ));
             }
@@ -173,27 +182,150 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
             }
             _ => {
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.usage_quality",
+                    "distantsunrises.command.usage_quality",
                     Vec::new(),
                 ));
             }
         },
+        "preset" => match arg.map(str::to_ascii_lowercase).as_deref() {
+            Some("low") => apply_preset(
+                host,
+                QualityPreset {
+                    radius: 64,
+                    h_qual: 0,
+                    v_qual: 0,
+                    ssao_q: 0,
+                    ssao_on: false,
+                    sharpen: 0.0,
+                    label_key: "distantsunrises.setting.quality.low",
+                },
+            ),
+            Some("medium" | "med") => apply_preset(
+                host,
+                QualityPreset {
+                    radius: 128,
+                    h_qual: 1,
+                    v_qual: 1,
+                    ssao_q: 1,
+                    ssao_on: true,
+                    sharpen: 0.25,
+                    label_key: "distantsunrises.setting.quality.medium",
+                },
+            ),
+            Some("high") => apply_preset(
+                host,
+                QualityPreset {
+                    radius: 256,
+                    h_qual: 2,
+                    v_qual: 2,
+                    ssao_q: 1,
+                    ssao_on: true,
+                    sharpen: 0.35,
+                    label_key: "distantsunrises.setting.quality.high",
+                },
+            ),
+            Some("extreme") => apply_preset(
+                host,
+                QualityPreset {
+                    radius: 512,
+                    h_qual: 2,
+                    v_qual: 3,
+                    ssao_q: 2,
+                    ssao_on: true,
+                    sharpen: 0.45,
+                    label_key: "distantsunrises.setting.quality.extreme",
+                },
+            ),
+            _ => {
+                let _ = host.chat_line(Text::translate(
+                    "distantsunrises.command.usage_preset",
+                    Vec::new(),
+                ));
+            }
+        },
+        "ssao" => handle_bool_setting(host, KEY_SSAO_ENABLED, "ssao", arg),
+        "sharpen" => match parse_toggle_arg(arg) {
+            Some(v) => {
+                host.set_setting(
+                    MOD_ID,
+                    KEY_SHARPENING_AMOUNT,
+                    if v { "0.35" } else { "0.0" },
+                );
+                refresh_config(host);
+                let _ = host.chat_line(Text::translate(
+                    if v {
+                        "distantsunrises.command.setting_on"
+                    } else {
+                        "distantsunrises.command.setting_off"
+                    },
+                    vec![Text::literal("sharpen")],
+                ));
+            }
+            None => {
+                let _ = host.chat_line(Text::translate(
+                    "distantsunrises.command.usage_toggle",
+                    vec![Text::literal("sharpen")],
+                ));
+            }
+        },
+        "heightfog" => handle_bool_setting(host, KEY_HEIGHT_FOG_ENABLED, "heightfog", arg),
+        "clouds" => handle_bool_setting(host, KEY_CLOUDS_ENABLED, "clouds", arg),
+        "beacons" => handle_bool_setting(host, KEY_BEACON_BEAMS_ENABLED, "beacons", arg),
+        "debug" => {
+            let parsed = match arg.map(str::to_ascii_lowercase).as_deref() {
+                Some("off" | "none" | "0") => {
+                    Some((DEBUG_OFF, "distantsunrises.setting.debug.off"))
+                }
+                Some("detail" | "lod" | "1") => {
+                    Some((DEBUG_SHOW_DETAIL, "distantsunrises.setting.debug.detail"))
+                }
+                Some("gen" | "source" | "2") => Some((
+                    DEBUG_SHOW_GEN_MODE,
+                    "distantsunrises.setting.debug.gen_mode",
+                )),
+                Some("light" | "lighting" | "3") => Some((
+                    DEBUG_SHOW_LIGHTING,
+                    "distantsunrises.setting.debug.lighting",
+                )),
+                Some("wireframe" | "wire" | "4") => Some((
+                    DEBUG_SHOW_DETAIL_WIREFRAME,
+                    "distantsunrises.setting.debug.wireframe",
+                )),
+                _ => None,
+            };
+            match parsed {
+                Some((mode, label_key)) => {
+                    host.set_setting(MOD_ID, KEY_DEBUG_MODE, &mode.to_string());
+                    refresh_config(host);
+                    let _ = host.chat_line(Text::translate(
+                        "distantsunrises.command.debug_set",
+                        vec![Text::translate(label_key, Vec::new())],
+                    ));
+                }
+                None => {
+                    let _ = host.chat_line(Text::translate(
+                        "distantsunrises.command.usage_debug",
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
         "fog" => match parse_toggle_arg(arg) {
             Some(v) => {
                 host.set_setting(MOD_ID, KEY_FOG_ENABLED, if v { "true" } else { "false" });
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
-                        "distanthorizons.command.fog_on"
+                        "distantsunrises.command.fog_on"
                     } else {
-                        "distanthorizons.command.fog_off"
+                        "distantsunrises.command.fog_off"
                     },
                     Vec::new(),
                 ));
             }
             None => {
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.usage_toggle",
+                    "distantsunrises.command.usage_toggle",
                     vec![Text::literal("fog")],
                 ));
             }
@@ -204,16 +336,16 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
-                        "distanthorizons.command.setting_on"
+                        "distantsunrises.command.setting_on"
                     } else {
-                        "distanthorizons.command.setting_off"
+                        "distantsunrises.command.setting_off"
                     },
                     vec![Text::literal("fade")],
                 ));
             }
             None => {
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.usage_toggle",
+                    "distantsunrises.command.usage_toggle",
                     vec![Text::literal("fade")],
                 ));
             }
@@ -224,16 +356,16 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
-                        "distanthorizons.command.setting_on"
+                        "distantsunrises.command.setting_on"
                     } else {
-                        "distanthorizons.command.setting_off"
+                        "distantsunrises.command.setting_off"
                     },
                     vec![Text::literal("noise")],
                 ));
             }
             None => {
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.usage_toggle",
+                    "distantsunrises.command.usage_toggle",
                     vec![Text::literal("noise")],
                 ));
             }
@@ -248,16 +380,16 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
-                        "distanthorizons.command.setting_on"
+                        "distantsunrises.command.setting_on"
                     } else {
-                        "distanthorizons.command.setting_off"
+                        "distantsunrises.command.setting_off"
                     },
                     vec![Text::literal("gen")],
                 ));
             }
             None => {
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.usage_toggle",
+                    "distantsunrises.command.usage_toggle",
                     vec![Text::literal("gen")],
                 ));
             }
@@ -268,16 +400,16 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
-                        "distanthorizons.command.setting_on"
+                        "distantsunrises.command.setting_on"
                     } else {
-                        "distanthorizons.command.setting_off"
+                        "distantsunrises.command.setting_off"
                     },
                     vec![Text::literal("cavecull")],
                 ));
             }
             None => {
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.usage_toggle",
+                    "distantsunrises.command.usage_toggle",
                     vec![Text::literal("cavecull")],
                 ));
             }
@@ -287,13 +419,13 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
                 host.set_setting(MOD_ID, KEY_VERTICAL_QUALITY, &v.to_string());
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.quality_set",
+                    "distantsunrises.command.quality_set",
                     vec![Text::literal(v.to_string())],
                 ));
             }
             _ => {
                 let _ = host.chat_line(Text::translate(
-                    "distanthorizons.command.usage_quality",
+                    "distantsunrises.command.usage_quality",
                     Vec::new(),
                 ));
             }
@@ -301,19 +433,19 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         "clear" => {
             let cleared = clear_active_dimension_cache();
             let _ = host.chat_line(Text::translate(
-                "distanthorizons.command.cleared",
+                "distantsunrises.command.cleared",
                 vec![Text::literal(cleared.to_string())],
             ));
         }
         "remesh" => {
             let count = remesh_active_dimension();
             let _ = host.chat_line(Text::translate(
-                "distanthorizons.command.remeshed",
+                "distantsunrises.command.remeshed",
                 vec![Text::literal(count.to_string())],
             ));
         }
         _ => {
-            let _ = host.chat_line(Text::translate("distanthorizons.command.help", Vec::new()));
+            let _ = host.chat_line(Text::translate("distantsunrises.command.help", Vec::new()));
         }
     }
 
@@ -330,9 +462,9 @@ fn parse_toggle_arg(arg: Option<&str>) -> Option<bool> {
 
 fn quality_label_key(q: u32) -> &'static str {
     match q {
-        0 => "distanthorizons.setting.quality.low",
-        2 => "distanthorizons.setting.quality.high",
-        _ => "distanthorizons.setting.quality.medium",
+        0 => "distantsunrises.setting.quality.low",
+        2 => "distantsunrises.setting.quality.high",
+        _ => "distantsunrises.setting.quality.medium",
     }
 }
 
@@ -362,8 +494,59 @@ fn set_quality(host: &mut dyn ClientHost, preset: u32) {
     host.set_setting(MOD_ID, KEY_HORIZONTAL_QUALITY, &preset.to_string());
     refresh_config(host);
     let _ = host.chat_line(Text::translate(
-        "distanthorizons.command.quality_set",
+        "distantsunrises.command.quality_set",
         vec![Text::translate(quality_label_key(preset), Vec::new())],
+    ));
+}
+
+fn handle_bool_setting(host: &mut dyn ClientHost, key: &str, label: &str, arg: Option<&str>) {
+    match parse_toggle_arg(arg) {
+        Some(v) => {
+            host.set_setting(MOD_ID, key, if v { "true" } else { "false" });
+            refresh_config(host);
+            let _ = host.chat_line(Text::translate(
+                if v {
+                    "distantsunrises.command.setting_on"
+                } else {
+                    "distantsunrises.command.setting_off"
+                },
+                vec![Text::literal(label)],
+            ));
+        }
+        None => {
+            let _ = host.chat_line(Text::translate(
+                "distantsunrises.command.usage_toggle",
+                vec![Text::literal(label)],
+            ));
+        }
+    }
+}
+
+struct QualityPreset {
+    radius: u32,
+    h_qual: u32,
+    v_qual: u32,
+    ssao_q: u32,
+    ssao_on: bool,
+    sharpen: f32,
+    label_key: &'static str,
+}
+
+fn apply_preset(host: &mut dyn ClientHost, p: QualityPreset) {
+    host.set_setting(MOD_ID, KEY_RENDER_DISTANCE, &p.radius.to_string());
+    host.set_setting(MOD_ID, KEY_HORIZONTAL_QUALITY, &p.h_qual.to_string());
+    host.set_setting(MOD_ID, KEY_VERTICAL_QUALITY, &p.v_qual.to_string());
+    host.set_setting(
+        MOD_ID,
+        KEY_SSAO_ENABLED,
+        if p.ssao_on { "true" } else { "false" },
+    );
+    host.set_setting(MOD_ID, KEY_SSAO_QUALITY, &p.ssao_q.to_string());
+    host.set_setting(MOD_ID, KEY_SHARPENING_AMOUNT, &format!("{:.2}", p.sharpen));
+    refresh_config(host);
+    let _ = host.chat_line(Text::translate(
+        "distantsunrises.command.preset_set",
+        vec![Text::translate(p.label_key, Vec::new())],
     ));
 }
 
@@ -379,12 +562,12 @@ fn send_status(host: &mut dyn ClientHost) {
         )
     };
     let state_key = if cfg.enabled {
-        "distanthorizons.command.state_on"
+        "distantsunrises.command.state_on"
     } else {
-        "distanthorizons.command.state_off"
+        "distantsunrises.command.state_off"
     };
     let _ = host.chat_line(Text::translate(
-        "distanthorizons.command.status_line",
+        "distantsunrises.command.status_line",
         vec![
             Text::translate(state_key, Vec::new()),
             Text::literal(dim),
@@ -449,12 +632,12 @@ mod tests {
     }
 
     #[test]
-    fn client_command_list_covers_dh_and_distanthorizons_aliases() {
+    fn client_command_list_covers_ds_and_distantsunrises_aliases() {
         let mut cmds = Vec::new();
         register_client_commands(&mut cmds);
-        assert!(cmds.iter().any(|c| c.usage == "dh status"));
-        assert!(cmds.iter().any(|c| c.usage == "dh radius <chunks:integer>"));
-        assert!(cmds.iter().any(|c| c.usage == "distanthorizons clear"));
+        assert!(cmds.iter().any(|c| c.usage == "ds status"));
+        assert!(cmds.iter().any(|c| c.usage == "ds radius <chunks:integer>"));
+        assert!(cmds.iter().any(|c| c.usage == "distantsunrises clear"));
         assert!(cmds.iter().all(|c| c.level == 0));
     }
 }

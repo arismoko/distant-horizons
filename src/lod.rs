@@ -1,4 +1,4 @@
-//! Distant Horizons multi-detail-level LOD section store and quadtree selector.
+//! Distant Sunrises multi-detail-level LOD section store and quadtree selector.
 
 use crate::config::DhConfig;
 use std::collections::{HashMap, HashSet};
@@ -143,7 +143,7 @@ pub struct LodColumn {
     pub fluid_rgba: [u8; 4],
     /// `SOURCE_EMPTY`, `SOURCE_DISTANT_SURFACE`, or `SOURCE_LOADED_CHUNK`.
     pub source: u8,
-    /// Iris / Distant Horizons 4-bit material ID (`DH_BLOCK_*`, `0..=15`) for solid terrain.
+    /// Iris / Distant Sunrises 4-bit material ID (`DH_BLOCK_*`, `0..=15`) for solid terrain.
     pub material_id: u8,
 }
 
@@ -260,7 +260,7 @@ pub struct ExtraSpan {
     pub rgba: [u8; 4],
     /// `true` for translucent fluids (water/lava surface layers), `false` for solid blocks.
     pub is_fluid: bool,
-    /// Iris / Distant Horizons 4-bit material ID (`DH_BLOCK_*`, `0..=15`).
+    /// Iris / Distant Sunrises 4-bit material ID (`DH_BLOCK_*`, `0..=15`).
     pub material_id: u8,
 }
 

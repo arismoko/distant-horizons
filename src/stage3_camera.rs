@@ -41,7 +41,7 @@ impl CameraMatrices {
     }
 
     /// Multiply `projection * view` in column-major order to obtain the combined camera-relative
-    /// clip matrix matching Sunrise's renderer and `assets/distanthorizons/shaders/core/lod_terrain.vsh`.
+    /// clip matrix matching Sunrise's renderer and `assets/distantsunrises/shaders/core/lod_terrain.vsh`.
     pub fn view_projection(&self) -> [f32; 16] {
         mul_mat4_col_major(&self.projection, &self.view)
     }
@@ -67,7 +67,7 @@ impl CameraMatrices {
 }
 
 /// CPU-side `DhFrameUniforms` layout (`std140`, 112 bytes) matching
-/// `assets/distanthorizons/shaders/core/lod_terrain.vsh` and `lod_terrain.fsh`.
+/// `assets/distantsunrises/shaders/core/lod_terrain.vsh` and `lod_terrain.fsh`.
 #[derive(Clone, Copy, Debug)]
 pub struct TerrainUniformBlock {
     pub view_proj: [f32; 16],

@@ -1,4 +1,4 @@
-//! Iris/OptiFine shader-pack integration data for Distant Horizons.
+//! Iris/OptiFine shader-pack integration data for Distant Sunrises.
 //!
 //! Computes the exact OpenGL `[-1, 1]` clip-space projection matrices (`dhProjection`,
 //! `dhProjectionInverse`, `dhPreviousProjection`) and scalar uniforms (`dhNearPlane`,
@@ -14,7 +14,7 @@ use crate::colors::{
 };
 
 /// Shared auxiliary depth-plane target ID used by DH solid and water pipelines (`#5371`).
-pub const DH_DEPTH_TARGET_ID: &str = "distanthorizons:far_depth";
+pub const DH_DEPTH_TARGET_ID: &str = "distantsunrises:far_depth";
 
 /// Pack program fallback chains matching Iris `DHCompatInternal` / `ProgramId`.
 pub const DH_TERRAIN_PROGRAMS: &[&str] = &["dh_terrain"];
@@ -149,7 +149,7 @@ pub fn invert_mat4(m: Mat4) -> Option<Mat4> {
     Some(out)
 }
 
-/// Per-frame shader-pack uniforms supplied by Distant Horizons (`#5371`).
+/// Per-frame shader-pack uniforms supplied by Distant Sunrises (`#5371`).
 #[derive(Clone, Copy, Debug)]
 pub struct DhPackFrameUniforms {
     pub dh_projection: Mat4,
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_defines_cover_distant_horizons_and_all_16_material_ids() {
+    fn pack_defines_cover_distant_sunrises_and_all_16_material_ids() {
         assert_eq!(DH_PACK_DEFINES.len(), 17);
         assert_eq!(DH_PACK_DEFINES[0], ("DISTANT_HORIZONS", None));
         assert_eq!(DH_PACK_DEFINES[13], ("DH_BLOCK_WATER", Some("12")));

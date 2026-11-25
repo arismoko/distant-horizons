@@ -1,6 +1,6 @@
-//! Vanilla 26.3 block and biome surface color palette for Distant Horizons LOD columns.
+//! Vanilla 26.3 block and biome surface color palette for Distant Sunrises LOD columns.
 
-/// Iris / Distant Horizons standard material IDs (`StandardMacros.java:81-96`).
+/// Iris / Distant Sunrises standard material IDs (`StandardMacros.java:81-96`).
 ///
 /// Exposed to translated Iris/OptiFine shader packs via `DH_BLOCK_*` preprocessor defines and
 /// vertex attribute `dhMaterialId`.
@@ -216,9 +216,60 @@ pub fn is_water_block(block_id: &str) -> bool {
     matches!(name, "water" | "bubble_column")
 }
 
-/// Grass tint `[r, g, b]` matching vanilla 26.3 biome climates.
+/// Vanilla `(temperature, downfall)` pairs for colormap sampling (`textures/colormap/{grass,foliage}.png`).
+fn biome_climate(name: &str) -> Option<(f32, f32)> {
+    match name {
+        "plains" | "sunflower_plains" | "beach" => Some((0.8, 0.4)),
+        "river" => Some((0.5, 0.5)),
+        "forest" | "flower_forest" | "dark_forest" => Some((0.7, 0.8)),
+        "birch_forest" | "old_growth_birch_forest" => Some((0.6, 0.6)),
+        "taiga" | "old_growth_pine_taiga" => Some((0.25, 0.8)),
+        "old_growth_spruce_taiga" => Some((0.25, 0.8)),
+        "snowy_taiga" => Some((-0.5, 0.4)),
+        "snowy_plains" | "ice_spikes" | "snowy_slopes" | "frozen_peaks" | "jagged_peaks"
+        | "grove" | "snowy_beach" | "frozen_river" | "frozen_ocean" | "deep_frozen_ocean" => {
+            Some((0.0, 0.5))
+        }
+        "windswept_hills"
+        | "windswept_gravelly_hills"
+        | "windswept_forest"
+        | "stony_shore"
+        | "stony_peaks" => Some((0.2, 0.3)),
+        "jungle" | "bamboo_jungle" => Some((0.95, 0.9)),
+        "sparse_jungle" => Some((0.95, 0.8)),
+        "savanna" | "savanna_plateau" | "windswept_savanna" | "desert" => Some((2.0, 0.0)),
+        "meadow" => Some((0.5, 0.8)),
+        "mushroom_fields" => Some((0.9, 1.0)),
+        "ocean"
+        | "deep_ocean"
+        | "lukewarm_ocean"
+        | "deep_lukewarm_ocean"
+        | "warm_ocean"
+        | "cold_ocean"
+        | "deep_cold_ocean" => Some((0.5, 0.5)),
+        _ => None,
+    }
+}
+
+/// Grass tint `[r, g, b]` matching vanilla 26.3 biome climates (sampled from active resource-pack
+/// `textures/colormap/grass.png` when loaded).
 pub fn biome_grass_tint(biome_id: &str) -> [u8; 3] {
     let name = strip_mc_namespace(biome_id);
+    if !matches!(
+        name,
+        "swamp"
+            | "mangrove_swamp"
+            | "badlands"
+            | "eroded_badlands"
+            | "wooded_badlands"
+            | "dark_forest"
+            | "cherry_grove"
+            | "pale_garden"
+    ) && let Some((temp, rain)) = biome_climate(name)
+        && let Some(rgb) = crate::resource_colors::sample_colormap(true, temp, rain)
+    {
+        return rgb;
+    }
     match name {
         "plains" | "sunflower_plains" | "river" | "beach" => [145, 189, 89],
         "forest" | "flower_forest" => [121, 192, 90],
@@ -254,9 +305,24 @@ pub fn biome_grass_tint(biome_id: &str) -> [u8; 3] {
     }
 }
 
-/// Foliage (leaves) tint `[r, g, b]` matching vanilla 26.3 biome climates.
+/// Foliage (leaves) tint `[r, g, b]` matching vanilla 26.3 biome climates (sampled from active
+/// resource-pack `textures/colormap/foliage.png` when loaded).
 pub fn biome_foliage_tint(biome_id: &str) -> [u8; 3] {
     let name = strip_mc_namespace(biome_id);
+    if !matches!(
+        name,
+        "swamp"
+            | "mangrove_swamp"
+            | "badlands"
+            | "eroded_badlands"
+            | "wooded_badlands"
+            | "cherry_grove"
+            | "pale_garden"
+    ) && let Some((temp, rain)) = biome_climate(name)
+        && let Some(rgb) = crate::resource_colors::sample_colormap(false, temp, rain)
+    {
+        return rgb;
+    }
     match name {
         "plains" | "sunflower_plains" => [119, 171, 47],
         "forest" | "flower_forest" => [89, 174, 48],
@@ -301,9 +367,40 @@ pub fn biome_water_color(biome_id: &str, water_color_hint: u32) -> [u8; 3] {
     }
 }
 
-/// Compute surface RGB for a block in a biome (with optional server biome water color hint).
+fn multiply_rgb(a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
+    [
+        ((a[0] as u16 * b[0] as u16) / 255) as u8,
+        ((a[1] as u16 * b[1] as u16) / 255) as u8,
+        ((a[2] as u16 * b[2] as u16) / 255) as u8,
+    ]
+}
+
+/// Compute surface RGB for a block in a biome (with optional server biome water color hint and
+/// active resource-pack texture overrides when loaded).
 pub fn block_color(block_id: &str, biome_id: &str, water_color_hint: u32) -> [u8; 3] {
     let name = strip_mc_namespace(block_id);
+    if matches!(name, "water" | "bubble_column") {
+        return biome_water_color(biome_id, water_color_hint);
+    }
+    if let Some(pack_rgb) = crate::resource_colors::lookup_pack_block_rgb(name) {
+        if name == "grass_block" {
+            return multiply_rgb(pack_rgb, biome_grass_tint(biome_id));
+        }
+        if name.contains("leaves")
+            && !matches!(
+                name,
+                "cherry_leaves" | "azalea_leaves" | "flowering_azalea_leaves" | "pale_oak_leaves"
+            )
+        {
+            let tint = match name {
+                "spruce_leaves" => [97, 153, 97],
+                "birch_leaves" => [128, 167, 85],
+                _ => biome_foliage_tint(biome_id),
+            };
+            return multiply_rgb(pack_rgb, tint);
+        }
+        return pack_rgb;
+    }
     match name {
         "grass_block" => biome_grass_tint(biome_id),
         "dirt" | "coarse_dirt" | "rooted_dirt" | "farmland" => [134, 96, 67],
