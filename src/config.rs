@@ -1,4 +1,16 @@
-use mod_api::{ClientHost, Registrar, SettingSpec};
+use mod_api::{ClientHost, Host, Registrar, SettingKey, SettingSpec};
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
+static SETTING_KEYS: OnceLock<RwLock<HashMap<String, SettingKey>>> = OnceLock::new();
+
+fn key_store() -> &'static RwLock<HashMap<String, SettingKey>> {
+    SETTING_KEYS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn setting_key(name: &str) -> Option<SettingKey> {
+    key_store().read().ok()?.get(name).copied()
+}
 
 pub const MOD_ID: &str = "distantsunrises";
 
@@ -399,108 +411,86 @@ impl DhConfig {
             )
             .tooltip("distantsunrises.setting.debug_mode.tooltip"),
         ];
+        let mut registered = HashMap::with_capacity(specs.len());
         for spec in specs {
-            let _ = registrar.register_setting(spec);
+            let name = spec.key.clone();
+            if let Ok(key) = registrar.register_setting(spec) {
+                registered.insert(name, key);
+            }
+        }
+        if let Ok(mut guard) = key_store().write() {
+            *guard = registered;
         }
     }
 
     pub fn read_from_client(host: &dyn ClientHost) -> Self {
+        Self::read_from_host(host)
+    }
+
+    pub fn read_from_host(host: &dyn Host) -> Self {
         let def = Self::default();
+        let read_bool = |name: &str, fallback: bool| {
+            setting_key(name)
+                .and_then(|k| host.setting_bool(k).ok())
+                .unwrap_or(fallback)
+        };
+        let read_choice = |name: &str, fallback: u32| {
+            setting_key(name)
+                .and_then(|k| host.setting_choice(k).ok())
+                .unwrap_or(fallback)
+        };
+        let read_f64 = |name: &str| setting_key(name).and_then(|k| host.setting_f64(k).ok());
         Self {
-            enabled: host.setting_bool(KEY_ENABLED).unwrap_or(def.enabled),
-            render_distance_chunks: host
-                .setting_f64(KEY_RENDER_DISTANCE)
+            enabled: read_bool(KEY_ENABLED, def.enabled),
+            render_distance_chunks: read_f64(KEY_RENDER_DISTANCE)
                 .map(|v| (v.round() as u32).clamp(32, 512))
                 .unwrap_or(def.render_distance_chunks),
-            horizontal_quality: host
-                .setting_choice(KEY_HORIZONTAL_QUALITY)
-                .unwrap_or(def.horizontal_quality),
-            vertical_quality: host
-                .setting_choice(KEY_VERTICAL_QUALITY)
-                .unwrap_or(def.vertical_quality),
-            distant_generation: host
-                .setting_bool(KEY_DISTANT_GENERATION)
-                .unwrap_or(def.distant_generation),
-            distant_generation_mode: host
-                .setting_choice(KEY_DISTANT_GENERATION_MODE)
-                .unwrap_or(def.distant_generation_mode),
-            cave_culling_enabled: host
-                .setting_bool(KEY_CAVE_CULLING)
-                .unwrap_or(def.cave_culling_enabled),
-            cave_culling_height: host
-                .setting_f64(KEY_CAVE_CULLING_HEIGHT)
+            horizontal_quality: read_choice(KEY_HORIZONTAL_QUALITY, def.horizontal_quality),
+            vertical_quality: read_choice(KEY_VERTICAL_QUALITY, def.vertical_quality),
+            distant_generation: read_bool(KEY_DISTANT_GENERATION, def.distant_generation),
+            distant_generation_mode: read_choice(
+                KEY_DISTANT_GENERATION_MODE,
+                def.distant_generation_mode,
+            ),
+            cave_culling_enabled: read_bool(KEY_CAVE_CULLING, def.cave_culling_enabled),
+            cave_culling_height: read_f64(KEY_CAVE_CULLING_HEIGHT)
                 .map(|v| (v.round() as i32).clamp(-64, 320))
                 .unwrap_or(def.cave_culling_height),
-            fog_enabled: host
-                .setting_bool(KEY_FOG_ENABLED)
-                .unwrap_or(def.fog_enabled),
-            noise_enabled: host
-                .setting_bool(KEY_NOISE_ENABLED)
-                .unwrap_or(def.noise_enabled),
-            noise_intensity: host
-                .setting_f64(KEY_NOISE_INTENSITY)
+            fog_enabled: read_bool(KEY_FOG_ENABLED, def.fog_enabled),
+            noise_enabled: read_bool(KEY_NOISE_ENABLED, def.noise_enabled),
+            noise_intensity: read_f64(KEY_NOISE_INTENSITY)
                 .map(|v| (v as f32).clamp(0.0, 0.5))
                 .unwrap_or(def.noise_intensity),
-            overdraw_prevention: host
-                .setting_f64(KEY_OVERDRAW_PREVENTION)
+            overdraw_prevention: read_f64(KEY_OVERDRAW_PREVENTION)
                 .map(|v| (v as f32).clamp(0.0, 1.0))
                 .unwrap_or(def.overdraw_prevention),
-            fade_enabled: host
-                .setting_bool(KEY_FADE_ENABLED)
-                .unwrap_or(def.fade_enabled),
-            shading_enabled: host
-                .setting_bool(KEY_SHADING_ENABLED)
-                .unwrap_or(def.shading_enabled),
-            brightness_multiplier: host
-                .setting_f64(KEY_BRIGHTNESS)
+            fade_enabled: read_bool(KEY_FADE_ENABLED, def.fade_enabled),
+            shading_enabled: read_bool(KEY_SHADING_ENABLED, def.shading_enabled),
+            brightness_multiplier: read_f64(KEY_BRIGHTNESS)
                 .map(|v| (v as f32).clamp(0.5, 2.0))
                 .unwrap_or(def.brightness_multiplier),
-            saturation_multiplier: host
-                .setting_f64(KEY_SATURATION)
+            saturation_multiplier: read_f64(KEY_SATURATION)
                 .map(|v| (v as f32).clamp(0.0, 2.0))
                 .unwrap_or(def.saturation_multiplier),
-            ssao_enabled: host
-                .setting_bool(KEY_SSAO_ENABLED)
-                .unwrap_or(def.ssao_enabled),
-            ssao_quality: host
-                .setting_choice(KEY_SSAO_QUALITY)
-                .unwrap_or(def.ssao_quality),
-            ssao_strength: host
-                .setting_f64(KEY_SSAO_STRENGTH)
+            ssao_enabled: read_bool(KEY_SSAO_ENABLED, def.ssao_enabled),
+            ssao_quality: read_choice(KEY_SSAO_QUALITY, def.ssao_quality),
+            ssao_strength: read_f64(KEY_SSAO_STRENGTH)
                 .map(|v| (v as f32).clamp(0.0, 1.0))
                 .unwrap_or(def.ssao_strength),
-            disable_vanilla_fog: host
-                .setting_bool(KEY_DISABLE_VANILLA_FOG)
-                .unwrap_or(def.disable_vanilla_fog),
-            fog_falloff: host
-                .setting_choice(KEY_FOG_FALLOFF)
-                .unwrap_or(def.fog_falloff),
-            fog_spherical: host
-                .setting_bool(KEY_FOG_SPHERICAL)
-                .unwrap_or(def.fog_spherical),
-            height_fog_enabled: host
-                .setting_bool(KEY_HEIGHT_FOG_ENABLED)
-                .unwrap_or(def.height_fog_enabled),
-            height_fog_base_height: host
-                .setting_f64(KEY_HEIGHT_FOG_BASE_HEIGHT)
+            disable_vanilla_fog: read_bool(KEY_DISABLE_VANILLA_FOG, def.disable_vanilla_fog),
+            fog_falloff: read_choice(KEY_FOG_FALLOFF, def.fog_falloff),
+            fog_spherical: read_bool(KEY_FOG_SPHERICAL, def.fog_spherical),
+            height_fog_enabled: read_bool(KEY_HEIGHT_FOG_ENABLED, def.height_fog_enabled),
+            height_fog_base_height: read_f64(KEY_HEIGHT_FOG_BASE_HEIGHT)
                 .map(|v| (v as f32).clamp(-64.0, 320.0))
                 .unwrap_or(def.height_fog_base_height),
-            height_fog_mix_mode: host
-                .setting_choice(KEY_HEIGHT_FOG_MIX_MODE)
-                .unwrap_or(def.height_fog_mix_mode),
-            clouds_enabled: host
-                .setting_bool(KEY_CLOUDS_ENABLED)
-                .unwrap_or(def.clouds_enabled),
-            beacon_beams_enabled: host
-                .setting_bool(KEY_BEACON_BEAMS_ENABLED)
-                .unwrap_or(def.beacon_beams_enabled),
-            sharpening_amount: host
-                .setting_f64(KEY_SHARPENING_AMOUNT)
+            height_fog_mix_mode: read_choice(KEY_HEIGHT_FOG_MIX_MODE, def.height_fog_mix_mode),
+            clouds_enabled: read_bool(KEY_CLOUDS_ENABLED, def.clouds_enabled),
+            beacon_beams_enabled: read_bool(KEY_BEACON_BEAMS_ENABLED, def.beacon_beams_enabled),
+            sharpening_amount: read_f64(KEY_SHARPENING_AMOUNT)
                 .map(|v| (v as f32).clamp(0.0, 1.0))
                 .unwrap_or(def.sharpening_amount),
-            debug_mode: host
-                .setting_choice(KEY_DEBUG_MODE)
-                .unwrap_or(def.debug_mode),
+            debug_mode: read_choice(KEY_DEBUG_MODE, def.debug_mode),
         }
     }
 }

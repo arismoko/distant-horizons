@@ -45,11 +45,11 @@ use mod_api::client::fog::FogType;
 use mod_api::{
     self, BlockChangedEvent, ChunkLoadEvent, ClientBlockChangedEvent, ClientChunkLoadEvent,
     ClientChunkUnloadEvent, ClientHost, ClientLevelLoadEvent, ClientLevelUnloadEvent,
-    ClientReloadHost, ClientSetupContext, ClientSetupEvent, ClientTickPreEvent, CommandEvent,
-    DebugEntry, DebugGroup, EntityRef, Flow, Heightmap, Hooks, HostSide, LevelDimension, LevelHost,
-    LevelLoadEvent, LevelTickPostEvent, LevelUnloadEvent, MAX_TERRAIN_COLUMNS,
-    RegisterClientCommandsEvent, RegisterDebugEntriesEvent, Registrar, RegistrationContext,
-    RenderFogEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
+    ClientReloadHost, ClientSetupContext, ClientSetupEvent, ClientTickPreEvent, DebugEntry,
+    DebugGroup, EntityRef, Heightmap, Hooks, Host, HostSide, LevelDimension, LevelHost,
+    LevelLoadEvent, LevelTickPostEvent, LevelUnloadEvent, RegisterClientCommandsEvent,
+    RegisterDebugEntriesEvent, Registrar, RegistrationContext, RenderFogEvent, ServerHost,
+    ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -110,10 +110,6 @@ impl Hooks for DistantHorizonsMod {
         commands::register_client_commands(event.commands);
     }
 
-    fn command(&self, host: &mut dyn ClientHost, event: &mut CommandEvent<'_>) -> Flow {
-        commands::handle_client_command(host, event.command)
-    }
-
     fn register_debug_entries(
         &self,
         _cx: &RegistrationContext,
@@ -140,7 +136,7 @@ impl Hooks for DistantHorizonsMod {
         );
     }
 
-    fn setting_changed(&self, host: &mut dyn ClientHost, _event: &mut SettingChangedEvent<'_>) {
+    fn setting_changed(&self, host: &dyn Host, _event: &mut SettingChangedEvent<'_>) {
         sync_client_config(host);
     }
 
@@ -449,8 +445,8 @@ impl Hooks for DistantHorizonsMod {
     }
 }
 
-fn sync_client_config(host: &dyn ClientHost) {
-    let cfg = DhConfig::read_from_client(host);
+fn sync_client_config(host: &dyn Host) {
+    let cfg = DhConfig::read_from_host(host);
     let rt = runtime();
     rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
     rt.inner.lock().unwrap().config = cfg;
@@ -621,60 +617,19 @@ fn sample_loaded_chunks(
     collect_deltas: bool,
 ) -> HashMap<SectionPos, network::SectionColumnDelta> {
     let mut deltas: HashMap<SectionPos, network::SectionColumnDelta> = HashMap::new();
-    let level_ref = host.level(dim);
-    let mut columns = Vec::with_capacity(chunks.len() * 256);
-    for &[cx, cz] in chunks {
-        let bx0 = cx << 4;
-        let bz0 = cz << 4;
-        for lz in 0..16 {
-            for lx in 0..16 {
-                columns.push((bx0 + lx, bz0 + lz));
-            }
-        }
-    }
-    let Ok(read) = host.read_columns(
-        dim,
-        &columns,
-        Heightmap::WorldSurface,
-        (LOADED_SCAN_BELOW, LOADED_SCAN_ABOVE),
-    ) else {
+    let Some(level) = host.level(dim) else {
         return deltas;
     };
 
-    let span = (LOADED_SCAN_BELOW + LOADED_SCAN_ABOVE) as usize;
-    if span == 0 || read.bases.len() != columns.len() {
-        return deltas;
-    }
-
-    // Resolve palette block IDs once per batch.
-    let palette_ids: Vec<&str> = read
-        .palette
+    let snapshots: Vec<([i32; 2], Option<mod_api::ChunkSnapshot>)> = chunks
         .iter()
-        .map(|state| state.block().id(host).unwrap_or("minecraft:stone"))
+        .map(|&pos| {
+            (
+                pos,
+                level.chunk_ref(host, pos).and_then(|c| c.snapshot(host)),
+            )
+        })
         .collect();
-
-    // Sample biomes on the vanilla 4x4 quart grid per chunk (16 calls/chunk vs 256) so grass,
-    // foliage, and water tints on loaded chunks match surrounding distant terrain seamlessly.
-    let mut chunk_biomes: Vec<[String; 16]> = Vec::with_capacity(chunks.len());
-    for (ci, &[cx, cz]) in chunks.iter().enumerate() {
-        let bx0 = cx << 4;
-        let bz0 = cz << 4;
-        let mut grid: [String; 16] = std::array::from_fn(|_| "minecraft:plains".to_owned());
-        if let Some(level) = level_ref {
-            for qz in 0..4 {
-                for qx in 0..4 {
-                    let lx = qx * 4 + 2;
-                    let lz = qz * 4 + 2;
-                    let col_idx = ci * 256 + lz * 16 + lx;
-                    let y = read.bases.get(col_idx).and_then(|b| *b).unwrap_or(64);
-                    if let Some(b) = level.biome_at(host, [bx0 + lx as i32, y, bz0 + lz as i32]) {
-                        grid[qz * 4 + qx] = b;
-                    }
-                }
-            }
-        }
-        chunk_biomes.push(grid);
-    }
 
     let mut chunk_beacons: Vec<Vec<BeaconBeam>> = vec![Vec::new(); chunks.len()];
 
@@ -682,108 +637,109 @@ fn sample_loaded_chunks(
     let mut st = rt.inner.lock().unwrap();
     let store = st.dimensions.entry(dim.to_owned()).or_default();
 
-    for (col_idx, &(bx, bz)) in columns.iter().enumerate() {
-        let Some(base_y) = read.bases[col_idx] else {
+    for (ci, ([cx, cz], snap_opt)) in snapshots.iter().enumerate() {
+        let Some(snap) = snap_opt else {
             continue;
         };
-        let slice_start = col_idx * span;
-        if slice_start + span > read.blocks.len() {
-            break;
-        }
-        let col_blocks = &read.blocks[slice_start..slice_start + span];
-        let water_hint = read.water_colors.get(col_idx).copied().unwrap_or(0);
+        let bx0 = cx << 4;
+        let bz0 = cz << 4;
 
-        let ci = col_idx / 256;
-        let local_idx = col_idx % 256;
-        let qx = (local_idx % 16) / 4;
-        let qz = (local_idx / 16) / 4;
-        let biome_id = chunk_biomes
-            .get(ci)
-            .map(|g| g[qz * 4 + qx].as_str())
-            .unwrap_or("minecraft:plains");
-
-        let mut fluid_top: Option<i32> = None;
-        let mut solid_top: Option<(i32, &str)> = None;
-        let mut beacon_y: Option<i32> = None;
-        let mut beacon_tint: Option<[u8; 3]> = None;
-
-        // Scan top-down through the sampled band for surface + any sky-visible beacon & stained glass tint.
-        for offset in (0..span).rev() {
-            let pal_idx = col_blocks[offset] as usize;
-            let block_id = palette_ids.get(pal_idx).copied().unwrap_or("minecraft:air");
-            let y = base_y - (LOADED_SCAN_BELOW as i32) + (offset as i32) + 1;
-            if block_id == "minecraft:beacon" {
-                beacon_y = Some(y);
-            }
-            if is_water_block(block_id) {
-                if fluid_top.is_none() {
-                    fluid_top = Some(y);
-                }
-                continue;
-            }
-            if is_skippable_for_lod(block_id) {
-                continue;
-            }
-            if solid_top.is_none() {
-                solid_top = Some((y, block_id));
-                if beacon_y.is_some() {
-                    break;
-                }
-            }
-        }
-
-        if let Some(by) = beacon_y {
-            // Walk bottom-up above the beacon to apply vanilla stained-glass tint averaging.
-            for (offset, &pal_u16) in col_blocks.iter().enumerate() {
-                let y = base_y - (LOADED_SCAN_BELOW as i32) + (offset as i32) + 1;
-                if y <= by {
+        for lz in 0..16u8 {
+            for lx in 0..16u8 {
+                let Some(base_y) = snap.heightmap(Heightmap::WorldSurface, lx, lz) else {
                     continue;
+                };
+                let bx = bx0 + i32::from(lx);
+                let bz = bz0 + i32::from(lz);
+                let y_min = base_y - (LOADED_SCAN_BELOW as i32) + 1;
+                let y_max = base_y + (LOADED_SCAN_ABOVE as i32);
+
+                let mut fluid_top: Option<i32> = None;
+                let mut solid_top: Option<(i32, &str)> = None;
+                let mut beacon_y: Option<i32> = None;
+                let mut beacon_tint: Option<[u8; 3]> = None;
+
+                // Scan top-down through the sampled band for surface + any sky-visible beacon & stained glass tint.
+                for y in (y_min..=y_max).rev() {
+                    let block_id = snap
+                        .block_state(lx, y, lz)
+                        .and_then(|state| state.block().id(host))
+                        .unwrap_or("minecraft:air");
+                    if block_id == "minecraft:beacon" {
+                        beacon_y = Some(y);
+                    }
+                    if is_water_block(block_id) {
+                        if fluid_top.is_none() {
+                            fluid_top = Some(y);
+                        }
+                        continue;
+                    }
+                    if is_skippable_for_lod(block_id) {
+                        continue;
+                    }
+                    if solid_top.is_none() {
+                        solid_top = Some((y, block_id));
+                        if beacon_y.is_some() {
+                            break;
+                        }
+                    }
                 }
-                let pal_idx = pal_u16 as usize;
-                let block_id = palette_ids.get(pal_idx).copied().unwrap_or("minecraft:air");
-                if let Some(glass_rgb) = stained_glass_tint(block_id) {
-                    beacon_tint = Some(blend_beacon_tint(beacon_tint, glass_rgb));
+
+                if let Some(by) = beacon_y {
+                    for y in (by + 1)..=y_max {
+                        let block_id = snap
+                            .block_state(lx, y, lz)
+                            .and_then(|state| state.block().id(host))
+                            .unwrap_or("minecraft:air");
+                        if let Some(glass_rgb) = stained_glass_tint(block_id) {
+                            beacon_tint = Some(blend_beacon_tint(beacon_tint, glass_rgb));
+                        }
+                    }
+                    if let Some(list) = chunk_beacons.get_mut(ci) {
+                        list.push(BeaconBeam {
+                            pos: [bx, by, bz],
+                            color: beacon_tint.unwrap_or([255, 255, 255]),
+                        });
+                    }
                 }
-            }
-            if let Some(list) = chunk_beacons.get_mut(ci) {
-                list.push(BeaconBeam {
-                    pos: [bx, by, bz],
-                    color: beacon_tint.unwrap_or([255, 255, 255]),
-                });
-            }
-        }
 
-        let (top_y, block_id) = match solid_top {
-            Some(v) => v,
-            None => match fluid_top {
-                Some(fy) => (fy - 4, "minecraft:sand"),
-                None => continue,
-            },
-        };
+                let (top_y, block_id) = match solid_top {
+                    Some(v) => v,
+                    None => match fluid_top {
+                        Some(fy) => (fy - 4, "minecraft:sand"),
+                        None => continue,
+                    },
+                };
 
-        let solid_rgb = block_color(block_id, biome_id, water_hint);
-        let fluid_rgb = biome_water_color(biome_id, water_hint);
-        let lod_col = LodColumn::from_solid_and_fluid(
-            top_y,
-            top_y - 8,
-            solid_rgb,
-            fluid_top,
-            fluid_rgb,
-            15,
-            0,
-            SOURCE_LOADED_CHUNK,
-        )
-        .with_material(classify_dh_material(block_id));
+                let biome_id = snap
+                    .biome(lx, top_y, lz)
+                    .map(|k| k.identifier().as_str())
+                    .unwrap_or("minecraft:plains");
+                let solid_rgb = block_color(block_id, biome_id, 0);
+                let fluid_rgb = biome_water_color(biome_id, 0);
+                let lod_col = LodColumn::from_solid_and_fluid(
+                    top_y,
+                    top_y - 8,
+                    solid_rgb,
+                    fluid_top,
+                    fluid_rgb,
+                    15,
+                    0,
+                    SOURCE_LOADED_CHUNK,
+                )
+                .with_material(classify_dh_material(block_id));
 
-        let sec_pos = SectionPos::from_block(0, bx, bz);
-        let (lx, lz) = sec_pos.local_cell(bx, bz);
-        let sec = store.get_or_create_mut(sec_pos);
-        if sec.set_cell(lx, lz, lod_col) {
-            dirty_sections.insert(sec_pos);
-            if collect_deltas {
-                let entry = deltas.entry(sec_pos).or_default();
-                entry.revision = sec.revision;
-                entry.columns.push((lx as u8, lz as u8, lod_col));
+                let sec_pos = SectionPos::from_block(0, bx, bz);
+                let (cell_x, cell_z) = sec_pos.local_cell(bx, bz);
+                let sec = store.get_or_create_mut(sec_pos);
+                if sec.set_cell(cell_x, cell_z, lod_col) {
+                    dirty_sections.insert(sec_pos);
+                    if collect_deltas {
+                        let entry = deltas.entry(sec_pos).or_default();
+                        entry.revision = sec.revision;
+                        entry.columns.push((cell_x as u8, cell_z as u8, lod_col));
+                    }
+                }
             }
         }
     }
@@ -906,12 +862,12 @@ fn sample_distant_sections(
                         let is_empty = sec.map(|s| s.get(cx, cz).is_empty()).unwrap_or(true);
                         if is_empty {
                             missing.push((cx, cz));
-                            if missing.len() >= DISTANT_COLS_PER_TICK.min(MAX_TERRAIN_COLUMNS) {
+                            if missing.len() >= DISTANT_COLS_PER_TICK {
                                 break;
                             }
                         }
                     }
-                    if missing.len() >= DISTANT_COLS_PER_TICK.min(MAX_TERRAIN_COLUMNS) {
+                    if missing.len() >= DISTANT_COLS_PER_TICK {
                         break;
                     }
                 }
@@ -984,7 +940,11 @@ fn sample_distant_sections(
             })
             .collect();
 
-        let Ok(samples) = host.terrain_surface(dim, &query_cols) else {
+        let Some(samples) = host
+            .level(dim)
+            .and_then(|l| l.detached_generator(host))
+            .and_then(|g| g.sample_surface_columns(&query_cols).ok())
+        else {
             let cooldown = (budget_start.elapsed() * DISTANT_SAMPLE_COOLDOWN_MULT)
                 .min(DISTANT_SAMPLE_MAX_COOLDOWN);
             rt.inner

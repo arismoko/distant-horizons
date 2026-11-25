@@ -9,11 +9,13 @@ use crate::config::{
     KEY_DEBUG_MODE, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FADE_ENABLED, KEY_FOG_ENABLED,
     KEY_HEIGHT_FOG_ENABLED, KEY_HORIZONTAL_QUALITY, KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE,
     KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED, KEY_SSAO_QUALITY, KEY_VERTICAL_QUALITY, MOD_ID,
+    setting_key,
 };
 use crate::render_bridge::{runtime, stats};
 use mod_api::{
-    ClientHost, ClientSetupContext, Command, Flow, KeyConflictContext, KeyRegistration,
-    ModKeyMappingRef, Registrar, Text,
+    ClientCommandRegistration, ClientHost, ClientSetupContext, Command, CommandArgumentValue,
+    CommandInvocation, Flow, KeyConflictContext, KeyRegistration, ModKeyMappingRef, Registrar,
+    SettingValue, Text,
 };
 use std::sync::atomic::Ordering;
 
@@ -102,28 +104,54 @@ impl DhKeybinds {
     }
 }
 
-/// Register client command completions for `/ds` and `/distantsunrises`.
-pub fn register_client_commands(commands: &mut Vec<Command>) {
-    for prefix in ["ds", "distantsunrises"] {
-        commands.push(Command::new(prefix));
-        commands.push(Command::new(&format!("{prefix} status")));
-        commands.push(Command::new(&format!("{prefix} toggle")));
-        commands.push(Command::new(&format!("{prefix} radius <chunks:integer>")));
-        commands.push(Command::new(&format!("{prefix} quality <preset:word>")));
-        commands.push(Command::new(&format!("{prefix} preset <preset:word>")));
-        commands.push(Command::new(&format!("{prefix} fog <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} heightfog <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} ssao <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} sharpen <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} clouds <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} beacons <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} debug <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} gen <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} cavecull <mode:word>")));
-        commands.push(Command::new(&format!("{prefix} clear")));
-        commands.push(Command::new(&format!("{prefix} remesh")));
-        commands.push(Command::new(&format!("{prefix} help")));
+fn write_setting(host: &mut dyn ClientHost, key_name: &str, value: SettingValue) {
+    if let Some(key) = setting_key(key_name) {
+        let _ = host.set_setting(key, value);
     }
+}
+
+/// Register client command completions and executors for `/ds` and `/distantsunrises`.
+pub fn register_client_commands(commands: &mut Vec<ClientCommandRegistration>) {
+    let usages = [
+        "",
+        " status",
+        " toggle",
+        " radius <chunks:integer>",
+        " quality <preset:word>",
+        " preset <preset:word>",
+        " fog <mode:word>",
+        " heightfog <mode:word>",
+        " ssao <mode:word>",
+        " sharpen <mode:word>",
+        " clouds <mode:word>",
+        " beacons <mode:word>",
+        " debug <mode:word>",
+        " gen <mode:word>",
+        " cavecull <mode:word>",
+        " clear",
+        " remesh",
+        " help",
+    ];
+    for prefix in ["ds", "distantsunrises"] {
+        for suffix in usages {
+            commands.push(Command::new(&format!("{prefix}{suffix}")).executes_client(
+                |host, inv| {
+                    handle_client_invocation(host, inv);
+                    Some(1)
+                },
+            ));
+        }
+    }
+}
+
+fn handle_client_invocation(host: &mut dyn ClientHost, inv: &CommandInvocation) {
+    let sub = inv.literals.get(1).map(String::as_str).unwrap_or("status");
+    let arg_owned = inv.arguments.first().and_then(|a| match &a.value {
+        CommandArgumentValue::String(s) => Some(s.clone()),
+        CommandArgumentValue::Integer(n) => Some(n.to_string()),
+        _ => None,
+    });
+    dispatch_client_command(host, sub, arg_owned.as_deref());
 }
 
 /// Execute `/ds ...` or `/distantsunrises ...` typed in chat.
@@ -139,7 +167,11 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
 
     let sub = parts.next().unwrap_or("status");
     let arg = parts.next();
+    dispatch_client_command(host, sub, arg);
+    Flow::Cancel
+}
 
+fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&str>) {
     match sub.to_ascii_lowercase().as_str() {
         "status" | "stats" => {
             send_status(host);
@@ -156,7 +188,11 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         "radius" | "distance" => match arg.and_then(|s| s.parse::<u32>().ok()) {
             Some(chunks) => {
                 let clamped = chunks.clamp(32, 512);
-                host.set_setting(MOD_ID, KEY_RENDER_DISTANCE, &clamped.to_string());
+                write_setting(
+                    host,
+                    KEY_RENDER_DISTANCE,
+                    SettingValue::Range(f64::from(clamped)),
+                );
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     "distantsunrises.command.radius_set",
@@ -246,10 +282,10 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         "ssao" => handle_bool_setting(host, KEY_SSAO_ENABLED, "ssao", arg),
         "sharpen" => match parse_toggle_arg(arg) {
             Some(v) => {
-                host.set_setting(
-                    MOD_ID,
+                write_setting(
+                    host,
                     KEY_SHARPENING_AMOUNT,
-                    if v { "0.35" } else { "0.0" },
+                    SettingValue::Range(if v { 0.35 } else { 0.0 }),
                 );
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
@@ -295,7 +331,7 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
             };
             match parsed {
                 Some((mode, label_key)) => {
-                    host.set_setting(MOD_ID, KEY_DEBUG_MODE, &mode.to_string());
+                    write_setting(host, KEY_DEBUG_MODE, SettingValue::Choice(mode as usize));
                     refresh_config(host);
                     let _ = host.chat_line(Text::translate(
                         "distantsunrises.command.debug_set",
@@ -312,7 +348,7 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         }
         "fog" => match parse_toggle_arg(arg) {
             Some(v) => {
-                host.set_setting(MOD_ID, KEY_FOG_ENABLED, if v { "true" } else { "false" });
+                write_setting(host, KEY_FOG_ENABLED, SettingValue::Toggle(v));
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
@@ -332,7 +368,7 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         },
         "fade" => match parse_toggle_arg(arg) {
             Some(v) => {
-                host.set_setting(MOD_ID, KEY_FADE_ENABLED, if v { "true" } else { "false" });
+                write_setting(host, KEY_FADE_ENABLED, SettingValue::Toggle(v));
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
@@ -352,7 +388,7 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         },
         "noise" => match parse_toggle_arg(arg) {
             Some(v) => {
-                host.set_setting(MOD_ID, KEY_NOISE_ENABLED, if v { "true" } else { "false" });
+                write_setting(host, KEY_NOISE_ENABLED, SettingValue::Toggle(v));
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
@@ -372,11 +408,7 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         },
         "gen" => match parse_toggle_arg(arg) {
             Some(v) => {
-                host.set_setting(
-                    MOD_ID,
-                    KEY_DISTANT_GENERATION,
-                    if v { "true" } else { "false" },
-                );
+                write_setting(host, KEY_DISTANT_GENERATION, SettingValue::Toggle(v));
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
@@ -396,7 +428,7 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         },
         "cavecull" => match parse_toggle_arg(arg) {
             Some(v) => {
-                host.set_setting(MOD_ID, KEY_CAVE_CULLING, if v { "true" } else { "false" });
+                write_setting(host, KEY_CAVE_CULLING, SettingValue::Toggle(v));
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     if v {
@@ -416,7 +448,7 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
         },
         "vquality" => match arg.and_then(|s| s.parse::<u32>().ok()) {
             Some(v) if v <= 3 => {
-                host.set_setting(MOD_ID, KEY_VERTICAL_QUALITY, &v.to_string());
+                write_setting(host, KEY_VERTICAL_QUALITY, SettingValue::Choice(v as usize));
                 refresh_config(host);
                 let _ = host.chat_line(Text::translate(
                     "distantsunrises.command.quality_set",
@@ -448,8 +480,6 @@ pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
             let _ = host.chat_line(Text::translate("distantsunrises.command.help", Vec::new()));
         }
     }
-
-    Flow::Cancel
 }
 
 fn parse_toggle_arg(arg: Option<&str>) -> Option<bool> {
@@ -476,22 +506,30 @@ fn refresh_config(host: &dyn ClientHost) -> DhConfig {
     cfg
 }
 
-fn toggle_enabled(host: &dyn ClientHost) -> bool {
+fn toggle_enabled(host: &mut dyn ClientHost) -> bool {
     let current = DhConfig::read_from_client(host).enabled;
     let next = !current;
-    host.set_setting(MOD_ID, KEY_ENABLED, if next { "true" } else { "false" });
+    write_setting(host, KEY_ENABLED, SettingValue::Toggle(next));
     refresh_config(host).enabled
 }
 
-fn cycle_horizontal_quality(host: &dyn ClientHost) -> u32 {
+fn cycle_horizontal_quality(host: &mut dyn ClientHost) -> u32 {
     let cur = DhConfig::read_from_client(host).horizontal_quality;
     let next = (cur + 1) % 3;
-    host.set_setting(MOD_ID, KEY_HORIZONTAL_QUALITY, &next.to_string());
+    write_setting(
+        host,
+        KEY_HORIZONTAL_QUALITY,
+        SettingValue::Choice(next as usize),
+    );
     refresh_config(host).horizontal_quality
 }
 
 fn set_quality(host: &mut dyn ClientHost, preset: u32) {
-    host.set_setting(MOD_ID, KEY_HORIZONTAL_QUALITY, &preset.to_string());
+    write_setting(
+        host,
+        KEY_HORIZONTAL_QUALITY,
+        SettingValue::Choice(preset as usize),
+    );
     refresh_config(host);
     let _ = host.chat_line(Text::translate(
         "distantsunrises.command.quality_set",
@@ -502,7 +540,7 @@ fn set_quality(host: &mut dyn ClientHost, preset: u32) {
 fn handle_bool_setting(host: &mut dyn ClientHost, key: &str, label: &str, arg: Option<&str>) {
     match parse_toggle_arg(arg) {
         Some(v) => {
-            host.set_setting(MOD_ID, key, if v { "true" } else { "false" });
+            write_setting(host, key, SettingValue::Toggle(v));
             refresh_config(host);
             let _ = host.chat_line(Text::translate(
                 if v {
@@ -533,16 +571,32 @@ struct QualityPreset {
 }
 
 fn apply_preset(host: &mut dyn ClientHost, p: QualityPreset) {
-    host.set_setting(MOD_ID, KEY_RENDER_DISTANCE, &p.radius.to_string());
-    host.set_setting(MOD_ID, KEY_HORIZONTAL_QUALITY, &p.h_qual.to_string());
-    host.set_setting(MOD_ID, KEY_VERTICAL_QUALITY, &p.v_qual.to_string());
-    host.set_setting(
-        MOD_ID,
-        KEY_SSAO_ENABLED,
-        if p.ssao_on { "true" } else { "false" },
+    write_setting(
+        host,
+        KEY_RENDER_DISTANCE,
+        SettingValue::Range(f64::from(p.radius)),
     );
-    host.set_setting(MOD_ID, KEY_SSAO_QUALITY, &p.ssao_q.to_string());
-    host.set_setting(MOD_ID, KEY_SHARPENING_AMOUNT, &format!("{:.2}", p.sharpen));
+    write_setting(
+        host,
+        KEY_HORIZONTAL_QUALITY,
+        SettingValue::Choice(p.h_qual as usize),
+    );
+    write_setting(
+        host,
+        KEY_VERTICAL_QUALITY,
+        SettingValue::Choice(p.v_qual as usize),
+    );
+    write_setting(host, KEY_SSAO_ENABLED, SettingValue::Toggle(p.ssao_on));
+    write_setting(
+        host,
+        KEY_SSAO_QUALITY,
+        SettingValue::Choice(p.ssao_q as usize),
+    );
+    write_setting(
+        host,
+        KEY_SHARPENING_AMOUNT,
+        SettingValue::Range(f64::from(p.sharpen)),
+    );
     refresh_config(host);
     let _ = host.chat_line(Text::translate(
         "distantsunrises.command.preset_set",
