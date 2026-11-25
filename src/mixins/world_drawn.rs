@@ -707,7 +707,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rg11b10Ufloat
     );
     let flags = [
-        u32::from(params.config.shading_enabled),
+        u32::from(params.config.shading_enabled) | (u32::from(is_hdr) << 8),
         u32::from(params.config.noise_enabled),
         u32::from(params.config.fade_enabled),
         params.config.debug_mode,
@@ -731,9 +731,21 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: params.fog_color[0] as f64,
-                            g: params.fog_color[1] as f64,
-                            b: params.fog_color[2] as f64,
+                            r: if is_hdr {
+                                (params.fog_color[0].max(0.0) as f64).powf(2.2)
+                            } else {
+                                params.fog_color[0] as f64
+                            },
+                            g: if is_hdr {
+                                (params.fog_color[1].max(0.0) as f64).powf(2.2)
+                            } else {
+                                params.fog_color[1] as f64
+                            },
+                            b: if is_hdr {
+                                (params.fog_color[2].max(0.0) as f64).powf(2.2)
+                            } else {
+                                params.fog_color[2] as f64
+                            },
                             a: 0.0,
                         }),
                         store: wgpu::StoreOp::Store,

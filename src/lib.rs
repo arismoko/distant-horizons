@@ -375,16 +375,18 @@ impl Hooks for DistantHorizonsMod {
         if event.fog.render_distance_end.is_finite() && event.fog.render_distance_end > 16.0 {
             st.vanilla_far_blocks = event.fog.render_distance_end;
         }
-        // Push vanilla's atmospheric render-distance fog out past vanilla's clip so the horizon
-        // reveals Distant Sunrises LOD terrain (DH applies its own atmospheric/height fog in the
-        // composite pass). Underwater/lava/powder-snow fog stays vanilla-exact.
+        // Disable vanilla atmospheric environmental + render-distance fog so foreground chunks
+        // are not hazed out at the vanilla border before Distant Sunrises draws far fog
+        // (matches DH `MixinFogRenderer.java:144-148` and Sunrise `fog.rs:447-448`).
+        // Underwater/lava/powder-snow fog stays vanilla-exact.
         if st.config.enabled
             && st.config.disable_vanilla_fog
             && event.fog_type == FogType::Atmospheric
         {
-            let dh_far = st.config.render_distance_blocks().max(512.0);
-            event.fog.render_distance_start = event.fog.render_distance_start.max(dh_far * 0.75);
-            event.fog.render_distance_end = event.fog.render_distance_end.max(dh_far);
+            event.fog.environmental_start = 1e9;
+            event.fog.environmental_end = 2e9;
+            event.fog.render_distance_start = 1e9;
+            event.fog.render_distance_end = 2e9;
         }
     }
 
