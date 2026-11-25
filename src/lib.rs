@@ -16,6 +16,7 @@ pub mod colors;
 pub mod commands;
 pub mod config;
 pub mod dh_v2;
+pub mod gen_worker;
 pub mod generic_render;
 pub mod lod;
 pub mod mesh;
@@ -62,18 +63,10 @@ const LOADED_SCAN_ABOVE: u32 = 2;
 
 /// Number of loaded chunks sampled per server tick when time remains.
 const CHUNKS_PER_TICK: usize = 4;
-/// Per-tick wall-time budget for synchronous server-thread detached-generator fallback batches
-/// (8% of a 50 ms server tick). On fast CPUs multiple 64-column batches run per tick within this
-/// budget; if a single batch exceeds it on a slower CPU, a post-completion cooldown of
-/// `elapsed * DISTANT_SAMPLE_COOLDOWN_MULT` (capped at `DISTANT_SAMPLE_MAX_COOLDOWN`) keeps the
-/// server thread under ~10% duty cycle until off-thread worker generation lands.
+/// Per-tick wall-time budget for custom `LodWorldGenerator` callbacks on the server thread.
 const DISTANT_SAMPLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
+/// Cooldown applied when built-in generation is disabled or no detached generator is available.
 const DISTANT_SAMPLE_MAX_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(250);
-const DISTANT_SAMPLE_COOLDOWN_MULT: u32 = 9;
-
-/// Number of empty cells sampled per synchronous server-thread detached-generator batch (taken in
-/// row-major order from the nearest unsampled section).
-const DISTANT_COLS_PER_TICK: usize = 64;
 
 #[derive(Default)]
 struct DistantHorizonsMod {
@@ -393,12 +386,15 @@ impl Hooks for DistantHorizonsMod {
     fn server_started(&self, host: &mut dyn ServerHost, _event: &mut ServerStartedEvent) {
         let world_dir = host.world_dir();
         let rt = runtime();
+        rt.gen_pool.shutdown_and_join();
+        rt.gen_pool.ensure_started();
         let mut st = rt.inner.lock().unwrap();
         st.world_dir = world_dir;
     }
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         let world_dir = host.world_dir();
+        runtime().gen_pool.shutdown_and_join();
         flush_dirty_sections(world_dir);
     }
 
@@ -414,6 +410,7 @@ impl Hooks for DistantHorizonsMod {
 
     fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
         let world_dir = host.world_dir();
+        runtime().gen_pool.reset_dimension(event.dimension);
         flush_dimension_dirty(world_dir, event.dimension);
     }
 
@@ -509,6 +506,9 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         );
     }
 
+    // 1b. Drain completed off-thread distant terrain generation results (fast O(1) ingest).
+    drain_gen_results(host, dim, &mut dirty_sections);
+
     // 2. If time remains and distant generation is on, sample distant terrain around connected
     //    players in `dim` (round-robin, supporting dedicated & LAN servers) or the local camera.
     let (distant_on, cam, cfg, active_dim, rr_cursor) = {
@@ -547,14 +547,7 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             for offset in 0..n {
                 let idx = (rr_cursor + offset) % n;
                 let (player_key, center) = player_centers[idx];
-                match sample_distant_sections(
-                    host,
-                    dim,
-                    player_key,
-                    center,
-                    cfg,
-                    &mut dirty_sections,
-                ) {
+                match sample_distant_sections(host, dim, player_key, center, cfg) {
                     SampleOutcome::Cooldown => break,
                     SampleOutcome::Sampled => {
                         let mut st = rt.inner.lock().unwrap();
@@ -572,7 +565,7 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         } else if dim == active_dim
             && let Some(center) = cam
         {
-            let _ = sample_distant_sections(host, dim, 0, center, cfg, &mut dirty_sections);
+            let _ = sample_distant_sections(host, dim, 0, center, cfg);
         }
     }
 
@@ -777,7 +770,6 @@ fn sample_distant_sections(
     player_key: u128,
     cam: [f64; 3],
     cfg: DhConfig,
-    dirty_sections: &mut HashSet<SectionPos>,
 ) -> SampleOutcome {
     let rt = runtime();
     let cam_block = [cam[0].floor() as i32, cam[2].floor() as i32];
@@ -846,6 +838,10 @@ fn sample_distant_sections(
     let mut detached_gen: Option<Option<mod_api::DetachedChunkGenerator>> = None;
 
     loop {
+        if !rt.gen_pool.has_capacity() {
+            break;
+        }
+
         let (target_section, custom_gen, builtin_disabled) = {
             let mut st = rt.inner.lock().unwrap();
             let custom_gen = st.world_generators.get(dim).cloned();
@@ -857,31 +853,36 @@ fn sample_distant_sections(
             let store = st_ref.dimensions.entry(dim.to_owned()).or_default();
 
             let mut picked = None;
-            while cache.sample_cursor < cache.list.len() {
-                let pos = cache.list[cache.sample_cursor];
+            let mut scan = cache.sample_cursor;
+            while scan < cache.list.len() {
+                let pos = cache.list[scan];
                 if store.sampled_distant_sections.contains(&pos) {
-                    cache.sample_cursor += 1;
+                    if scan == cache.sample_cursor {
+                        cache.sample_cursor += 1;
+                    }
+                    scan += 1;
+                    continue;
+                }
+                if rt.gen_pool.is_in_flight(dim, pos) {
+                    scan += 1;
                     continue;
                 }
                 let sec = store.sections.get(&pos);
-                let mut missing = Vec::with_capacity(DISTANT_COLS_PER_TICK);
+                let mut missing = Vec::new();
                 for cz in 0..SECTION_SIZE {
                     for cx in 0..SECTION_SIZE {
                         let is_empty = sec.map(|s| s.get(cx, cz).is_empty()).unwrap_or(true);
                         if is_empty {
                             missing.push((cx, cz));
-                            if missing.len() >= DISTANT_COLS_PER_TICK {
-                                break;
-                            }
                         }
-                    }
-                    if missing.len() >= DISTANT_COLS_PER_TICK {
-                        break;
                     }
                 }
                 if missing.is_empty() {
                     store.sampled_distant_sections.insert(pos);
-                    cache.sample_cursor += 1;
+                    if scan == cache.sample_cursor {
+                        cache.sample_cursor += 1;
+                    }
+                    scan += 1;
                 } else {
                     picked = Some((pos, missing));
                     break;
@@ -935,32 +936,13 @@ fn sample_distant_sections(
             };
         }
 
-        let (ox, oz) = pos.block_origin();
-        let step = pos.cell_size();
-        let half = step >> 1;
-        let query_cols: Vec<(i32, i32)> = cells
-            .iter()
-            .map(|&(cx, cz)| {
-                (
-                    ox + (cx as i32) * step + half,
-                    oz + (cz as i32) * step + half,
-                )
-            })
-            .collect();
-
         let generator = detached_gen
             .get_or_insert_with(|| host.level(dim).and_then(|l| l.detached_generator(host)));
-        let Some(samples) = generator
-            .as_ref()
-            .and_then(|g| g.sample_surface_columns(&query_cols).ok())
-        else {
-            let cooldown = (budget_start.elapsed() * DISTANT_SAMPLE_COOLDOWN_MULT)
-                .min(DISTANT_SAMPLE_MAX_COOLDOWN);
-            rt.inner
-                .lock()
-                .unwrap()
-                .next_distant_sample
-                .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
+        let Some(gen_handle) = generator.clone() else {
+            rt.inner.lock().unwrap().next_distant_sample.insert(
+                dim.to_owned(),
+                std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
+            );
             return if ran_any {
                 SampleOutcome::Sampled
             } else {
@@ -968,69 +950,92 @@ fn sample_distant_sections(
             };
         };
 
-        let mut st = rt.inner.lock().unwrap();
-        let store = st.dimensions.entry(dim.to_owned()).or_default();
-        let mut updated_any = false;
-        let mut non_empty_count = 0u64;
-
-        {
-            let sec = store.get_or_create_mut(pos);
-            for (&(cx, cz), sample) in cells.iter().zip(samples.iter()) {
-                let Some(col) = sample else {
-                    continue;
-                };
-                let block_id = col.block.id(host).unwrap_or("minecraft:stone");
-                let solid_rgb = block_color(block_id, &col.biome, 0);
-                let fluid_rgb = biome_water_color(&col.biome, 0);
-                let skirt = (step * 4).clamp(8, 32);
-                let lod_col = LodColumn::from_solid_and_fluid(
-                    col.height,
-                    col.height - skirt,
-                    solid_rgb,
-                    col.water,
-                    fluid_rgb,
-                    15,
-                    0,
-                    SOURCE_DISTANT_SURFACE,
-                )
-                .with_material(classify_dh_material(block_id));
-                if sec.set_cell(cx, cz, lod_col) {
-                    updated_any = true;
-                }
-                non_empty_count += 1;
-            }
-        }
-
-        store.generated_columns = store.generated_columns.saturating_add(non_empty_count);
-        if !updated_any {
-            // Void / partial-None section with no further fillable cells: mark sampled so
-            // `sample_cursor` advances past it instead of re-picking it forever.
-            store.sampled_distant_sections.insert(pos);
-        }
-        if updated_any {
-            dirty_sections.insert(pos);
-        }
-        ran_any = true;
-
-        if budget_start.elapsed() >= DISTANT_SAMPLE_BUDGET {
+        if rt.gen_pool.enqueue(dim.to_owned(), pos, gen_handle, cells) {
+            ran_any = true;
+        } else {
             break;
         }
     }
 
     if ran_any {
-        let elapsed = budget_start.elapsed();
-        if elapsed > DISTANT_SAMPLE_BUDGET {
-            let cooldown =
-                (elapsed * DISTANT_SAMPLE_COOLDOWN_MULT).min(DISTANT_SAMPLE_MAX_COOLDOWN);
-            rt.inner
-                .lock()
-                .unwrap()
-                .next_distant_sample
-                .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
-        }
         SampleOutcome::Sampled
     } else {
         SampleOutcome::Exhausted
+    }
+}
+
+/// Ingest completed off-thread `DetachedChunkGenerator` section results on the server thread.
+fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut HashSet<SectionPos>) {
+    let rt = runtime();
+    let results = rt.gen_pool.drain_for_dim(dim);
+    if results.is_empty() {
+        return;
+    }
+
+    let mut block_id_cache: HashMap<mod_api::BlockKey, &str> = HashMap::new();
+    let mut st = rt.inner.lock().unwrap();
+    let mut had_error = false;
+    {
+        let store = st.dimensions.entry(dim.to_owned()).or_default();
+
+        for res in results {
+            let step = res.pos.cell_size();
+            let skirt = (step * 4).clamp(8, 32);
+            let mut updated_any = false;
+            let mut non_empty_count = 0u64;
+
+            {
+                let sec = store.get_or_create_mut(res.pos);
+                for (&(cx, cz), sample) in res.cells.iter().zip(res.samples.iter()) {
+                    if sec.get(cx, cz).source == SOURCE_LOADED_CHUNK {
+                        continue;
+                    }
+                    let Some(col) = sample else {
+                        continue;
+                    };
+                    let block_id = *block_id_cache
+                        .entry(col.block)
+                        .or_insert_with(|| col.block.id(host).unwrap_or("minecraft:stone"));
+                    let solid_rgb = block_color(block_id, &col.biome, 0);
+                    let fluid_rgb = biome_water_color(&col.biome, 0);
+                    let lod_col = LodColumn::from_solid_and_fluid(
+                        col.height,
+                        col.height - skirt,
+                        solid_rgb,
+                        col.water,
+                        fluid_rgb,
+                        15,
+                        0,
+                        SOURCE_DISTANT_SURFACE,
+                    )
+                    .with_material(classify_dh_material(block_id));
+                    if sec.set_cell(cx, cz, lod_col) {
+                        updated_any = true;
+                    }
+                    non_empty_count += 1;
+                }
+            }
+
+            store.generated_columns = store.generated_columns.saturating_add(non_empty_count);
+            match res.outcome {
+                crate::gen_worker::GenOutcome::Complete => {
+                    store.sampled_distant_sections.insert(res.pos);
+                }
+                crate::gen_worker::GenOutcome::Error => {
+                    had_error = true;
+                }
+                crate::gen_worker::GenOutcome::Cancelled => {}
+            }
+            if updated_any {
+                dirty_sections.insert(res.pos);
+            }
+        }
+    }
+    if had_error {
+        st.next_distant_sample.insert(
+            dim.to_owned(),
+            std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
+        );
     }
 }
 

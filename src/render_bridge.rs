@@ -6,6 +6,7 @@
 
 use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
+use crate::gen_worker::GenWorkerPool;
 use crate::generic_render::{BeaconTracker, CloudField, GenericGroupMesh};
 use crate::lod::{DimensionLodStore, SectionPos};
 use crate::mesh::{MeshWorker, SectionMeshData};
@@ -536,6 +537,7 @@ pub struct DhRuntime {
     pub frames_drawn: AtomicU64,
     pub io: LodIoWorker,
     pub mesher: MeshWorker,
+    pub gen_pool: GenWorkerPool,
     pub inner: Mutex<DhState>,
 }
 
@@ -676,6 +678,7 @@ pub fn runtime() -> &'static Arc<DhRuntime> {
             frames_drawn: AtomicU64::new(0),
             io: LodIoWorker::spawn(),
             mesher: MeshWorker::spawn(),
+            gen_pool: GenWorkerPool::new(),
             inner: Mutex::new(DhState::default()),
         })
     })
