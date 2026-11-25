@@ -577,6 +577,11 @@ pub struct DhState {
     pub remote_cache_dir: Option<PathBuf>,
     /// Round-robin cursor across connected players for dedicated/LAN server distant generation.
     pub server_player_round_robin: usize,
+    /// Per-dimension cached desired-section order, keyed by camera cell and config, so the
+    /// server tick does not rebuild and sort the whole quadtree every tick.
+    pub desired_cache: HashMap<String, DesiredCache>,
+    /// When the last built-in distant sampling call ran on the server thread.
+    pub last_distant_sample: Option<Instant>,
     /// Generic box groups (beacons, clouds, and third-party mod groups) per dimension.
     pub generic_groups: HashMap<String, HashMap<String, GenericGroupMesh>>,
     pub generic_groups_revision: u64,
@@ -587,6 +592,13 @@ pub struct DhState {
     pub cloud_field: CloudField,
     /// Start time for smooth LOD cloud drift.
     pub start_instant: Instant,
+}
+
+/// Cached result of `DimensionLodStore::desired_sections_coarse_to_fine`.
+pub struct DesiredCache {
+    pub cell: (i32, i32),
+    pub config: DhConfig,
+    pub list: Vec<SectionPos>,
 }
 
 impl Default for DhState {
@@ -625,6 +637,8 @@ impl Default for DhState {
             remote_config_requested: false,
             remote_cache_dir: None,
             server_player_round_robin: 0,
+            desired_cache: HashMap::new(),
+            last_distant_sample: None,
             generic_groups: HashMap::new(),
             generic_groups_revision: 0,
             last_uploaded_generic_revision: 0,

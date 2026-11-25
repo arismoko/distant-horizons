@@ -62,10 +62,16 @@ const LOADED_SCAN_ABOVE: u32 = 2;
 
 /// Number of loaded chunks sampled per server tick when time remains.
 const CHUNKS_PER_TICK: usize = 4;
+/// Minimum quiet time after a built-in distant sampling call on the server thread before
+/// starting the next one. Matches DH's `FullDataUpdatePropagatorV2.PROPAGATE_QUEUE_THREAD_DELAY_IN_MS`
+/// (250 ms) so synchronous `terrain_surface` fallback work (before detached off-thread generation)
+/// leaves the server thread idle between small batches.
+const DISTANT_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Number of distant surface columns sampled per server tick (capped well under 4096 so ticks
-/// stay responsive even on software setups).
-const DISTANT_COLS_PER_TICK: usize = 1024;
+/// Number of distant surface columns sampled per server-thread batch (one 64-column row of a
+/// `SECTION_SIZE` section). Kept small so each synchronous `terrain_surface` call stays well
+/// within a single 50 ms server tick instead of pegging the server thread.
+const DISTANT_COLS_PER_TICK: usize = 64;
 
 #[derive(Default)]
 struct DistantHorizonsMod {
@@ -770,7 +776,40 @@ fn sample_distant_sections(
     dirty_sections: &mut HashSet<SectionPos>,
 ) {
     let rt = runtime();
-    let desired = DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg);
+    // Sampling a section calls the generator's density functions on the server thread, so enforce
+    // a quiet interval measured from completion of the previous batch.
+    {
+        let st = rt.inner.lock().unwrap();
+        let now = std::time::Instant::now();
+        if st
+            .last_distant_sample
+            .is_some_and(|t| now.duration_since(t) < DISTANT_SAMPLE_INTERVAL)
+        {
+            return;
+        }
+    }
+    // Rebuild the desired order only when the camera crosses a 64-block (`SECTION_SIZE`, matching
+    // DH's `LodQuadTree` passing `FullDataSourceV2.WIDTH` = 64 to `QuadTree.setCenterBlockPos`)
+    // cell or the config changes.
+    let desired: Vec<SectionPos> = {
+        let cell = ((cam[0].floor() as i32) >> 6, (cam[2].floor() as i32) >> 6);
+        let mut st = rt.inner.lock().unwrap();
+        match st.desired_cache.get(dim) {
+            Some(c) if c.cell == cell && c.config == cfg => c.list.clone(),
+            _ => {
+                let list = DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg);
+                st.desired_cache.insert(
+                    dim.to_owned(),
+                    render_bridge::DesiredCache {
+                        cell,
+                        config: cfg,
+                        list: list.clone(),
+                    },
+                );
+                list
+            }
+        }
+    };
 
     // Pick the nearest desired section that still has unpopulated cells, and issue async disk
     // load checks for unseen sections first. Also capture any registered external world generator
@@ -828,6 +867,7 @@ fn sample_distant_sections(
     };
 
     let Some((pos, cells)) = target_section else {
+        rt.inner.lock().unwrap().last_distant_sample = Some(std::time::Instant::now());
         return;
     };
 
@@ -873,10 +913,12 @@ fn sample_distant_sections(
         .collect();
 
     let Ok(samples) = host.terrain_surface(dim, &query_cols) else {
+        rt.inner.lock().unwrap().last_distant_sample = Some(std::time::Instant::now());
         return;
     };
 
     let mut st = rt.inner.lock().unwrap();
+    st.last_distant_sample = Some(std::time::Instant::now());
     let store = st.dimensions.entry(dim.to_owned()).or_default();
     let mut updated_any = false;
     let mut non_empty_count = 0u64;
