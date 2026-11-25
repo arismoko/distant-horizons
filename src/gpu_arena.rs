@@ -21,7 +21,9 @@
 //! one fixed slot per `(section id, bucket)`, rewritten every frame by `voxy_cmdgen.csh`, so the
 //! draw count is simply the id high-water mark times the bucket count.
 
-use mod_api::{BufferError, ClientHost, StorageBufferDescriptor, StorageBufferRef};
+use mod_api::{
+    BufferError, ClientHost, ClientRenderClientHost, StorageBufferDescriptor, StorageBufferRef,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Bytes per packed quad (Voxy `BufferArena(geometryCapacity, 8)`).

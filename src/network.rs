@@ -895,7 +895,7 @@ pub mod octree_sync {
     };
     use std::collections::{HashMap, VecDeque};
     use std::hash::Hash;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
@@ -2429,6 +2429,25 @@ pub mod octree_sync {
             client_events().lock().unwrap().extend(events);
             Ok(())
         }
+    }
+
+    static CONFIG_SENT: AtomicBool = AtomicBool::new(false);
+
+    /// Send our session config once per connection (`ServerPlayerState.java:62-65`).
+    pub fn client_send_config_once(host: &mut dyn ClientHost) {
+        if CONFIG_SENT.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(bytes) = ClientSession::config_message(&SessionConfig::default()) {
+            let _ = host.send_payload_to_server(&octree_sync_channel_id(), PayloadBytes(bytes));
+        }
+    }
+
+    /// Forget the per-connection state when the client leaves a server.
+    pub fn client_reset() {
+        CONFIG_SENT.store(false, Ordering::Relaxed);
+        *client_session().lock().unwrap() = ClientSession::default();
+        client_events().lock().unwrap().clear();
     }
 
     /// Send one request from the client tick.
