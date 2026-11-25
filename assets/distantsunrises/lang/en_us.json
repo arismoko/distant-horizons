@@ -102,5 +102,14 @@
   "distantsunrises.command.preset_set": "Applied Distant Sunrises %s quality preset.",
   "distantsunrises.command.usage_debug": "Usage: /ds debug <off|detail|gen|light|wireframe>",
   "distantsunrises.command.usage_preset": "Usage: /ds preset <low|medium|high|extreme>",
-  "distantsunrises.command.help": "Commands: /ds <status|toggle|radius <chunks>|quality <low|medium|high>|preset <low|medium|high|extreme>|fog <on|off>|heightfog <on|off>|ssao <on|off>|sharpen <on|off>|clouds <on|off>|beacons <on|off>|debug <off|detail|gen|light|wireframe>|fade <on|off>|noise <on|off>|gen <on|off>|cavecull <on|off>|clear|remesh>"
+  "distantsunrises.command.help": "Commands: /ds <status|toggle|radius <chunks>|quality <low|medium|high>|preset <low|medium|high|extreme>|fog <on|off>|heightfog <on|off>|ssao <on|off>|sharpen <on|off>|clouds <on|off>|beacons <on|off>|debug <off|detail|gen|light|wireframe>|fade <on|off>|noise <on|off>|gen <on|off>|threads <minimal|low|balanced|aggressive|whole>|cavecull <on|off>|clear|remesh>",
+  "distantsunrises.setting.thread_preset": "World Generation Thread Preset",
+  "distantsunrises.setting.thread_preset.tooltip": "How much of the CPU Distant Sunrises may use for LOD generation and ingest (10% / 25% / 50% / 75% / 100% of logical processors).",
+  "distantsunrises.setting.thread_preset.minimal_impact": "Minimal Impact (10%)",
+  "distantsunrises.setting.thread_preset.low_impact": "Low Impact (25%)",
+  "distantsunrises.setting.thread_preset.balanced": "Balanced (50%)",
+  "distantsunrises.setting.thread_preset.aggressive": "Aggressive (75%)",
+  "distantsunrises.setting.thread_preset.i_paid_for_the_whole_cpu": "I Paid For The Whole CPU (100%)",
+  "distantsunrises.command.threads_set": "Distant Sunrises thread preset set to %s.",
+  "distantsunrises.command.usage_threads": "Usage: /ds threads <minimal|low|balanced|aggressive|whole>"
 }
