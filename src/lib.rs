@@ -679,7 +679,7 @@ fn sample_loaded_chunks(
         .collect();
     for (chunk, snapshot) in &snapshots {
         if let Some(snapshot) = snapshot {
-            pipeline::ingest_loaded_chunk(host, dim, *chunk, snapshot);
+            pipeline::ingest_chunk(host, dim, *chunk, snapshot, pipeline::SnapshotSource::Loaded);
         }
     }
     ingest_chunk_snapshots(host, dim, &snapshots, dirty_sections, collect_deltas)
@@ -1121,6 +1121,11 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
         .flat_map(|r| std::mem::take(&mut r.saved_chunks))
         .map(|(pos, snap)| (pos, Some(snap)))
         .collect();
+    for (chunk, snapshot) in &saved {
+        if let Some(snapshot) = snapshot {
+            pipeline::ingest_chunk(host, dim, *chunk, snapshot, pipeline::SnapshotSource::Saved);
+        }
+    }
     if !saved.is_empty() {
         ingest_chunk_snapshots(host, dim, &saved, dirty_sections, false);
     }

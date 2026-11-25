@@ -11,7 +11,7 @@ use crate::bakery::{
 use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
 use crate::mesh::{SectionQuads, mesh_octree_section};
 use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
-use crate::octree_ingest::{OctreeIngestStore, ingest_chunk_snapshot};
+use crate::octree_ingest::{OctreeIngestStore, ingest_chunk_snapshot, ingest_saved_chunk};
 use crate::render_bridge::submit_built_section;
 use mod_api::{BlockState, ChunkSnapshot, ClientHost, Direction, ServerHost};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -97,18 +97,32 @@ impl Pipeline {
     }
 }
 
-/// G1: ingest a loaded chunk's snapshot (server thread). Returns whether the chunk was accepted.
-pub fn ingest_loaded_chunk(
+/// Which source a snapshot came from: G1 (live chunk) or G3 (saved Anvil chunk).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotSource {
+    Loaded,
+    Saved,
+}
+
+/// Ingest one chunk snapshot into `dim`'s octree store (server thread) and queue the touched
+/// sections for meshing. Returns whether the chunk was accepted (a higher-priority source owns it
+/// otherwise).
+pub fn ingest_chunk(
     host: &dyn ServerHost,
     dim: &str,
     chunk: [i32; 2],
     snapshot: &ChunkSnapshot,
+    source: SnapshotSource,
 ) -> bool {
     let mut guard = PIPELINE.lock().unwrap();
     let p = &mut *guard;
     let store = p.stores.entry(dim.to_owned()).or_default();
     let mapper = std::cell::RefCell::new(&mut p.mapper);
-    let accepted = ingest_chunk_snapshot(
+    let ingest = match source {
+        SnapshotSource::Loaded => ingest_chunk_snapshot,
+        SnapshotSource::Saved => ingest_saved_chunk,
+    };
+    let accepted = ingest(
         store,
         chunk,
         snapshot,
