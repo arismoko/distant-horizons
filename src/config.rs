@@ -43,6 +43,86 @@ pub const KEY_CLOUDS_ENABLED: &str = "clouds_enabled";
 pub const KEY_BEACON_BEAMS_ENABLED: &str = "beacon_beams_enabled";
 pub const KEY_SHARPENING_AMOUNT: &str = "sharpening_amount";
 pub const KEY_DEBUG_MODE: &str = "debug_mode";
+pub const KEY_THREAD_PRESET: &str = "thread_preset";
+
+/// Mirrors `EDhApiThreadPreset` and `ThreadPresetConfigEventHandler` (percent of logical
+/// processors per preset; `CUSTOM` has no fixed value and is not offered).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ThreadPreset {
+    MinimalImpact = 0,
+    LowImpact = 1,
+    #[default]
+    Balanced = 2,
+    Aggressive = 3,
+    IPaidForTheWholeCpu = 4,
+}
+
+impl ThreadPreset {
+    pub const ALL: [Self; 5] = [
+        Self::MinimalImpact,
+        Self::LowImpact,
+        Self::Balanced,
+        Self::Aggressive,
+        Self::IPaidForTheWholeCpu,
+    ];
+
+    /// `getThreadCountByPercent(0.1 / 0.25 / 0.5 / 0.75 / 1.0)`.
+    pub const fn percent(self) -> f64 {
+        match self {
+            Self::MinimalImpact => 0.1,
+            Self::LowImpact => 0.25,
+            Self::Balanced => 0.5,
+            Self::Aggressive => 0.75,
+            Self::IPaidForTheWholeCpu => 1.0,
+        }
+    }
+
+    /// `ceil(total * percent)` clamped to `1..=total`.
+    pub fn thread_count(self, total_logical_processors: usize) -> usize {
+        let total = total_logical_processors.max(1);
+        (((total as f64) * self.percent()).ceil() as usize).clamp(1, total)
+    }
+
+    /// `threadRunTime` column of the preset table: `MinimalImpact` 0.5, all others 1.0.
+    pub const fn run_time_ratio(self) -> f64 {
+        match self {
+            Self::MinimalImpact => 0.5,
+            _ => 1.0,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        Self::ALL.get(index as usize).copied().unwrap_or_default()
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        Self::from_index(u32::from(v))
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
+            "minimalimpact" | "minimal" => Some(Self::MinimalImpact),
+            "lowimpact" | "low" => Some(Self::LowImpact),
+            "balanced" => Some(Self::Balanced),
+            "aggressive" => Some(Self::Aggressive),
+            "ipaidforthewholecpu" | "whole" | "all" => Some(Self::IPaidForTheWholeCpu),
+            _ => None,
+        }
+    }
+
+    pub const fn label_key(self) -> &'static str {
+        match self {
+            Self::MinimalImpact => "distantsunrises.setting.thread_preset.minimal_impact",
+            Self::LowImpact => "distantsunrises.setting.thread_preset.low_impact",
+            Self::Balanced => "distantsunrises.setting.thread_preset.balanced",
+            Self::Aggressive => "distantsunrises.setting.thread_preset.aggressive",
+            Self::IPaidForTheWholeCpu => {
+                "distantsunrises.setting.thread_preset.i_paid_for_the_whole_cpu"
+            }
+        }
+    }
+}
 
 /// Debug visualization modes matching upstream `EDhApiDebugRendering`.
 pub const DEBUG_OFF: u32 = 0;
@@ -91,6 +171,8 @@ pub struct DhConfig {
     pub sharpening_amount: f32,
     /// `DEBUG_OFF..=DEBUG_SHOW_DETAIL_WIREFRAME`.
     pub debug_mode: u32,
+    /// Worldgen/ingest thread preset (`EDhApiThreadPreset`).
+    pub thread_preset: ThreadPreset,
 }
 
 impl Default for DhConfig {
@@ -125,6 +207,7 @@ impl Default for DhConfig {
             beacon_beams_enabled: true,
             sharpening_amount: 0.35,
             debug_mode: DEBUG_OFF,
+            thread_preset: ThreadPreset::Balanced,
         }
     }
 }
@@ -410,6 +493,13 @@ impl DhConfig {
                 0,
             )
             .tooltip("distantsunrises.setting.debug_mode.tooltip"),
+            SettingSpec::choice(
+                KEY_THREAD_PRESET,
+                "distantsunrises.setting.thread_preset",
+                ThreadPreset::ALL.map(ThreadPreset::label_key),
+                ThreadPreset::Balanced as usize,
+            )
+            .tooltip("distantsunrises.setting.thread_preset.tooltip"),
         ];
         let mut registered = HashMap::with_capacity(specs.len());
         for spec in specs {
@@ -489,6 +579,38 @@ impl DhConfig {
                 .map(|v| (v as f32).clamp(0.0, 1.0))
                 .unwrap_or(def.sharpening_amount),
             debug_mode: read_choice(KEY_DEBUG_MODE, def.debug_mode),
+            thread_preset: ThreadPreset::from_index(read_choice(
+                KEY_THREAD_PRESET,
+                def.thread_preset as u32,
+            )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_preset_counts_match_dh_formula() {
+        // DH javadoc table (4/8/16 cores) for the 0.1 and 1.0 rows, plus 50/25/75%.
+        let cases = [
+            (ThreadPreset::MinimalImpact, [1, 1, 2]),
+            (ThreadPreset::LowImpact, [1, 2, 4]),
+            (ThreadPreset::Balanced, [2, 4, 8]),
+            (ThreadPreset::Aggressive, [3, 6, 12]),
+            (ThreadPreset::IPaidForTheWholeCpu, [4, 8, 16]),
+        ];
+        for (preset, expected) in cases {
+            for (total, want) in [4, 8, 16].into_iter().zip(expected) {
+                assert_eq!(preset.thread_count(total), want, "{preset:?} on {total}");
+            }
+        }
+        assert_eq!(ThreadPreset::MinimalImpact.thread_count(0), 1);
+        assert_eq!(ThreadPreset::default(), ThreadPreset::Balanced);
+        assert_eq!(
+            ThreadPreset::parse("I_PAID_FOR_THE_WHOLE_CPU"),
+            Some(ThreadPreset::IPaidForTheWholeCpu)
+        );
     }
 }

@@ -827,60 +827,56 @@ impl DimensionLodStore {
         selected
     }
 
-    /// Returns sections to populate in progressive order: first the inner fine detail rings
-    /// around the vanilla border (`detail 0` and `detail 1` within ~384 blocks) so the immediate
-    /// border outside vanilla chunks is crisp right away, then coarse-to-fine (`detail MAX_DETAIL`
-    /// down to `0`) across the rest of the horizon.
+    /// Returns the **leaf** sections to populate, mirroring DH's inside-out `LodQuadTree`: each
+    /// distance ring is queued only at its target detail level (a node inside its split distance
+    /// is replaced by its four children, never queued alongside them). The ring right outside
+    /// vanilla's render distance therefore holds only `detail 0` sections; coarse parents are
+    /// filled by downsampling from their children (`propagate_up`) or, in far rings, are
+    /// themselves the target leaf.
+    ///
+    /// Order follows DH `WorldGenerationQueue.tryStartNextWorldGenTask` (lines 302-304):
+    /// ascending `chebyshevDist(center, cam) / (detail + 1)`, so the sections nearest the camera
+    /// come first and coarse leaves are favoured at equal distance. (DH divides by `detail`;
+    /// `detail + 1` keeps detail 0 defined.)
     pub fn desired_sections_coarse_to_fine(
         cam_x: f64,
         cam_z: f64,
         config: DhConfig,
     ) -> Vec<SectionPos> {
         let max_dist = config.render_distance_blocks() as f64;
-        let mut by_detail: [Vec<SectionPos>; (MAX_DETAIL as usize) + 1] = Default::default();
         let root_span = SectionPos::new(MAX_DETAIL, 0, 0).block_span() as f64;
         let radius_roots = (max_dist / root_span).ceil() as i32 + 1;
         let center_root =
             SectionPos::from_block(MAX_DETAIL, cam_x.floor() as i32, cam_z.floor() as i32);
 
+        let mut leaves = Vec::new();
         for rz in (center_root.z - radius_roots)..=(center_root.z + radius_roots) {
             for rx in (center_root.x - radius_roots)..=(center_root.x + radius_roots) {
-                collect_progressive_nodes(
+                collect_leaf_nodes(
                     SectionPos::new(MAX_DETAIL, rx, rz),
                     cam_x,
                     cam_z,
                     max_dist,
                     config,
-                    &mut by_detail,
+                    &mut leaves,
                 );
             }
         }
-        let mut ordered = Vec::new();
-        let mut seen = HashSet::new();
-        for bucket in &by_detail {
-            for &pos in bucket {
-                if seen.insert(pos) {
-                    ordered.push(pos);
-                }
-            }
-        }
-        // Sort by DH `WorldGenerationQueue.java:302-304` priority:
-        // `chebyshevDist(center, cam) / (detail + 1)` — coarse sections around the camera fill
-        // the horizon first, then finer detail levels refine outward from the player.
-        ordered.sort_by(|a, b| {
-            let score = |p: SectionPos| {
-                let (ox, oz) = p.block_origin();
-                let half = (p.block_span() as f64) * 0.5;
-                let chebyshev = ((ox as f64 + half) - cam_x)
-                    .abs()
-                    .max(((oz as f64 + half) - cam_z).abs());
-                chebyshev / (p.detail as f64 + 1.0)
-            };
+        let score = |p: SectionPos| {
+            let (ox, oz) = p.block_origin();
+            let half = (p.block_span() as f64) * 0.5;
+            let chebyshev = ((ox as f64 + half) - cam_x)
+                .abs()
+                .max(((oz as f64 + half) - cam_z).abs());
+            chebyshev / (p.detail as f64 + 1.0)
+        };
+        leaves.sort_by(|a, b| {
             score(*a)
                 .total_cmp(&score(*b))
                 .then_with(|| b.detail.cmp(&a.detail))
+                .then_with(|| (a.x, a.z).cmp(&(b.x, b.z)))
         });
-        ordered
+        leaves
     }
 }
 
@@ -961,27 +957,30 @@ fn select_node(
     }
 }
 
-fn collect_progressive_nodes(
+/// Leaf-only traversal: a node inside its split distance is replaced by its children; any other
+/// in-range node is the target leaf for its ring and is emitted.
+fn collect_leaf_nodes(
     pos: SectionPos,
     cam_x: f64,
     cam_z: f64,
     max_dist: f64,
     config: DhConfig,
-    by_detail: &mut [Vec<SectionPos>; (MAX_DETAIL as usize) + 1],
+    leaves: &mut Vec<SectionPos>,
 ) {
     let dist = pos.min_horizontal_distance(cam_x, cam_z);
     if dist > max_dist {
         return;
     }
-    by_detail[pos.detail as usize].push(pos);
     if pos.detail > 0
         && dist < config.detail_split_distance_blocks(pos.detail) as f64
         && let Some(children) = pos.children()
     {
         for child in children {
-            collect_progressive_nodes(child, cam_x, cam_z, max_dist, config, by_detail);
+            collect_leaf_nodes(child, cam_x, cam_z, max_dist, config, leaves);
         }
+        return;
     }
+    leaves.push(pos);
 }
 
 #[cfg(test)]
@@ -1123,5 +1122,56 @@ mod tests {
             nether_extra[1].material_id,
             crate::colors::DH_BLOCK_DEEPSLATE
         );
+    }
+
+    #[test]
+    fn desired_sections_are_leaf_only_with_detail_zero_near_camera() {
+        let cfg = DhConfig::default();
+        let (cx, cz) = (1234.5, -987.25);
+        let desired = DimensionLodStore::desired_sections_coarse_to_fine(cx, cz, cfg);
+        assert!(!desired.is_empty());
+
+        // The section(s) covering the camera, and everything inside detail 1's split distance,
+        // are detail 0 leaves; no detail 6/5/4 ancestor covers the camera.
+        let near = cfg.detail_split_distance_blocks(1) as f64;
+        for &p in &desired {
+            let d = p.min_horizontal_distance(cx, cz);
+            if d < near {
+                assert_eq!(p.detail, 0, "near section {p:?} at {d} must be detail 0");
+            }
+            if p.detail > 0 {
+                assert!(
+                    d >= cfg.detail_split_distance_blocks(p.detail) as f64,
+                    "{p:?} is inside its split distance yet queued as a coarse leaf"
+                );
+            }
+        }
+        let cam_cover = |p: &SectionPos| p.min_horizontal_distance(cx, cz) == 0.0;
+        assert!(desired.iter().any(|p| p.detail == 0 && cam_cover(p)));
+        assert!(
+            desired
+                .iter()
+                .filter(|p| cam_cover(p))
+                .all(|p| p.detail == 0)
+        );
+
+        // Leaf-only: no queued section is an ancestor of another queued section.
+        let set: HashSet<SectionPos> = desired.iter().copied().collect();
+        assert_eq!(set.len(), desired.len());
+        for &p in &desired {
+            let mut cur = p;
+            while let Some(parent) = cur.parent() {
+                assert!(!set.contains(&parent), "{parent:?} queued above leaf {p:?}");
+                cur = parent;
+            }
+        }
+    }
+
+    #[test]
+    fn desired_sections_are_ordered_nearest_first() {
+        let cfg = DhConfig::default();
+        let desired = DimensionLodStore::desired_sections_coarse_to_fine(0.5, 0.5, cfg);
+        assert_eq!(desired[0].detail, 0);
+        assert_eq!(desired[0].min_horizontal_distance(0.5, 0.5), 0.0);
     }
 }

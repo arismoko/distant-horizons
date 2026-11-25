@@ -451,6 +451,7 @@ fn sync_client_config(host: &dyn Host) {
     let rt = runtime();
     rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
     rt.inner.lock().unwrap().config = cfg;
+    rt.gen_pool.reconfigure(cfg.thread_preset);
 }
 
 fn enqueue_chunk(dimension: &str, chunk: [i32; 2]) {
@@ -613,9 +614,8 @@ fn sample_loaded_chunks(
     dirty_sections: &mut HashSet<SectionPos>,
     collect_deltas: bool,
 ) -> HashMap<SectionPos, network::SectionColumnDelta> {
-    let mut deltas: HashMap<SectionPos, network::SectionColumnDelta> = HashMap::new();
     let Some(level) = host.level(dim) else {
-        return deltas;
+        return HashMap::new();
     };
 
     let snapshots: Vec<([i32; 2], Option<mod_api::ChunkSnapshot>)> = chunks
@@ -627,6 +627,19 @@ fn sample_loaded_chunks(
             )
         })
         .collect();
+    ingest_chunk_snapshots(host, dim, &snapshots, dirty_sections, collect_deltas)
+}
+
+/// Converts chunk snapshots (live G1 or saved G3) into LOD columns, spans and beacons.
+fn ingest_chunk_snapshots(
+    host: &dyn ServerHost,
+    dim: &str,
+    snapshots: &[([i32; 2], Option<mod_api::ChunkSnapshot>)],
+    dirty_sections: &mut HashSet<SectionPos>,
+    collect_deltas: bool,
+) -> HashMap<SectionPos, network::SectionColumnDelta> {
+    let mut deltas: HashMap<SectionPos, network::SectionColumnDelta> = HashMap::new();
+    let chunks: Vec<[i32; 2]> = snapshots.iter().map(|(p, _)| *p).collect();
 
     let mut block_id_cache: HashMap<mod_api::BlockState, &str> = HashMap::new();
     let mut chunk_beacons: Vec<Vec<BeaconBeam>> = vec![Vec::new(); chunks.len()];
@@ -1022,7 +1035,11 @@ fn sample_distant_sections(
             };
         };
 
-        if rt.gen_pool.enqueue(dim.to_owned(), pos, gen_handle, cells) {
+        let saved_reader = host.level(dim).and_then(|l| l.saved_chunk_reader(host));
+        if rt
+            .gen_pool
+            .enqueue(dim.to_owned(), pos, gen_handle, saved_reader, cells)
+        {
             ran_any = true;
         } else {
             break;
@@ -1039,9 +1056,18 @@ fn sample_distant_sections(
 /// Ingest completed off-thread `DetachedChunkGenerator` section results on the server thread.
 fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut HashSet<SectionPos>) {
     let rt = runtime();
-    let results = rt.gen_pool.drain_for_dim(dim);
+    let mut results = rt.gen_pool.drain_for_dim(dim);
     if results.is_empty() {
         return;
+    }
+    // G3: chunks read from saved Anvil storage go through the same snapshot ingest as live chunks.
+    let saved: Vec<([i32; 2], Option<mod_api::ChunkSnapshot>)> = results
+        .iter_mut()
+        .flat_map(|r| std::mem::take(&mut r.saved_chunks))
+        .map(|(pos, snap)| (pos, Some(snap)))
+        .collect();
+    if !saved.is_empty() {
+        ingest_chunk_snapshots(host, dim, &saved, dirty_sections, false);
     }
 
     let mut block_id_cache: HashMap<mod_api::BlockKey, &str> = HashMap::new();
