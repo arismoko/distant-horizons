@@ -537,22 +537,44 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             .filter(|&p| dim_id.is_some() && p.dimension(host) == dim_id)
             .filter_map(|p| EntityRef::from(p).position(host).map(|pos| (p.uuid(), pos)))
             .collect();
-        let center_opt = if !player_centers.is_empty() {
-            Some(player_centers[rr_cursor % player_centers.len()])
-        } else if dim == active_dim {
-            cam.map(|pos| (0u128, pos))
-        } else {
-            None
-        };
-        if let Some((player_key, center)) = center_opt
-            && sample_distant_sections(host, dim, player_key, center, cfg, &mut dirty_sections)
+        if !player_centers.is_empty() {
+            // Evict cache entries for players no longer in this dimension.
+            {
+                let mut st = rt.inner.lock().unwrap();
+                st.desired_cache.retain(|(d, key), _| {
+                    d != dim || *key == 0 || player_centers.iter().any(|(u, _)| u == key)
+                });
+            }
+            let n = player_centers.len();
+            for offset in 0..n {
+                let idx = (rr_cursor + offset) % n;
+                let (player_key, center) = player_centers[idx];
+                match sample_distant_sections(
+                    host,
+                    dim,
+                    player_key,
+                    center,
+                    cfg,
+                    &mut dirty_sections,
+                ) {
+                    SampleOutcome::Cooldown => break,
+                    SampleOutcome::Sampled => {
+                        let mut st = rt.inner.lock().unwrap();
+                        st.server_player_round_robin
+                            .insert(dim.to_owned(), (idx + 1) % n);
+                        break;
+                    }
+                    SampleOutcome::Exhausted => {
+                        let mut st = rt.inner.lock().unwrap();
+                        st.server_player_round_robin
+                            .insert(dim.to_owned(), (idx + 1) % n);
+                    }
+                }
+            }
+        } else if dim == active_dim
+            && let Some(center) = cam
         {
-            let mut st = rt.inner.lock().unwrap();
-            let entry = st
-                .server_player_round_robin
-                .entry(dim.to_owned())
-                .or_insert(0);
-            *entry = entry.wrapping_add(1);
+            let _ = sample_distant_sections(host, dim, 0, center, cfg, &mut dirty_sections);
         }
     }
 
@@ -775,9 +797,17 @@ fn sample_loaded_chunks(
     deltas
 }
 
+enum SampleOutcome {
+    /// Dimension cooldown has not elapsed yet; do not advance round-robin.
+    Cooldown,
+    /// Player's desired-section list has no unsampled sections left; try the next player.
+    Exhausted,
+    /// Ran at least one sampling batch (or hit a rate-limited terminal path); advance round-robin.
+    Sampled,
+}
+
 /// Advances unthrottled async disk-load checks and, when this dimension's cooldown has elapsed,
-/// runs distant-sampling batches up to `DISTANT_SAMPLE_BUDGET` (4 ms/tick). Returns `true` when
-/// sampling work actually ran (so callers can advance per-dimension player round-robin fairly).
+/// runs distant-sampling batches up to `DISTANT_SAMPLE_BUDGET` (4 ms/tick).
 fn sample_distant_sections(
     host: &dyn ServerHost,
     dim: &str,
@@ -785,7 +815,7 @@ fn sample_distant_sections(
     cam: [f64; 3],
     cfg: DhConfig,
     dirty_sections: &mut HashSet<SectionPos>,
-) -> bool {
+) -> SampleOutcome {
     let rt = runtime();
     let cam_block = [cam[0].floor() as i32, cam[2].floor() as i32];
     let cache_key = (dim.to_owned(), player_key);
@@ -844,7 +874,7 @@ fn sample_distant_sections(
         }
 
         if !sample_due {
-            return false;
+            return SampleOutcome::Cooldown;
         }
     }
 
@@ -934,7 +964,11 @@ fn sample_distant_sections(
                 dim.to_owned(),
                 std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
             );
-            return ran_any;
+            return if ran_any {
+                SampleOutcome::Sampled
+            } else {
+                SampleOutcome::Cooldown
+            };
         }
 
         let (ox, oz) = pos.block_origin();
@@ -958,7 +992,11 @@ fn sample_distant_sections(
                 .unwrap()
                 .next_distant_sample
                 .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
-            return ran_any;
+            return if ran_any {
+                SampleOutcome::Sampled
+            } else {
+                SampleOutcome::Cooldown
+            };
         };
 
         let mut st = rt.inner.lock().unwrap();
@@ -1021,8 +1059,10 @@ fn sample_distant_sections(
                 .next_distant_sample
                 .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
         }
+        SampleOutcome::Sampled
+    } else {
+        SampleOutcome::Exhausted
     }
-    ran_any
 }
 
 fn flush_dimension_dirty(world_dir: Option<std::path::PathBuf>, dim: &str) {
