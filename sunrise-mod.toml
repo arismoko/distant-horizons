@@ -19,21 +19,3 @@ issues = "https://github.com/arismoko/distant-sunrises/issues"
 api = "0.2"
 side = "both"
 capabilities = ["registries"]
-
-[native]
-game = "26.3"
-sunrise = "6a02076f89cd189d74d63492dda5b023fa85a38f"
-
-[[native.mixin]]
-id = "render_needs"
-target = "sunrise_mod_render::render::render_needs"
-kind = "HEAD"
-helper = "src/mixins/render_needs.rs"
-bindings = [{ name = "needs", ty = "&mut RenderNeeds", value = "&mut *needs" }]
-
-[[native.mixin]]
-id = "world_drawn"
-target = "sunrise_mod_render::render::world_drawn"
-kind = "HEAD"
-helper = "src/mixins/world_drawn.rs"
-bindings = [{ name = "world", ty = "&mut WorldDrawn<'_>", value = "&mut *world" }]
