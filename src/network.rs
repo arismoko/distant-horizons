@@ -863,9 +863,15 @@ mod tests {
 /// (`sunrise-mod-vocab/src/wire/limits.rs`: `PAYLOAD_MAX_LIST_ENTRIES`, `PAYLOAD_MAX_STRING_BYTES`),
 /// and encode little-endian. DH's split chunk is 1,048,000 bytes and its codec is Netty
 /// big-endian, so the DH layout can only ride a raw channel (`PayloadRegistrar::play_bidirectional`
-/// with [`PayloadBytes`]). A raw clientbound body may be 1,048,576 bytes (vanilla
-/// `ClientboundCustomPayloadPacket.MAX_PAYLOAD_SIZE`, quoted by `PayloadSendError::PayloadTooLarge`)
-/// and a serverbound one 32,767 (`ServerboundCustomPayloadPacket.MAX_PAYLOAD_SIZE`).
+/// with [`PayloadBytes`]).
+///
+/// # Size limits
+/// A payload on a channel the receiver registered is bounded by the frame limits: 2,097,151 bytes
+/// per frame and 8,388,608 uncompressed. A payload sent to a receiver that does not know the
+/// channel is held to vanilla's `DiscardedPayload` limits instead: 1,048,576 bytes clientbound
+/// (`ClientboundCustomPayloadPacket.MAX_PAYLOAD_SIZE`) and 32,767 serverbound
+/// (`ServerboundCustomPayloadPacket.MAX_PAYLOAD_SIZE`). DH's 1,048,000-byte split is kept so a
+/// chunk also fits the 1,048,576 limit when the receiver has not registered the channel.
 ///
 /// # Framing (DH `AbstractPluginPacketSender.java`)
 /// `u16 protocol version` (`:142`, `:58`), `u16 message id` (`:148`, decode `:100`), message body,
@@ -906,9 +912,9 @@ pub mod octree_sync {
     pub const FULL_DATA_SPLIT_SIZE_IN_BYTES: usize = 1_048_000;
     /// `FullDataPayloadSender.TICK_RATE`, `FullDataPayloadSender.java:18`; also Minecraft's tick rate.
     pub const TICK_RATE: i64 = 20;
-    /// Vanilla clientbound raw custom-payload body limit (see module docs).
+    /// Vanilla clientbound custom-payload body limit for a channel the receiver does not know (see module docs).
     pub const CLIENTBOUND_BODY_LIMIT: usize = 1_048_576;
-    /// Vanilla serverbound raw custom-payload body limit (see module docs).
+    /// Vanilla serverbound custom-payload body limit for a channel the receiver does not know (see module docs).
     pub const SERVERBOUND_BODY_LIMIT: usize = 32_767;
     /// Bytes a split message adds around its chunk: protocol u16, id u16, bufferId i32, size i32,
     /// isFirst bool (`FullDataSplitMessage.java:63-68`).
