@@ -1,19 +1,24 @@
 //! Background worker pool for off-thread distant terrain generation via
 //! `mod_api::DetachedChunkGenerator`.
 //!
-//! Default worker count follows Distant Horizons' `EDhApiThreadPreset.BALANCED`
-//! (`ThreadPresetConfigEventHandler.getDefaultThreadCount()` -> `getThreadCountByPercent(0.5)`:
-//! `ceil(available_processors * 0.5)` clamped to `1..=available_processors`).
+//! Worker count follows Distant Horizons' `EDhApiThreadPreset` (`ThreadPresetConfigEventHandler`):
+//! `ceil(available_processors * percent)` clamped to `1..=available_processors`, default
+//! `Balanced` (50%). [`GenWorkerPool::reconfigure`] applies a preset live.
+//!
+//! Already-saved Anvil chunks are ingested first through `mod_api::SavedChunkReader` (G3), and
+//! only columns without a saved chunk fall back to `DetachedChunkGenerator` (G4); neither loads
+//! anything into the live world.
 //!
 //! Keeps all noise, surface-rule, and biome sampling off the server tick thread.
 //! Finished section batches are drained in O(1) during `level_tick_post`, and
 //! `server_stopping` cancels and joins all worker threads cleanly.
 
+use crate::config::ThreadPreset;
 use crate::lod::SectionPos;
-use mod_api::{DetachedChunkGenerator, TerrainColumn};
+use mod_api::{ChunkSnapshot, DetachedChunkGenerator, SavedChunkReader, TerrainColumn};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -39,6 +44,7 @@ struct GenJob {
     dimension: String,
     pos: SectionPos,
     generator: DetachedChunkGenerator,
+    saved_reader: Option<SavedChunkReader>,
     cells: Vec<(usize, usize)>,
 }
 
@@ -50,6 +56,8 @@ pub struct GenResult {
     pub pos: SectionPos,
     pub cells: Vec<(usize, usize)>,
     pub samples: Vec<Option<TerrainColumn>>,
+    /// Chunks read from saved Anvil storage (G3). Their columns are absent from `cells`.
+    pub saved_chunks: Vec<([i32; 2], ChunkSnapshot)>,
     pub outcome: GenOutcome,
 }
 
@@ -62,6 +70,10 @@ struct Shared {
     global_epoch: AtomicU64,
     next_job_id: AtomicU64,
     stop: AtomicBool,
+    /// Desired worker count; workers with `idx >= target_threads` exit.
+    target_threads: AtomicUsize,
+    /// `ThreadPreset` discriminant (`threadRunTimeRatio` is derived from it).
+    preset: AtomicU8,
 }
 
 pub struct GenWorkerPool {
@@ -70,14 +82,12 @@ pub struct GenWorkerPool {
     max_in_flight: AtomicUsize,
 }
 
-/// Matches DH `ThreadPresetConfigEventHandler.getDefaultThreadCount()` (`BALANCED` = 50% of
-/// logical processors, rounded up, clamped to `1..=total`).
-fn default_worker_count() -> usize {
-    let total = thread::available_parallelism()
+/// Logical processor count (DH `Runtime.availableProcessors()`).
+fn logical_cpus() -> usize {
+    thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
-        .max(1);
-    total.div_ceil(2).clamp(1, total)
+        .max(1)
 }
 
 impl GenWorkerPool {
@@ -91,6 +101,8 @@ impl GenWorkerPool {
             global_epoch: AtomicU64::new(1),
             next_job_id: AtomicU64::new(1),
             stop: AtomicBool::new(false),
+            target_threads: AtomicUsize::new(ThreadPreset::default().thread_count(logical_cpus())),
+            preset: AtomicU8::new(ThreadPreset::default() as u8),
         });
         Self {
             shared,
@@ -106,22 +118,48 @@ impl GenWorkerPool {
             return handles.len();
         }
         self.shared.stop.store(false, Ordering::Release);
-        let target = default_worker_count();
-        for idx in 0..target {
-            let shared_clone = Arc::clone(&self.shared);
-            if let Ok(handle) = thread::Builder::new()
-                .name(format!("ds-worldgen-{idx}"))
-                .spawn(move || worker_loop(shared_clone))
-            {
-                handles.push(handle);
-            }
-        }
+        let target = self.shared.target_threads.load(Ordering::Acquire);
+        spawn_workers(&self.shared, &mut handles, target);
         let spawned = handles.len();
         self.max_in_flight.store(
             spawned * MAX_RETRIEVAL_REQUESTS_PER_THREAD,
             Ordering::Release,
         );
         spawned
+    }
+
+    /// Apply a DH thread preset. Spawns extra workers or retires the highest-indexed ones
+    /// (they finish their current batch, then exit) and rescales the retrieval cap
+    /// (`GeneratedFullDataSourceProvider.getMaxRetrievalQueueCount()` = 20 * threads).
+    pub fn reconfigure(&self, preset: ThreadPreset) {
+        let target = preset.thread_count(logical_cpus());
+        if self.shared.preset.load(Ordering::Acquire) == preset as u8
+            && self.worker_count() == target
+        {
+            return;
+        }
+        self.shared.preset.store(preset as u8, Ordering::Release);
+        self.shared.target_threads.store(target, Ordering::Release);
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        if handles.is_empty() {
+            return; // not running; `ensure_started` picks the new target up
+        }
+        if handles.len() > target {
+            // Dropping a `JoinHandle` detaches; the worker sees `idx >= target` and exits.
+            handles.truncate(target);
+            self.shared.cv.notify_all();
+        } else {
+            spawn_workers(&self.shared, &mut handles, target);
+        }
+        self.max_in_flight.store(
+            handles.len() * MAX_RETRIEVAL_REQUESTS_PER_THREAD,
+            Ordering::Release,
+        );
+    }
+
+    /// Number of live worker threads.
+    pub fn worker_count(&self) -> usize {
+        self.handles.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn has_capacity(&self) -> bool {
@@ -153,6 +191,7 @@ impl GenWorkerPool {
         dimension: String,
         pos: SectionPos,
         generator: DetachedChunkGenerator,
+        saved_reader: Option<SavedChunkReader>,
         cells: Vec<(usize, usize)>,
     ) -> bool {
         if cells.is_empty() {
@@ -195,6 +234,7 @@ impl GenWorkerPool {
             dimension,
             pos,
             generator,
+            saved_reader,
             cells,
         });
         self.shared.cv.notify_one();
@@ -374,14 +414,33 @@ fn clear_in_flight_if_matching(shared: &Shared, dim: &str, pos: SectionPos, job_
     }
 }
 
-fn worker_loop(shared: Arc<Shared>) {
+fn spawn_workers(shared: &Arc<Shared>, handles: &mut Vec<JoinHandle<()>>, target: usize) {
+    while handles.len() < target {
+        let idx = handles.len();
+        let shared_clone = Arc::clone(shared);
+        match thread::Builder::new()
+            .name(format!("ds-worldgen-{idx}"))
+            .spawn(move || worker_loop(shared_clone, idx))
+        {
+            Ok(handle) => handles.push(handle),
+            Err(_) => break,
+        }
+    }
+}
+
+fn worker_loop(shared: Arc<Shared>, idx: usize) {
     loop {
         let job = {
             let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-            while q.is_empty() && !shared.stop.load(Ordering::Acquire) {
+            while q.is_empty()
+                && !shared.stop.load(Ordering::Acquire)
+                && idx < shared.target_threads.load(Ordering::Acquire)
+            {
                 q = shared.cv.wait(q).unwrap_or_else(|e| e.into_inner());
             }
-            if shared.stop.load(Ordering::Acquire) {
+            if shared.stop.load(Ordering::Acquire)
+                || idx >= shared.target_threads.load(Ordering::Acquire)
+            {
                 return;
             }
             q.pop_front()
@@ -395,16 +454,53 @@ fn worker_loop(shared: Arc<Shared>) {
             continue;
         }
 
+        let busy_start = std::time::Instant::now();
         let (ox, oz) = job.pos.block_origin();
         let step = job.pos.cell_size();
         let half = step >> 1;
 
         let run_result = catch_unwind(AssertUnwindSafe(|| {
             let mut samples = Vec::with_capacity(job.cells.len());
+            let mut saved_chunks: Vec<([i32; 2], ChunkSnapshot)> = Vec::new();
             let mut outcome = GenOutcome::Complete;
             let mut query = Vec::with_capacity(WORKER_CHUNK_COLS);
+            let mut fallback_cells: Vec<(usize, usize)> = Vec::with_capacity(job.cells.len());
 
-            for chunk in job.cells.chunks(WORKER_CHUNK_COLS) {
+            // G3: a detail-0 section is 4x4 chunks; ingest every already-saved chunk straight
+            // from Anvil storage. Coarser sections are filled by downsampling their children.
+            if job.pos.detail == 0
+                && let Some(reader) = job.saved_reader.as_ref()
+            {
+                let mut chunk_state: HashMap<[i32; 2], bool> = HashMap::new();
+                for &(cx, cz) in &job.cells {
+                    let chunk = [(ox + cx as i32) >> 4, (oz + cz as i32) >> 4];
+                    let saved = match chunk_state.get(&chunk) {
+                        Some(&known) => known,
+                        None => {
+                            if !is_job_valid(&shared, &job) {
+                                return (samples, saved_chunks, Vec::new(), GenOutcome::Cancelled);
+                            }
+                            let found = match reader.read(chunk) {
+                                Ok(Some(snap)) => {
+                                    saved_chunks.push((chunk, snap));
+                                    true
+                                }
+                                Ok(None) | Err(_) => false,
+                            };
+                            chunk_state.insert(chunk, found);
+                            found
+                        }
+                    };
+                    if !saved {
+                        fallback_cells.push((cx, cz));
+                    }
+                }
+            } else {
+                fallback_cells.extend_from_slice(&job.cells);
+            }
+
+            // G4: everything not saved is sampled by the detached generator.
+            for chunk in fallback_cells.chunks(WORKER_CHUNK_COLS) {
                 if !is_job_valid(&shared, &job) {
                     outcome = GenOutcome::Cancelled;
                     break;
@@ -424,13 +520,20 @@ fn worker_loop(shared: Arc<Shared>) {
                     }
                 }
             }
-            (samples, outcome)
+            (samples, saved_chunks, fallback_cells, outcome)
         }));
 
-        let (samples, outcome) = match run_result {
-            Ok(pair) => pair,
-            Err(_) => (Vec::new(), GenOutcome::Error),
+        let (samples, saved_chunks, cells, outcome) = match run_result {
+            Ok(parts) => parts,
+            Err(_) => (Vec::new(), Vec::new(), Vec::new(), GenOutcome::Error),
         };
+
+        // DH `threadRunTimeRatio`: idle for `busy * (1/ratio - 1)` so the thread runs `ratio` of
+        // the time (`MinimalImpact` = 0.5, every other preset 1.0).
+        let ratio = ThreadPreset::from_u8(shared.preset.load(Ordering::Acquire)).run_time_ratio();
+        if ratio < 1.0 {
+            thread::sleep(busy_start.elapsed().mul_f64(1.0 / ratio - 1.0));
+        }
 
         if outcome == GenOutcome::Cancelled {
             clear_in_flight_if_matching(&shared, &job.dimension, job.pos, job.job_id);
@@ -447,8 +550,9 @@ fn worker_loop(shared: Arc<Shared>) {
                 dim_epoch: job.dim_epoch,
                 dimension: job.dimension,
                 pos: job.pos,
-                cells: job.cells,
+                cells,
                 samples,
+                saved_chunks,
                 outcome,
             });
     }
