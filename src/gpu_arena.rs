@@ -44,31 +44,15 @@ pub const MODEL_WORDS: u64 = 16;
 pub const MODEL_COUNT: u64 = 1 << 20;
 pub const BIOME_COUNT: u64 = 1 << 9;
 
-/// Device limits the arena sizes itself against (`wgpu::Limits`, ruling point 9).
-#[derive(Clone, Copy, Debug)]
-pub struct DeviceBufferLimits {
-    pub max_buffer_size: u64,
-    pub max_storage_buffer_binding_size: u64,
-}
+/// Geometry arena size requested first: Voxy's cap (`min(next_pow2(ssbo_max) << 1, 1<<32) - 1024`)
+/// assuming a 2 GiB binding limit. The game reports no device limits, so [`GpuArena::new`] halves
+/// the request until `create_storage_buffer` accepts it.
+pub const VOXY_GEOMETRY_BYTES: u64 = (1 << 32) - 1024;
 
-impl DeviceBufferLimits {
-    fn max_bound_buffer(self) -> u64 {
-        self.max_buffer_size
-            .min(self.max_storage_buffer_binding_size)
-    }
-}
+/// Smallest geometry arena worth running with.
+const MIN_GEOMETRY_BYTES: u64 = 64 << 20;
 
-/// Geometry arena size Voxy requests (`RenderResourceReuse.getGeometryBufferSize`):
-/// `min((next_pow2(ssbo_max) << 1), 1<<32) - 1024`, never below 512 MiB. Voxy's extra
-/// vendor-specific clamps and its free-VRAM query have no wgpu equivalent; the device limits
-/// clamp the result in [`GpuArena::new`].
-pub fn voxy_geometry_capacity(max_storage_buffer_binding_size: u64) -> u64 {
-    let x = max_storage_buffer_binding_size.max(2);
-    let pow2 = 1u64 << (64 - (x - 1).leading_zeros());
-    ((pow2 << 1).min(1 << 32) - 1024).max(512 * 1024 * 1024)
-}
-
-/// Requested arena capacities; clamped to the device limits at creation.
+/// Requested arena capacities; halved at creation until the device accepts them.
 #[derive(Clone, Copy, Debug)]
 pub struct ArenaConfig {
     pub max_sections: u32,
@@ -449,37 +433,69 @@ pub struct GpuArena {
 }
 
 impl GpuArena {
-    pub fn new(
+    pub fn new(host: &mut dyn ClientHost, config: ArenaConfig) -> Result<Self, ArenaError> {
+        let mut sections = config.max_sections.max(1);
+        let mut geometry = config.geometry_bytes.max(MIN_GEOMETRY_BYTES);
+        loop {
+            match Self::try_new(host, sections, geometry) {
+                Ok(arena) => return Ok(arena),
+                Err(ArenaError::Buffer(_))
+                    if geometry > MIN_GEOMETRY_BYTES || sections > 1 << 14 =>
+                {
+                    geometry = (geometry / 2).max(MIN_GEOMETRY_BYTES);
+                    sections = (sections / 2).max(1 << 14);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn try_new(
         host: &mut dyn ClientHost,
-        limits: DeviceBufferLimits,
-        config: ArenaConfig,
+        max_sections: u32,
+        geometry_bytes: u64,
     ) -> Result<Self, ArenaError> {
-        let bound = limits.max_bound_buffer();
-        let per_section_bytes =
-            SECTION_METADATA_BYTES.max(OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES);
-        let max_sections = (config.max_sections as u64).min(bound / per_section_bytes) as u32;
-        let geometry_bytes = config.geometry_bytes.min(bound) / QUAD_BYTES * QUAD_BYTES;
+        let geometry_bytes = geometry_bytes / QUAD_BYTES * QUAD_BYTES;
         let n = max_sections as u64;
-        let quads = host.create_storage_buffer(&StorageBufferDescriptor::new(geometry_bytes))?;
-        let sections =
-            host.create_storage_buffer(&StorageBufferDescriptor::new(n * SECTION_METADATA_BYTES))?;
-        let opaque_commands = host.create_storage_buffer(
-            &StorageBufferDescriptor::new(
+        let mut made: Vec<StorageBufferRef> = Vec::new();
+        let mut make = |host: &mut dyn ClientHost, desc: StorageBufferDescriptor| match host
+            .create_storage_buffer(&desc)
+        {
+            Ok(b) => {
+                made.push(b);
+                Ok(b)
+            }
+            Err(e) => {
+                for b in made.drain(..) {
+                    let _ = host.storage_buffer_release(b);
+                }
+                Err(ArenaError::from(e))
+            }
+        };
+        let quads = make(host, StorageBufferDescriptor::new(geometry_bytes))?;
+        let sections = make(
+            host,
+            StorageBufferDescriptor::new(n * SECTION_METADATA_BYTES),
+        )?;
+        let opaque_commands = make(
+            host,
+            StorageBufferDescriptor::new(
                 n * OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES,
             )
             .indirect(true),
         )?;
-        let translucent_commands = host.create_storage_buffer(
-            &StorageBufferDescriptor::new(
+        let translucent_commands = make(
+            host,
+            StorageBufferDescriptor::new(
                 n * TRANSLUCENT_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES,
             )
             .indirect(true),
         )?;
-        let models = host.create_storage_buffer(&StorageBufferDescriptor::new(
-            (MODEL_COUNT * MODEL_WORDS * 4).min(bound) / 4 * 4,
-        ))?;
-        let biome_tints =
-            host.create_storage_buffer(&StorageBufferDescriptor::new(BIOME_COUNT * 3 * 4))?;
+        let models = make(
+            host,
+            StorageBufferDescriptor::new(MODEL_COUNT * MODEL_WORDS * 4),
+        )?;
+        let biome_tints = make(host, StorageBufferDescriptor::new(BIOME_COUNT * 3 * 4))?;
         Ok(Self {
             models,
             biome_tints,
@@ -548,7 +564,7 @@ impl GpuArena {
         for q in &section.quads {
             bytes.extend_from_slice(&q.to_bytes());
         }
-        if let Err(e) = self.quads.write_range(host, start * QUAD_BYTES, &bytes) {
+        if let Err(e) = host.storage_buffer_write_range(self.quads, start * QUAD_BYTES, &bytes) {
             self.ids.free(id);
             self.quad_alloc.free(start);
             return Err(e.into());
@@ -579,8 +595,11 @@ impl GpuArena {
         let mut next = 0u32;
         for (id, meta) in dirty {
             if !run.is_empty() && id != next {
-                self.sections
-                    .write_range(host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
+                host.storage_buffer_write_range(
+                    self.sections,
+                    run_start as u64 * SECTION_METADATA_BYTES,
+                    &run,
+                )?;
                 run.clear();
             }
             if run.is_empty() {
@@ -590,8 +609,11 @@ impl GpuArena {
             next = id + 1;
         }
         if !run.is_empty() {
-            self.sections
-                .write_range(host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
+            host.storage_buffer_write_range(
+                self.sections,
+                run_start as u64 * SECTION_METADATA_BYTES,
+                &run,
+            )?;
         }
         Ok(())
     }
@@ -604,8 +626,7 @@ impl GpuArena {
         words: &[u32],
     ) -> Result<(), ArenaError> {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        self.models
-            .write_range(host, first_model as u64 * MODEL_WORDS * 4, &bytes)?;
+        host.storage_buffer_write_range(self.models, first_model as u64 * MODEL_WORDS * 4, &bytes)?;
         Ok(())
     }
 
@@ -617,8 +638,7 @@ impl GpuArena {
         words: &[u32],
     ) -> Result<(), ArenaError> {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        self.biome_tints
-            .write_range(host, first_biome as u64 * 12, &bytes)?;
+        host.storage_buffer_write_range(self.biome_tints, first_biome as u64 * 12, &bytes)?;
         Ok(())
     }
 
@@ -626,12 +646,12 @@ impl GpuArena {
     /// otherwise survives resource reload and world close (ruling point 2). To empty it on a
     /// world change, `remove` each section instead.
     pub fn release(self, host: &mut dyn ClientHost) -> Result<(), ArenaError> {
-        self.quads.release(host)?;
-        self.sections.release(host)?;
-        self.opaque_commands.release(host)?;
-        self.translucent_commands.release(host)?;
-        self.models.release(host)?;
-        self.biome_tints.release(host)?;
+        host.storage_buffer_release(self.quads)?;
+        host.storage_buffer_release(self.sections)?;
+        host.storage_buffer_release(self.opaque_commands)?;
+        host.storage_buffer_release(self.translucent_commands)?;
+        host.storage_buffer_release(self.models)?;
+        host.storage_buffer_release(self.biome_tints)?;
         Ok(())
     }
 }
@@ -659,15 +679,6 @@ mod tests {
         assert_eq!(f.free(0), Some(30));
         assert_eq!(f.used(), 0);
         assert_eq!(f.alloc(100), Some(0));
-    }
-
-    #[test]
-    fn voxy_capacity_formula() {
-        // ssbo max 2 GiB -> pow2 2 GiB -> <<1 = 4 GiB -> min(4 GiB, 4 GiB) - 1024.
-        assert_eq!(voxy_geometry_capacity(2 << 30), (1 << 32) - 1024);
-        // Small limits are raised to Voxy's 512 MiB floor.
-        assert_eq!(voxy_geometry_capacity(1 << 20), 512 << 20);
-        assert_eq!(voxy_geometry_capacity((1 << 30) + 1), (1 << 32) - 1024);
     }
 
     #[test]

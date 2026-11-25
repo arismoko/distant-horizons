@@ -249,18 +249,11 @@ impl Hooks for DistantHorizonsMod {
         if host.on(MOD_ID) {
             let dim = runtime().inner.lock().unwrap().active_dimension.clone();
             pipeline::client_tick(host, &dim);
-            let limits = host.device_buffer_limits();
             let _ = render_bridge::upload_pending(
                 host,
-                gpu_arena::DeviceBufferLimits {
-                    max_buffer_size: limits.max_buffer_size,
-                    max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
-                },
                 gpu_arena::ArenaConfig {
                     max_sections: gpu_arena::VOXY_MAX_SECTIONS,
-                    geometry_bytes: gpu_arena::voxy_geometry_capacity(
-                        limits.max_storage_buffer_binding_size,
-                    ),
+                    geometry_bytes: gpu_arena::VOXY_GEOMETRY_BYTES,
                 },
             );
         }
