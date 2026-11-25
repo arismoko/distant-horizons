@@ -1,4 +1,4 @@
-use mod_api::{ClientHost, Host, Registrar, SettingKey, SettingSpec};
+use mod_api::{Host, Registrar, SettingKey, SettingSpec};
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
@@ -418,13 +418,11 @@ impl DhConfig {
                 registered.insert(name, key);
             }
         }
-        if let Ok(mut guard) = key_store().write() {
+        if !registered.is_empty()
+            && let Ok(mut guard) = key_store().write()
+        {
             *guard = registered;
         }
-    }
-
-    pub fn read_from_client(host: &dyn ClientHost) -> Self {
-        Self::read_from_host(host)
     }
 
     pub fn read_from_host(host: &dyn Host) -> Self {

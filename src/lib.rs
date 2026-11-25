@@ -1,8 +1,8 @@
 //! Distant Sunrises native mod for Sunrise.
 //!
 //! Stage 1 architecture:
-//! - Server side samples loaded chunks (`read_columns`) and distant ungenerated terrain
-//!   (`terrain_surface`) during `level_tick_post` under `host.server_has_time()` budgeting,
+//! - Server side samples loaded chunks (`ChunkSnapshot`) and distant ungenerated terrain
+//!   (`DetachedChunkGenerator::sample_surface_columns`) during `level_tick_post` under `host.server_has_time()` budgeting,
 //!   downsamples into the multi-detail-level quadtree, and persists RLE-compressed sections to
 //!   `<world_dir>/distant_sunrises/<dimension>/` on a background IO worker.
 //! - Background meshing worker generates greedy-merged, face-culled solid and fluid meshes.
@@ -62,16 +62,16 @@ const LOADED_SCAN_ABOVE: u32 = 2;
 
 /// Number of loaded chunks sampled per server tick when time remains.
 const CHUNKS_PER_TICK: usize = 4;
-/// Per-tick wall-time budget for synchronous server-thread `terrain_surface` fallback batches
+/// Per-tick wall-time budget for synchronous server-thread detached-generator fallback batches
 /// (8% of a 50 ms server tick). On fast CPUs multiple 64-column batches run per tick within this
 /// budget; if a single batch exceeds it on a slower CPU, a post-completion cooldown of
 /// `elapsed * DISTANT_SAMPLE_COOLDOWN_MULT` (capped at `DISTANT_SAMPLE_MAX_COOLDOWN`) keeps the
-/// server thread under ~10% duty cycle until off-thread detached generation lands.
+/// server thread under ~10% duty cycle until off-thread worker generation lands.
 const DISTANT_SAMPLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
 const DISTANT_SAMPLE_MAX_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(250);
 const DISTANT_SAMPLE_COOLDOWN_MULT: u32 = 9;
 
-/// Number of empty cells sampled per synchronous server-thread `terrain_surface` batch (taken in
+/// Number of empty cells sampled per synchronous server-thread detached-generator batch (taken in
 /// row-major order from the nearest unsampled section).
 const DISTANT_COLS_PER_TICK: usize = 64;
 
@@ -223,7 +223,7 @@ impl Hooks for DistantHorizonsMod {
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
         let rt = runtime();
-        let cfg = DhConfig::read_from_client(host);
+        let cfg = DhConfig::read_from_host(host);
         rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
 
         if host.playing() {
@@ -242,7 +242,7 @@ impl Hooks for DistantHorizonsMod {
 
         let remote_batch = {
             let mut st = rt.inner.lock().unwrap();
-            st.config = DhConfig::read_from_client(host);
+            st.config = DhConfig::read_from_host(host);
             st.vanilla_render_distance_chunks = gfx_opts.render_distance.max(2);
             st.rain_level = rain_level.clamp(0.0, 1.0);
             st.thunder_level = thunder_level.clamp(0.0, 1.0);
@@ -471,7 +471,7 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     let rt = runtime();
     let world_dir = host.world_dir();
 
-    // 1. Sample a small batch of newly loaded / modified chunks via `read_columns`.
+    // 1. Sample a small batch of newly loaded / modified chunks via `ChunkSnapshot`.
     let chunks_to_sample: Vec<[i32; 2]> = {
         let mut st = rt.inner.lock().unwrap();
         if st.world_dir.is_none() && world_dir.is_some() {
@@ -631,6 +631,7 @@ fn sample_loaded_chunks(
         })
         .collect();
 
+    let mut block_id_cache: HashMap<mod_api::BlockState, &str> = HashMap::new();
     let mut chunk_beacons: Vec<Vec<BeaconBeam>> = vec![Vec::new(); chunks.len()];
 
     let rt = runtime();
@@ -661,10 +662,12 @@ fn sample_loaded_chunks(
 
                 // Scan top-down through the sampled band for surface + any sky-visible beacon & stained glass tint.
                 for y in (y_min..=y_max).rev() {
-                    let block_id = snap
-                        .block_state(lx, y, lz)
-                        .and_then(|state| state.block().id(host))
-                        .unwrap_or("minecraft:air");
+                    let block_id = match snap.block_state(lx, y, lz) {
+                        Some(state) => *block_id_cache
+                            .entry(state)
+                            .or_insert_with(|| state.block().id(host).unwrap_or("minecraft:stone")),
+                        None => "minecraft:air",
+                    };
                     if block_id == "minecraft:beacon" {
                         beacon_y = Some(y);
                     }
@@ -687,10 +690,12 @@ fn sample_loaded_chunks(
 
                 if let Some(by) = beacon_y {
                     for y in (by + 1)..=y_max {
-                        let block_id = snap
-                            .block_state(lx, y, lz)
-                            .and_then(|state| state.block().id(host))
-                            .unwrap_or("minecraft:air");
+                        let block_id = match snap.block_state(lx, y, lz) {
+                            Some(state) => *block_id_cache.entry(state).or_insert_with(|| {
+                                state.block().id(host).unwrap_or("minecraft:stone")
+                            }),
+                            None => "minecraft:air",
+                        };
                         if let Some(glass_rgb) = stained_glass_tint(block_id) {
                             beacon_tint = Some(blend_beacon_tint(beacon_tint, glass_rgb));
                         }
@@ -836,6 +841,7 @@ fn sample_distant_sections(
 
     let budget_start = std::time::Instant::now();
     let mut ran_any = false;
+    let mut detached_gen: Option<Option<mod_api::DetachedChunkGenerator>> = None;
 
     loop {
         let (target_section, custom_gen, builtin_disabled) = {
@@ -887,7 +893,7 @@ fn sample_distant_sections(
         };
 
         // If a mod registered a custom `LodWorldGenerator` covering this detail level, delegate
-        // generation to it instead of calling built-in `terrain_surface`.
+        // generation to it instead of calling built-in `DetachedChunkGenerator`.
         if let Some(generator) = custom_gen
             && generator.detail_range().contains(&pos.detail)
         {
@@ -940,9 +946,10 @@ fn sample_distant_sections(
             })
             .collect();
 
-        let Some(samples) = host
-            .level(dim)
-            .and_then(|l| l.detached_generator(host))
+        let gen = detached_gen
+            .get_or_insert_with(|| host.level(dim).and_then(|l| l.detached_generator(host)));
+        let Some(samples) = gen
+            .as_ref()
             .and_then(|g| g.sample_surface_columns(&query_cols).ok())
         else {
             let cooldown = (budget_start.elapsed() * DISTANT_SAMPLE_COOLDOWN_MULT)

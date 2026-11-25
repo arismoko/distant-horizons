@@ -14,7 +14,7 @@ use crate::config::{
 use crate::render_bridge::{runtime, stats};
 use mod_api::{
     ClientCommandRegistration, ClientHost, ClientSetupContext, Command, CommandArgumentValue,
-    CommandInvocation, Flow, KeyConflictContext, KeyRegistration, ModKeyMappingRef, Registrar,
+    CommandInvocation, KeyConflictContext, KeyRegistration, ModKeyMappingRef, Registrar,
     SettingValue, Text,
 };
 use std::sync::atomic::Ordering;
@@ -115,11 +115,16 @@ pub fn register_client_commands(commands: &mut Vec<ClientCommandRegistration>) {
     let usages = [
         "",
         " status",
+        " stats",
         " toggle",
         " radius <chunks:integer>",
+        " distance <chunks:integer>",
         " quality <preset:word>",
+        " vquality <level:integer>",
         " preset <preset:word>",
         " fog <mode:word>",
+        " fade <mode:word>",
+        " noise <mode:word>",
         " heightfog <mode:word>",
         " ssao <mode:word>",
         " sharpen <mode:word>",
@@ -152,23 +157,6 @@ fn handle_client_invocation(host: &mut dyn ClientHost, inv: &CommandInvocation) 
         _ => None,
     });
     dispatch_client_command(host, sub, arg_owned.as_deref());
-}
-
-/// Execute `/ds ...` or `/distantsunrises ...` typed in chat.
-pub fn handle_client_command(host: &mut dyn ClientHost, raw: &str) -> Flow {
-    let trimmed = raw.trim().trim_start_matches('/');
-    let mut parts = trimmed.split_whitespace();
-    let Some(root) = parts.next() else {
-        return Flow::Continue;
-    };
-    if !root.eq_ignore_ascii_case("ds") && !root.eq_ignore_ascii_case("distantsunrises") {
-        return Flow::Continue;
-    }
-
-    let sub = parts.next().unwrap_or("status");
-    let arg = parts.next();
-    dispatch_client_command(host, sub, arg);
-    Flow::Cancel
 }
 
 fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&str>) {
@@ -499,7 +487,7 @@ fn quality_label_key(q: u32) -> &'static str {
 }
 
 fn refresh_config(host: &dyn ClientHost) -> DhConfig {
-    let cfg = DhConfig::read_from_client(host);
+    let cfg = DhConfig::read_from_host(host);
     let rt = runtime();
     rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
     rt.inner.lock().unwrap().config = cfg;
@@ -507,14 +495,14 @@ fn refresh_config(host: &dyn ClientHost) -> DhConfig {
 }
 
 fn toggle_enabled(host: &mut dyn ClientHost) -> bool {
-    let current = DhConfig::read_from_client(host).enabled;
+    let current = DhConfig::read_from_host(host).enabled;
     let next = !current;
     write_setting(host, KEY_ENABLED, SettingValue::Toggle(next));
     refresh_config(host).enabled
 }
 
 fn cycle_horizontal_quality(host: &mut dyn ClientHost) -> u32 {
-    let cur = DhConfig::read_from_client(host).horizontal_quality;
+    let cur = DhConfig::read_from_host(host).horizontal_quality;
     let next = (cur + 1) % 3;
     write_setting(
         host,
@@ -566,7 +554,7 @@ struct QualityPreset {
     v_qual: u32,
     ssao_q: u32,
     ssao_on: bool,
-    sharpen: f32,
+    sharpen: f64,
     label_key: &'static str,
 }
 
@@ -592,11 +580,7 @@ fn apply_preset(host: &mut dyn ClientHost, p: QualityPreset) {
         KEY_SSAO_QUALITY,
         SettingValue::Choice(p.ssao_q as usize),
     );
-    write_setting(
-        host,
-        KEY_SHARPENING_AMOUNT,
-        SettingValue::Range(f64::from(p.sharpen)),
-    );
+    write_setting(host, KEY_SHARPENING_AMOUNT, SettingValue::Range(p.sharpen));
     refresh_config(host);
     let _ = host.chat_line(Text::translate(
         "distantsunrises.command.preset_set",
