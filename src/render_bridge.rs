@@ -53,10 +53,13 @@ fn id(text: &str) -> mod_api::Identifier {
     mod_api::Identifier::parse(text).expect("static identifier")
 }
 
-/// A storage-buffer layout entry (`std430`, set 1). The GLSL block must be at least as large as
-/// the bound slice.
-fn storage(name: &str, read_only: bool) -> mod_api::BindEntry {
-    mod_api::BindEntry::new(name, mod_api::BindingKind::StorageBuffer { read_only })
+/// A storage-buffer layout entry (`std430`, set 1). `min_size` is the size of the GLSL block's
+/// fixed part (one array element): the bound slice must hold at least that.
+fn storage(name: &str, read_only: bool, min_size: u32) -> mod_api::BindEntry {
+    mod_api::BindEntry::new(
+        name,
+        mod_api::BindingKind::StorageBuffer { read_only, min_size },
+    )
 }
 
 /// The quad pipelines' set-1 layout (`voxy_quads.vsh/fsh`).
@@ -64,10 +67,10 @@ pub fn quad_layout() -> mod_api::BindGroupLayout {
     use mod_api::{SamplerAddress, SamplerFilter};
     mod_api::BindGroupLayout::builder()
         .uniform_buffer("QuadParams", 160)
-        .entry(storage("QuadBuffer", true))
-        .entry(storage("SectionBuffer", true))
-        .entry(storage("ModelBuffer", true))
-        .entry(storage("BiomeTintBuffer", true))
+        .entry(storage("QuadBuffer", true, 8))
+        .entry(storage("SectionBuffer", true, 32))
+        .entry(storage("ModelBuffer", true, 64))
+        .entry(storage("BiomeTintBuffer", true, 4))
         .sampler(
             "BlockAtlas",
             SamplerFilter::Nearest,
@@ -86,10 +89,10 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
             "SceneUniform",
             crate::shader_pack::PACK_SCENE_UNIFORM_SIZE as u32,
         )
-        .entry(storage("QuadArena", true))
-        .entry(storage("SectionBuffer", true))
-        .entry(storage("ModelBuffer", true))
-        .entry(storage("BiomeTintBuffer", true))
+        .entry(storage("QuadArena", true, 8))
+        .entry(storage("SectionBuffer", true, 32))
+        .entry(storage("ModelBuffer", true, 64))
+        .entry(storage("BiomeTintBuffer", true, 4))
         .sampler(
             "BlockAtlas",
             SamplerFilter::Nearest,
