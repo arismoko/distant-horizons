@@ -21,7 +21,9 @@
 //! one fixed slot per `(section id, bucket)`, rewritten every frame by `voxy_cmdgen.csh`, so the
 //! draw count is simply the id high-water mark times the bucket count.
 
-use mod_api::{BufferError, ClientHost, StorageBufferDescriptor, StorageBufferRef};
+use mod_api::{
+    BufferError, ClientHost, StorageBufferDescriptor, StorageBufferRef, StorageBufferSlice,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Bytes per packed quad (Voxy `BufferArena(geometryCapacity, 8)`).
@@ -412,6 +414,17 @@ impl From<BufferError> for ArenaError {
     }
 }
 
+/// Whole-buffer [`StorageBufferSlice`]s of the arena's bound buffers.
+#[derive(Clone, Copy)]
+pub struct ArenaSlices {
+    pub quads: StorageBufferSlice,
+    pub sections: StorageBufferSlice,
+    pub opaque_commands: StorageBufferSlice,
+    pub translucent_commands: StorageBufferSlice,
+    pub models: StorageBufferSlice,
+    pub biome_tints: StorageBufferSlice,
+}
+
 /// The persistent GPU buffers plus their CPU-side allocators.
 pub struct GpuArena {
     pub quads: StorageBufferRef,
@@ -424,6 +437,8 @@ pub struct GpuArena {
     pub models: StorageBufferRef,
     /// Biome tint LUT: grass, foliage, water `0x00BBGGRR` per 9-bit biome id.
     pub biome_tints: StorageBufferRef,
+    /// Whole-buffer slices for set-1 bindings.
+    pub slices: ArenaSlices,
     max_sections: u32,
     quad_alloc: FreeList,
     ids: IdAllocator,
@@ -496,7 +511,20 @@ impl GpuArena {
             StorageBufferDescriptor::new(MODEL_COUNT * MODEL_WORDS * 4),
         )?;
         let biome_tints = make(host, StorageBufferDescriptor::new(BIOME_COUNT * 3 * 4))?;
+        let cmd_bytes = n * OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
+        let tcmd_bytes = n * TRANSLUCENT_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
+        let model_bytes = MODEL_COUNT * MODEL_WORDS * 4;
+        let biome_bytes = BIOME_COUNT * 3 * 4;
+        let slices = ArenaSlices {
+            quads: quads.slice(0, geometry_bytes),
+            sections: sections.slice(0, n * SECTION_METADATA_BYTES),
+            opaque_commands: opaque_commands.slice(0, cmd_bytes),
+            translucent_commands: translucent_commands.slice(0, tcmd_bytes),
+            models: models.slice(0, model_bytes),
+            biome_tints: biome_tints.slice(0, biome_bytes),
+        };
         Ok(Self {
+            slices,
             models,
             biome_tints,
             quads,

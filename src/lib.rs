@@ -94,19 +94,39 @@ impl Hooks for DistantHorizonsMod {
         render_bridge::register_pipelines(event);
     }
 
+    fn prepare_render_buffers(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::PrepareRenderBuffersEvent<'_>,
+    ) {
+        if !host.on(MOD_ID) {
+            return;
+        }
+        let camera = stage3_camera::CameraMatrices::from_camera(event.view.camera);
+        render_bridge::begin_frame(camera.position);
+        render_bridge::prepare_draws(host, &camera, event.context);
+    }
+
+    fn frame_graph_setup(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::FrameGraphSetupEvent<'_>,
+    ) {
+        if !host.on(MOD_ID) {
+            return;
+        }
+        let camera = stage3_camera::CameraMatrices::from_camera(event.view.camera);
+        render_bridge::setup_compute(host, &camera, event.graph);
+    }
+
     fn render_level_stage(
         &self,
         host: &dyn ClientHost,
         event: &mut mod_api::RenderLevelStageEvent<'_>,
     ) {
-        if event.stage != mod_api::RenderLevelStage::AfterOpaqueBlocks || !host.on(MOD_ID) {
-            return;
+        if host.on(MOD_ID) {
+            render_bridge::draw_stage(event.stage, event.context);
         }
-        let Some(camera) = runtime().inner.lock().unwrap().camera else {
-            return;
-        };
-        let (frame, _, _, _) = render_bridge::begin_render_frame(camera.position);
-        render_bridge::record_stage(host, event, &frame, &camera);
     }
 
     fn client_setup(&self, host: &mut dyn ClientSetupContext, _event: &mut ClientSetupEvent) {

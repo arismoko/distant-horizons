@@ -35,8 +35,8 @@ use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
 pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
 pub const SHADER_COMPOSITE: &str = "distantsunrises:core/voxy_composite";
-pub const SHADER_HIZ: &str = "distantsunrises:compute/voxy_hiz";
-pub const SHADER_CMDGEN: &str = "distantsunrises:compute/voxy_cmdgen";
+pub const SHADER_HIZ: &str = "distantsunrises:voxy_hiz";
+pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
 
 pub const PIPELINE_OPAQUE: &str = "distantsunrises:voxy_opaque";
 pub const PIPELINE_TRANSLUCENT: &str = "distantsunrises:voxy_translucent";
@@ -168,6 +168,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
                 .optional(),
         );
     }
+    register_compute(event);
     event.register(
         RenderPipeline::new(
             id(PIPELINE_COMPOSITE),
@@ -197,6 +198,59 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
                 .build()
                 .expect("static composite layout"),
         ),
+    );
+}
+
+/// Hi-Z copy / reduce and command generation (`assets/distantsunrises/shaders/compute`).
+fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
+    use mod_api::{
+        BindGroupLayout, ComputePipeline, SamplerAddress, SamplerFilter, StorageImageAccess,
+    };
+    let hiz_layout = || {
+        BindGroupLayout::builder()
+            .uniform_buffer("HizParams", 16)
+            .sampler(
+                "HizSource",
+                SamplerFilter::Nearest,
+                SamplerAddress::ClampToEdge,
+            )
+            .entry(mod_api::BindEntry::new(
+                "HizDest",
+                mod_api::BindingKind::StorageImage {
+                    access: StorageImageAccess::WriteOnly,
+                },
+            ))
+            .build()
+            .expect("static hiz layout")
+    };
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_hiz_copy"), id(SHADER_HIZ))
+            .bind_group_layout(hiz_layout())
+            .define("HIZ_FROM_WORLD_DEPTH")
+            .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_hiz_reduce"), id(SHADER_HIZ))
+            .bind_group_layout(hiz_layout())
+            .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_cmdgen"), id(SHADER_CMDGEN))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .uniform_buffer("CmdgenParams", 112)
+                    .entry(storage("SectionBuffer", true, 32))
+                    .entry(storage("OpaqueCommands", false, 20))
+                    .entry(storage("TranslucentCommands", false, 20))
+                    .sampler(
+                        "HizPyramid",
+                        SamplerFilter::Nearest,
+                        SamplerAddress::ClampToEdge,
+                    )
+                    .build()
+                    .expect("static cmdgen layout"),
+            )
+            .build(),
     );
 }
 
@@ -352,6 +406,8 @@ pub type SectionKey = (String, u8, [i32; 3]);
 
 struct ArenaState {
     arena: GpuArena,
+    /// Shared quad index pattern (`0,1,2,2,1,3` per quad) the indirect commands index into.
+    quad_mesh: mod_api::MeshRef,
     ids: HashMap<SectionKey, u32>,
 }
 
@@ -374,6 +430,29 @@ pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
     PENDING_SECTIONS.lock().unwrap().push((key, section));
 }
 
+/// Most quads one indirect command can span (a 32³ section's worth of faces in one bucket).
+const MAX_QUADS_PER_COMMAND: u32 = 1 << 16;
+
+/// A mesh holding only the shared quad index buffer; its one vertex binding is never read (the
+/// vertex stages pull quads from the arena by `gl_VertexID`).
+fn create_quad_mesh(
+    host: &mut dyn mod_api::ClientHost,
+) -> Result<mod_api::MeshRef, crate::gpu_arena::ArenaError> {
+    use mod_api::{IndexFormat, MeshBufferInit, MeshDescriptor, MeshIndexInit};
+    let mut bytes = Vec::with_capacity(MAX_QUADS_PER_COMMAND as usize * 24);
+    for q in 0..MAX_QUADS_PER_COMMAND {
+        for i in [0u32, 1, 2, 2, 1, 3] {
+            bytes.extend_from_slice(&(q * 4 + i).to_le_bytes());
+        }
+    }
+    let dummy = [0u8; 4];
+    let vertex = [MeshBufferInit::from_bytes(4, &dummy)];
+    let desc = MeshDescriptor::new(&vertex)
+        .with_indices(MeshIndexInit::from_bytes(IndexFormat::Uint32, &bytes));
+    host.create_mesh(&desc)
+        .map_err(|_| crate::gpu_arena::ArenaError::Buffer(mod_api::BufferError::Unavailable))
+}
+
 /// Creates the arena on first use (ruling 2: it then survives reloads and world close),
 /// uploads pending sections and flushes metadata. Call from `client_tick_pre`.
 pub fn upload_pending(
@@ -382,8 +461,10 @@ pub fn upload_pending(
 ) -> Result<(), crate::gpu_arena::ArenaError> {
     let mut guard = ARENA.lock().unwrap();
     if guard.is_none() {
+        let quad_mesh = create_quad_mesh(host)?;
         *guard = Some(ArenaState {
             arena: GpuArena::new(host, config)?,
+            quad_mesh,
             ids: HashMap::new(),
         });
     }
@@ -448,15 +529,126 @@ pub fn release_arena(
     }
 }
 
-/// Records one frame: Hi-Z build, cmdgen, the two indirect draws. Called from
-/// `Hooks::render_level_stage` at `AfterOpaqueBlocks`.
-pub fn record_stage(
+static FRAME_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The frame's parameters, set by [`begin_frame`] in `prepare_render_buffers`.
+static FRAME: Mutex<Option<RenderFrameParams>> = Mutex::new(None);
+
+/// Draws prepared in `prepare_render_buffers`, issued in their stage by [`draw_stage`].
+static PREPARED: Mutex<Vec<(mod_api::RenderLevelStage, mod_api::PreparedWorldDraw)>> =
+    Mutex::new(Vec::new());
+
+/// Stage the opaque LOD draw runs in; the Hi-Z/cmdgen compute node runs just before it, after
+/// the vanilla opaque blocks are in the depth buffer.
+pub const OPAQUE_STAGE: mod_api::RenderLevelStage = mod_api::RenderLevelStage::AfterOpaqueFeatures;
+/// Stage of the translucent LOD draw.
+pub const TRANSLUCENT_STAGE: mod_api::RenderLevelStage =
+    mod_api::RenderLevelStage::AfterTranslucentBlocks;
+
+/// Starts the frame: drains workers, stores the frame parameters and drops last frame's prepared
+/// draws. Called first from `Hooks::prepare_render_buffers`.
+pub fn begin_frame(camera: [f64; 3]) {
+    FRAME_ID.fetch_add(1, Ordering::Relaxed);
+    let (frame, _, _, _) = begin_render_frame(camera);
+    *FRAME.lock().unwrap() = Some(frame);
+    PREPARED.lock().unwrap().clear();
+}
+
+/// Registers the Hi-Z + cmdgen compute node of this frame in the frame graph. Called from
+/// `Hooks::frame_graph_setup`.
+pub fn setup_compute(
     host: &dyn mod_api::ClientHost,
-    event: &mut mod_api::RenderLevelStageEvent<'_>,
-    frame: &RenderFrameParams,
     camera: &CameraMatrices,
+    graph: &mut dyn mod_api::FrameGraphContext,
 ) {
-    use mod_api::{DrawBindings, IndirectDraw, TextureSource, UniformValue};
+    use mod_api::{
+        ComputePassDescriptor, DrawBindings, FrameTarget, RenderLevelStage, TextureSource,
+    };
+    let Some(frame) = FRAME.lock().unwrap().clone() else {
+        return;
+    };
+    let guard = ARENA.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return };
+    let arena = &state.arena;
+    let sections = arena.section_high_water();
+    if !frame.enabled || sections == 0 {
+        return;
+    }
+    let Some([w, h]) = host.window_size() else {
+        return;
+    };
+    let assets = host.render_assets();
+    let ids = ["voxy_hiz_copy", "voxy_hiz_reduce", "voxy_cmdgen"]
+        .map(|n| assets.compute_pipeline(&id(&format!("distantsunrises:{n}"))));
+    let [Ok(copy), Ok(reduce), Ok(cmdgen)] = ids else {
+        return;
+    };
+    let Some((hiz, _)) = ensure_hiz(host, [w, h]) else {
+        return;
+    };
+    let mips = hiz.mips;
+    let view_proj = camera.view_projection();
+    let desc = ComputePassDescriptor::new("distantsunrises:hiz_cmdgen")
+        .reads(FrameTarget::MainDepth)
+        .writes(FrameTarget::Mod(hiz.target))
+        .after_stage(RenderLevelStage::AfterOpaqueBlocks)
+        .before_stage(OPAQUE_STAGE);
+    let slices = arena.slices;
+    let _ = graph.add_compute_pass(desc, &mut |ctx| {
+        let groups = |n: u32| n.div_ceil(HIZ_WORKGROUP);
+        let (mut sw, mut sh) = (w, h);
+        for level in 0..mips {
+            let (dw, dh) = if level == 0 {
+                (w, h)
+            } else {
+                ((sw / 2).max(1), (sh / 2).max(1))
+            };
+            let params = Std140(Vec::new())
+                .i32s(&[sw as i32, sh as i32, dw as i32, dh as i32])
+                .0;
+            let source = if level == 0 {
+                TextureSource::WorldDepth
+            } else {
+                hiz.source(level - 1)
+            };
+            let bindings = DrawBindings::new()
+                .inline_uniform("HizParams", &params)
+                .texture("HizSource", source)
+                .storage_image("HizDest", hiz.dest(level));
+            let _ = ctx.dispatch(
+                if level == 0 { copy } else { reduce },
+                &bindings,
+                [groups(dw), groups(dh), 1],
+            );
+            (sw, sh) = (dw, dh);
+        }
+        let params = cmdgen_params_bytes(view_proj, camera.position, sections, [w, h], mips, true);
+        let bindings = DrawBindings::new()
+            .inline_uniform("CmdgenParams", &params)
+            .storage_buffer("SectionBuffer", slices.sections)
+            .storage_buffer("OpaqueCommands", slices.opaque_commands)
+            .storage_buffer("TranslucentCommands", slices.translucent_commands)
+            .texture("HizPyramid", hiz.all_mips());
+        let _ = ctx.dispatch(
+            cmdgen,
+            &bindings,
+            [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
+        );
+    });
+}
+
+/// Prepares this frame's two indirect draws (opaque in [`OPAQUE_STAGE`], translucent in
+/// [`TRANSLUCENT_STAGE`]); a shader pack that compiled `dh_terrain` / `dh_water` draws the
+/// pack-linked pipelines instead. Called from `Hooks::prepare_render_buffers`.
+pub fn prepare_draws(
+    host: &dyn mod_api::ClientHost,
+    camera: &CameraMatrices,
+    context: &mut dyn mod_api::PrepareRenderBuffersContext,
+) {
+    use mod_api::{DrawBindings, IndirectDraw, TextureSource};
+    let Some(frame) = FRAME.lock().unwrap().clone() else {
+        return;
+    };
     let guard = ARENA.lock().unwrap();
     let Some(state) = guard.as_ref() else { return };
     let arena = &state.arena;
@@ -468,66 +660,7 @@ pub fn record_stage(
     let view_proj = camera.view_projection();
     let near_dh = 8.0;
     let far_dh = (frame.config.render_distance_blocks() * 1.4).max(1024.0);
-    let [w, h] = event.view.size();
-    let mips = hiz_mip_levels(w, h);
-
-    // 1. Hi-Z pyramid: mip 0 <- WorldDepth, mip N <- mip N-1 (distinct subresources).
-    let Some((hiz, _)) = ensure_hiz(host, [w, h]) else {
-        return;
-    };
-    let copy = assets
-        .compute_pipeline(&mod_api::Identifier::parse("distantsunrises:voxy_hiz_copy").unwrap());
-    let reduce = assets
-        .compute_pipeline(&mod_api::Identifier::parse("distantsunrises:voxy_hiz_reduce").unwrap());
-    let cmdgen = assets
-        .compute_pipeline(&mod_api::Identifier::parse("distantsunrises:voxy_cmdgen").unwrap());
-    let (Ok(copy), Ok(reduce), Ok(cmdgen)) = (copy, reduce, cmdgen) else {
-        return;
-    };
-    let groups = |n: u32| n.div_ceil(HIZ_WORKGROUP);
-    let (mut sw, mut sh) = (w, h);
-    for level in 0..mips {
-        let (dw, dh) = if level == 0 {
-            (w, h)
-        } else {
-            ((sw / 2).max(1), (sh / 2).max(1))
-        };
-        let params = Std140(Vec::new())
-            .i32s(&[sw as i32, sh as i32, dw as i32, dh as i32])
-            .0;
-        let source = if level == 0 {
-            TextureSource::WorldDepth
-        } else {
-            hiz.source(level - 1)
-        };
-        let bindings = DrawBindings::new()
-            .uniform("HizParams", UniformValue::Inline(&params))
-            .texture("HizSource", source)
-            .storage_image("HizDest", hiz.dest(level));
-        let _ = event.compute.dispatch(
-            if level == 0 { copy } else { reduce },
-            &bindings,
-            [groups(dw), groups(dh), 1],
-        );
-        (sw, sh) = (dw, dh);
-    }
-
-    // 2. cmdgen: one invocation per section id up to the high-water mark.
-    let params = cmdgen_params_bytes(view_proj, camera.position, sections, [w, h], mips, true);
-    let bindings = DrawBindings::new()
-        .uniform("CmdgenParams", UniformValue::Inline(&params))
-        .storage_buffer("SectionBuffer", &arena.sections)
-        .storage_buffer("OpaqueCommands", &arena.opaque_commands)
-        .storage_buffer("TranslucentCommands", &arena.translucent_commands)
-        .texture("HizPyramid", hiz.all_mips());
-    let _ = event.compute.dispatch(
-        cmdgen,
-        &bindings,
-        [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
-    );
-
-    // 3. One multi-draw per pass; culled slots carry instance_count = 0.
-    let fog = [frame.env_fog_start, frame.env_fog_end, 0.0, 0.0];
+    let atlas_id = id(ATLAS_TEXTURE);
     let quad_params = quad_params_bytes(
         view_proj,
         camera.position,
@@ -535,43 +668,93 @@ pub fn record_stage(
         far_dh,
         (frame.vanilla_far_blocks * frame.config.overdraw_prevention).max(0.0),
         frame.sun_brightness,
-        fog,
+        [frame.env_fog_start, frame.env_fog_end, 0.0, 0.0],
         frame.fog_color,
         true,
         frame.config.shading_enabled,
     );
-    let bindings = DrawBindings::new()
-        .uniform("QuadParams", UniformValue::Inline(&quad_params))
-        .storage_buffer("QuadBuffer", &arena.quads)
-        .storage_buffer("SectionBuffer", &arena.sections)
-        .storage_buffer("ModelBuffer", &arena.models)
-        .storage_buffer("BiomeTintBuffer", &arena.biome_tints)
-        .texture(
-            "BlockAtlas",
-            TextureSource::DynamicTexture(&mod_api::Identifier::parse(ATLAS_TEXTURE).unwrap()),
-        );
-    for (name, cmds, count) in [
+    let (base, sub) = camera_split(camera.position);
+    let pack_params = |depth_remap: [f32; 2]| {
+        let view: [[f32; 4]; 4] =
+            std::array::from_fn(|c| std::array::from_fn(|r| camera.view[c * 4 + r]));
+        let proj: [[f32; 4]; 4] =
+            std::array::from_fn(|c| std::array::from_fn(|r| camera.projection[c * 4 + r]));
+        crate::shader_pack::PackSceneUniform {
+            model_view: view,
+            projection: proj,
+            base_block_pos: [base[0] << 5, base[1] << 5, base[2] << 5],
+            frame_id: FRAME_ID.load(Ordering::Relaxed),
+            camera_sub_pos: sub,
+            depth_remap,
+        }
+        .to_bytes()
+    };
+    let s = arena.slices;
+    for (stage, plain, pack, cmds, count) in [
         (
-            "distantsunrises:voxy_opaque",
-            &arena.opaque_commands,
+            OPAQUE_STAGE,
+            PIPELINE_OPAQUE,
+            PIPELINE_PACK_TERRAIN,
+            arena.opaque_commands,
             arena.opaque_command_count(),
         ),
         (
-            "distantsunrises:voxy_translucent",
-            &arena.translucent_commands,
+            TRANSLUCENT_STAGE,
+            PIPELINE_TRANSLUCENT,
+            PIPELINE_PACK_WATER,
+            arena.translucent_commands,
             arena.translucent_command_count(),
         ),
     ] {
-        let Ok(pipeline) = assets.render_pipeline(&mod_api::Identifier::parse(name).unwrap())
-        else {
-            continue;
+        let packed = assets
+            .render_pipeline(&id(pack))
+            .ok()
+            .filter(|p| assets.pipeline_pack_bound(*p));
+        let pack_bytes = pack_params(crate::shader_pack::DepthRemap::standard(near_dh));
+        let pipeline;
+        let bindings = if let Some(p) = packed {
+            pipeline = p;
+            DrawBindings::new()
+                .inline_uniform("SceneUniform", &pack_bytes)
+                .storage_buffer("QuadArena", s.quads)
+                .storage_buffer("SectionBuffer", s.sections)
+                .storage_buffer("ModelBuffer", s.models)
+                .storage_buffer("BiomeTintBuffer", s.biome_tints)
+                .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
+        } else {
+            let Ok(p) = assets.render_pipeline(&id(plain)) else {
+                continue;
+            };
+            pipeline = p;
+            DrawBindings::new()
+                .inline_uniform("QuadParams", &quad_params)
+                .storage_buffer("QuadBuffer", s.quads)
+                .storage_buffer("SectionBuffer", s.sections)
+                .storage_buffer("ModelBuffer", s.models)
+                .storage_buffer("BiomeTintBuffer", s.biome_tints)
+                .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
         };
-        let draw = IndirectDraw::new(pipeline, cmds, 0, count)
-            .mesh(&event.quad_index_mesh)
-            .bindings(&bindings);
-        let _ = event.draw.draw_indirect(&draw);
+        let draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(state.quad_mesh);
+        if let Ok(batch) = context.draw_indirect(stage, &draw) {
+            PREPARED.lock().unwrap().push((stage, batch));
+        }
     }
     record_frame_stats(sections as u64, arena.live_sections() as u64);
+}
+
+/// Issues the draws prepared for `stage`. Called from `Hooks::render_level_stage`.
+pub fn draw_stage(
+    stage: mod_api::RenderLevelStage,
+    context: &mut dyn mod_api::RenderLevelStageContext,
+) {
+    let Some(pass) = context.world_pass() else {
+        return;
+    };
+    for (s, batch) in PREPARED.lock().unwrap().iter() {
+        if *s == stage {
+            let _ = pass.draw(*batch);
+        }
+    }
 }
 
 /// Snapshot of client frame parameters passed from the mod crate to the stage renderer.
