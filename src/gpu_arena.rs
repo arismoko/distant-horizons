@@ -142,7 +142,7 @@ pub fn pack_section_pos(level: u8, x: i32, y: i32, z: i32) -> [u32; 2] {
     debug_assert!((-128..128).contains(&y));
     let z24 = z as u32 & 0xFF_FFFF;
     let w0 = ((level as u32) << 28) | ((y as u32 & 0xFF) << 20) | (z24 >> 4);
-    let w1 = ((x as u32 & 0xFF_FFFF) << 4) | (z24 & 0xF);
+    let w1 = ((z24 & 0xF) << 28) | ((x as u32 & 0xFF_FFFF) << 4);
     [w0, w1]
 }
 
@@ -678,6 +678,21 @@ mod tests {
         assert_eq!(f.free(0), Some(30));
         assert_eq!(f.used(), 0);
         assert_eq!(f.alloc(100), Some(0));
+    }
+
+    #[test]
+    fn section_position_round_trips_with_low_z_bits() {
+        for level in [0u8, 3, 15] {
+            for &x in &[0, 1, -1, 12345, -12345, (1 << 23) - 1, -(1 << 23)] {
+                for &y in &[0, 7, -1, -128, 127] {
+                    for &z in &[0, 5, -3, 0xF, -0x11, 99991, -99991, (1 << 23) - 1] {
+                        let words = pack_section_pos(level, x, y, z);
+                        assert_eq!(words[1] >> 28, z as u32 & 0xF);
+                        assert_eq!(unpack_section_pos(words), (level, [x, y, z]));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

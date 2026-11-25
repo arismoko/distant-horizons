@@ -1148,6 +1148,119 @@ mod octree_mesh_tests {
         assert!(PackedQuad::default().is_empty());
     }
 
+    /// Every visible voxel face of a section with canopies, overhangs, caves and water is covered
+    /// by exactly one quad: no missing and no overlapping faces.
+    #[test]
+    fn greedy_quads_cover_each_visible_face_exactly_once() {
+        use std::collections::HashMap;
+        const N: usize = 32;
+        let mut s = OctreeSection::new(pos());
+        // Terrain with a cave and an overhang.
+        for x in 0..N {
+            for z in 0..N {
+                let h = 8 + (x / 6 + z / 5) % 4;
+                for y in 0..h {
+                    let cave =
+                        (10..14).contains(&x) && (12..20).contains(&z) && (4..7).contains(&y);
+                    if !cave {
+                        s.set(x, y, z, Voxel::new(STONE, 0, 0, 0));
+                    }
+                }
+            }
+        }
+        for x in 20..28 {
+            for z in 4..10 {
+                s.set(x, 18, z, Voxel::new(STONE, 0, 15, 0)); // floating overhang slab
+            }
+        }
+        // Tree: trunk plus leaf canopy with air gaps.
+        for y in 10..16 {
+            s.set(16, y, 16, Voxel::new(LOG, 0, 15, 0));
+        }
+        for x in 13..20usize {
+            for z in 13..20usize {
+                for y in 15..19usize {
+                    if (x + y + z) % 5 != 0 {
+                        s.set(x, y, z, Voxel::new(LEAVES, 3, 15, 0));
+                    }
+                }
+            }
+        }
+        // A water pool.
+        for x in 2..9 {
+            for z in 22..30 {
+                for y in 6..10 {
+                    s.set(x, y, z, Voxel::new(WATER, 1, 15, 0));
+                }
+            }
+        }
+
+        let dense = s.to_dense();
+        let at = |x: i32, y: i32, z: i32| {
+            dense[crate::octree::voxel_index(x as usize, y as usize, z as usize)]
+        };
+        let mut expected: HashMap<([i32; 3], u8), u32> = HashMap::new();
+        for x in 0..N as i32 {
+            for y in 0..N as i32 {
+                for z in 0..N as i32 {
+                    let v = at(x, y, z);
+                    let meta = models(v.block_id());
+                    if v.is_air() || meta.is_empty() {
+                        continue;
+                    }
+                    for face in Face::ALL {
+                        if !meta.has_face(face) {
+                            continue;
+                        }
+                        let (dx, dy, dz) = face.offset();
+                        let (nx, ny, nz) = (x + dx, y + dy, z + dz);
+                        if (0..N as i32).contains(&nx)
+                            && (0..N as i32).contains(&ny)
+                            && (0..N as i32).contains(&nz)
+                        {
+                            let nv = at(nx, ny, nz);
+                            if !nv.is_air() {
+                                let nm = models(nv.block_id());
+                                if nm.face_occludes(face.opposite())
+                                    || (meta.culls_same() && nv.block_id() == v.block_id())
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+                        expected.insert(([x, y, z], face.id()), 0);
+                    }
+                }
+            }
+        }
+        assert!(expected.len() > 500);
+
+        let m = mesh_octree_section(&s, &NeighborBorders::none(), &models);
+        for q in m.opaque.iter().chain(&m.translucent) {
+            let face = Face::ALL[q.face() as usize];
+            let ext = tangent_extent(face, usize::from(q.width()), usize::from(q.height()));
+            let lo = [q.x() as usize, q.y() as usize, q.z() as usize];
+            for dx in 0..ext[0].max(usize::from(face.world_axis() == 0)) {
+                for dy in 0..ext[1].max(usize::from(face.world_axis() == 1)) {
+                    for dz in 0..ext[2].max(usize::from(face.world_axis() == 2)) {
+                        let v = [
+                            (lo[0] + dx) as i32,
+                            (lo[1] + dy) as i32,
+                            (lo[2] + dz) as i32,
+                        ];
+                        match expected.get_mut(&(v, q.face())) {
+                            Some(n) => *n += 1,
+                            None => panic!("quad covers a hidden face at {v:?} face {}", q.face()),
+                        }
+                    }
+                }
+            }
+        }
+        for (key, n) in &expected {
+            assert_eq!(*n, 1, "face {key:?} covered {n} times");
+        }
+    }
+
     #[test]
     fn full_stone_section_is_24_greedy_quads_with_aabb() {
         let s = OctreeSection::filled(pos(), Voxel::new(STONE, 0, 15, 0));
