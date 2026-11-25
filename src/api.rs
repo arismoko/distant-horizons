@@ -576,6 +576,7 @@ pub fn submit_dh_v2_bytes(
 pub fn invalidate_lod_section(dimension: &str, pos: LodSectionPos) -> bool {
     let sec_pos = SectionPos::from(pos);
     let rt = runtime();
+    rt.gen_pool.invalidate_section(dimension, sec_pos);
     let mut st = rt.inner.lock().unwrap();
     let mut removed = false;
     if let Some(store) = st.dimensions.get_mut(dimension) {

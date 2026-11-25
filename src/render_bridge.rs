@@ -668,7 +668,7 @@ pub fn runtime() -> &'static Arc<DhRuntime> {
             frames_drawn: AtomicU64::new(0),
             io: LodIoWorker::spawn(),
             mesher: MeshWorker::spawn(),
-            gen_pool: GenWorkerPool::spawn(),
+            gen_pool: GenWorkerPool::new(),
             inner: Mutex::new(DhState::default()),
         })
     })

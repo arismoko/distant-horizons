@@ -384,14 +384,15 @@ impl Hooks for DistantHorizonsMod {
     fn server_started(&self, host: &mut dyn ServerHost, _event: &mut ServerStartedEvent) {
         let world_dir = host.world_dir();
         let rt = runtime();
-        rt.gen_pool.reset_all();
+        rt.gen_pool.shutdown_and_join();
+        rt.gen_pool.ensure_started();
         let mut st = rt.inner.lock().unwrap();
         st.world_dir = world_dir;
     }
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         let world_dir = host.world_dir();
-        runtime().gen_pool.reset_all();
+        runtime().gen_pool.shutdown_and_join();
         flush_dirty_sections(world_dir);
     }
 
@@ -971,53 +972,68 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
 
     let mut block_id_cache: HashMap<mod_api::BlockKey, &str> = HashMap::new();
     let mut st = rt.inner.lock().unwrap();
-    let store = st.dimensions.entry(dim.to_owned()).or_default();
+    let mut had_error = false;
+    {
+        let store = st.dimensions.entry(dim.to_owned()).or_default();
 
-    for res in results {
-        let step = res.pos.cell_size();
-        let skirt = (step * 4).clamp(8, 32);
-        let mut updated_any = false;
-        let mut non_empty_count = 0u64;
+        for res in results {
+            let step = res.pos.cell_size();
+            let skirt = (step * 4).clamp(8, 32);
+            let mut updated_any = false;
+            let mut non_empty_count = 0u64;
 
-        {
-            let sec = store.get_or_create_mut(res.pos);
-            for (&(cx, cz), sample) in res.cells.iter().zip(res.samples.iter()) {
-                if sec.get(cx, cz).source == SOURCE_LOADED_CHUNK {
-                    continue;
+            {
+                let sec = store.get_or_create_mut(res.pos);
+                for (&(cx, cz), sample) in res.cells.iter().zip(res.samples.iter()) {
+                    if sec.get(cx, cz).source == SOURCE_LOADED_CHUNK {
+                        continue;
+                    }
+                    let Some(col) = sample else {
+                        continue;
+                    };
+                    let block_id = *block_id_cache
+                        .entry(col.block)
+                        .or_insert_with(|| col.block.id(host).unwrap_or("minecraft:stone"));
+                    let solid_rgb = block_color(block_id, &col.biome, 0);
+                    let fluid_rgb = biome_water_color(&col.biome, 0);
+                    let lod_col = LodColumn::from_solid_and_fluid(
+                        col.height,
+                        col.height - skirt,
+                        solid_rgb,
+                        col.water,
+                        fluid_rgb,
+                        15,
+                        0,
+                        SOURCE_DISTANT_SURFACE,
+                    )
+                    .with_material(classify_dh_material(block_id));
+                    if sec.set_cell(cx, cz, lod_col) {
+                        updated_any = true;
+                    }
+                    non_empty_count += 1;
                 }
-                let Some(col) = sample else {
-                    continue;
-                };
-                let block_id = *block_id_cache
-                    .entry(col.block)
-                    .or_insert_with(|| col.block.id(host).unwrap_or("minecraft:stone"));
-                let solid_rgb = block_color(block_id, &col.biome, 0);
-                let fluid_rgb = biome_water_color(&col.biome, 0);
-                let lod_col = LodColumn::from_solid_and_fluid(
-                    col.height,
-                    col.height - skirt,
-                    solid_rgb,
-                    col.water,
-                    fluid_rgb,
-                    15,
-                    0,
-                    SOURCE_DISTANT_SURFACE,
-                )
-                .with_material(classify_dh_material(block_id));
-                if sec.set_cell(cx, cz, lod_col) {
-                    updated_any = true;
+            }
+
+            store.generated_columns = store.generated_columns.saturating_add(non_empty_count);
+            match res.outcome {
+                crate::gen_worker::GenOutcome::Complete => {
+                    store.sampled_distant_sections.insert(res.pos);
                 }
-                non_empty_count += 1;
+                crate::gen_worker::GenOutcome::Error => {
+                    had_error = true;
+                }
+                crate::gen_worker::GenOutcome::Cancelled => {}
+            }
+            if updated_any {
+                dirty_sections.insert(res.pos);
             }
         }
-
-        store.generated_columns = store.generated_columns.saturating_add(non_empty_count);
-        if res.complete {
-            store.sampled_distant_sections.insert(res.pos);
-        }
-        if updated_any {
-            dirty_sections.insert(res.pos);
-        }
+    }
+    if had_error {
+        st.next_distant_sample.insert(
+            dim.to_owned(),
+            std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
+        );
     }
 }
 
