@@ -394,18 +394,14 @@ fn model_words(index: usize, m: &BakedModel, atlas: &mut [u8]) -> [u32; MODEL_WO
     w[12] = u32::from(m.flags & MODEL_TRANSLUCENT != 0)
         | 2
         | (u32::from(cutout) << 2)
-        | (tint_kind << 4);
-    w[15] = u32::from(m.light_emission);
+        | (tint_kind << 4)
+        | (u32::from(m.dh_material_id & 0xF) << 8);
+    w[15] = m.mc_entity as u32;
     w
 }
 
-/// The mesher packs light as `block << 4 | sky`; `voxy_quads.fsh` reads `sky << 4 | block`
-/// (Voxy's light id), so the nibbles swap on the way into the arena.
 fn arena_quad(q: crate::mesh::PackedQuad) -> crate::gpu_arena::PackedQuad {
-    const SHIFT: u32 = 55;
-    let light = (q.0 >> SHIFT) & 0xFF;
-    let swapped = ((light & 0xF) << 4) | (light >> 4);
-    crate::gpu_arena::PackedQuad((q.0 & !(0xFF << SHIFT)) | (swapped << SHIFT))
+    crate::gpu_arena::PackedQuad(q.0)
 }
 
 /// Buckets a mesh for the arena: bucket 0 translucent, 1 double-sided (unused), `2 + face` opaque.

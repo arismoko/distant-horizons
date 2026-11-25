@@ -76,8 +76,10 @@ bool occluded_by_hiz(vec3 mn, vec3 mx) {
         vec4 clip = view_proj * vec4(c, 1.0);
         if (clip.w <= 0.0) return false; // straddles the camera plane: keep (conservative)
         vec3 ndc = clip.xyz / clip.w;
-        smin = min(smin, vec3(ndc.xy * 0.5 + 0.5, ndc.z));
-        smax = max(smax, vec3(ndc.xy * 0.5 + 0.5, ndc.z));
+        // wgpu texture space: y = 0 is the top row.
+        vec3 s = vec3(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, ndc.z);
+        smin = min(smin, s);
+        smax = max(smax, s);
     }
     smin.xy = clamp(smin.xy, vec2(0.0), vec2(1.0));
     smax.xy = clamp(smax.xy, vec2(0.0), vec2(1.0));

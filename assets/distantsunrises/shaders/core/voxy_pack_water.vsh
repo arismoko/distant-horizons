@@ -11,7 +11,7 @@
 // Mod bindings use the mod's own set (`set = 1` in source; the engine places it after the pack's
 // sets, #5700 ruling 42). Draw contract: indexed-indirect, 6 indices per quad producing vertex ids
 // `4 * quad + corner`, `first_vertex` = first quad of the section * 4, `first_instance` = index into
-// `SectionPositions` (Voxy `positionBuffer[gl_BaseInstance]`).
+// `SectionBuffer` (`SectionMeta`, the same 32-byte rows as `voxy_quads.vsh`).
 
 layout(set = 1, binding = 0, std140) uniform SceneUniform {
     mat4 modelView;      // camera-relative world -> view
@@ -27,18 +27,25 @@ layout(set = 1, binding = 0, std140) uniform SceneUniform {
 // One `PackedQuad` per element: x = bits 0..31, y = bits 32..63 (little endian).
 layout(set = 1, binding = 1, std430) readonly buffer QuadArena { uvec2 quadData[]; };
 // Voxy packed section position (`pos_util.glsl`): x = lod[31:28] | y[27:20] | z_hi[19:0], y = z_lo[31:28] | x[27:0].
-layout(set = 1, binding = 2, std430) readonly buffer SectionPositions { uvec2 positionBuffer[]; };
-// 16 uints per model: faceData[6], flagsA, colourTint, customId (= mc_Entity id), pad[7].
+struct SectionMeta {
+    uvec4 a; // pos0, pos1, aabb, quad_start
+    uvec4 b;
+};
+layout(set = 1, binding = 2, std430) readonly buffer SectionBuffer { SectionMeta sections[]; };
+// 16 uints per model (same as voxy_quads): tile_origin[6] (x | y << 16 in atlas px), avg_rgba[6],
+// mflags@12 (bit0 translucent, bit1 face shading, bit2 cutout, bits4..8 tint kind, bits8..12
+// dhMaterialId), const_tint@13, tile_size@14 (w | h << 16, 0 = flat colour), mc_Entity@15.
 layout(set = 1, binding = 3, std430) readonly buffer ModelBuffer { uint modelData[]; };
-layout(set = 1, binding = 4, std430) readonly buffer ModelColours { uint colourData[]; };
-layout(set = 1, binding = 5) uniform sampler2D blockModelAtlas;
+// Biome tint LUT: grass, foliage, water per biome id, 0x00BBGGRR.
+layout(set = 1, binding = 4, std430) readonly buffer BiomeTintBuffer { uint biomeTints[]; };
+layout(set = 1, binding = 5) uniform sampler2D BlockAtlas;
 
 // Pack fragment interface.
 layout(location = 0) out vec4 vColor;               // sRGB vertex colour (tint * directional shade)
 layout(location = 1) out vec4 vColorLinear;         // same colour, linear
 layout(location = 2) out vec2 vLmCoord;             // vanilla lightmap uv (x = block, y = sky)
 layout(location = 3) out vec3 vNormal;              // view-space normal
-layout(location = 4) flat out int dhMaterialId;     // DH_BLOCK_* (model flagsA bits 8..11)
+layout(location = 4) flat out int dhMaterialId;     // DH_BLOCK_* (model mflags bits 8..11)
 layout(location = 5) flat out ivec4 mc_Entity;      // (block.properties id, 0, 0, 1)
 layout(location = 6) out vec3 vWorldPos;            // camera-relative world position
 layout(location = 7) out vec3 vViewPos;
@@ -46,7 +53,6 @@ layout(location = 8) out vec4 vClipPos;
 layout(location = 9) out vec2 vTexCoord;            // face-local uv in blocks
 
 const uint MODEL_STRIDE = 16u;
-const float TILE_MIP = 4.0; // 16 px face tile -> 1 px; the pack fragment has no atlas sampler
 
 const vec3 FACE_NORMALS[6] = vec3[](
     vec3(0, -1, 0), vec3(0, 1, 0), vec3(0, 0, -1), vec3(0, 0, 1), vec3(-1, 0, 0), vec3(1, 0, 0));
@@ -81,7 +87,7 @@ void main() {
     uint light = (q.y >> 23) & 0xFFu;
 
     // Section placement (voxy `pos_util.glsl`).
-    uvec2 sPos = positionBuffer[gl_InstanceIndex];
+    uvec2 sPos = sections[uint(gl_InstanceIndex)].a.xy;
     uint lodLevel = sPos.x >> 28;
     int sy = (int(sPos.x) << 4) >> 24;
     int sx = (int(sPos.y) << 4) >> 8;
@@ -91,24 +97,15 @@ void main() {
     ivec3 baseSection = (ivec3(sx, sy, sz) << int(lodLevel)) - (baseSectionPos >> 5);
 
     uint m = modelId * MODEL_STRIDE;
-    uint faceData = modelData[m + face];
-    uint flagsA = modelData[m + 6u];
-    uint tintBase = modelData[m + 7u];
-    uint customId = modelData[m + 8u];
+    uint mflags = modelData[m + 12u];
+    uint mcEntity = modelData[m + 15u];
 
-    // Face rectangle inside the block (voxy `getFaceSize`).
-    vec4 fs = vec4(faceData & 0xFu, (faceData >> 4) & 0xFu, (faceData >> 8) & 0xFu, (faceData >> 12) & 0xFu) / 16.0
-            + vec4(0.0, 1.0 / 16.0, 0.0, 1.0 / 16.0);
-    fs.xz -= vec2(0.00005);
-    fs.yw -= fs.xz;
-    uint indentEnc = (faceData >> 16) & 63u;
-    indentEnc += uint(indentEnc == 63u);
-    float depthOffset = float(indentEnc) / 64.0;
+    float depthOffset = 0.0;
 
     uint axis = face >> 1;
-    vec3 quadStart = pos + swizzleAxis(axis, vec3(fs.xz, mix(depthOffset, 1.0 - depthOffset, float(face & 1u))));
+    vec3 quadStart = pos + swizzleAxis(axis, vec3(0.0, 0.0, mix(depthOffset, 1.0 - depthOffset, float(face & 1u))));
     vec3 basePoint = quadStart * lodScale + vec3(baseSection << 5);
-    vec2 sizeAddin = fs.yw + vec2(size) - 1.0;
+    vec2 sizeAddin = vec2(size);
 
     vec2 mask = vec2(float((corner >> 1) & 1u), float(corner & 1u)) * lodScale;
     vec3 point = basePoint + swizzleAxis(axis, vec3(sizeAddin * mask, 0.0));
@@ -117,24 +114,29 @@ void main() {
     vec4 clip = projection * viewPos;
     clip.z = depthRemap.x + depthRemap.y * clip.w;
 
-    // Colour: atlas tile average * conditional biome tint * directional shade.
-    vec2 modelUV = vec2(float(modelId & 0xFFu), float((modelId >> 8) & 0xFFu)) * (1.0 / 256.0);
-    vec2 tile = vec2(1.0 / (3.0 * 256.0), 1.0 / (2.0 * 256.0));
-    vec2 faceUV = modelUV + vec2(float(face >> 1), float(face & 1u)) * tile;
-    vec4 base = textureLod(blockModelAtlas, faceUV + tile * 0.5, TILE_MIP);
-    base.a = max(base.a, 1.0 / 255.0);
-    // Translucent pass keeps the atlas alpha (voxy `quads.frag` TRANSLUCENT path) so the pack's
-    // `dh_water` blend state (BufferBlendOverride) sees the real water alpha.
-
-    uint tintState = (faceData >> 24) & 3u;
-    uint tintColour = tintBase;
-    if ((flagsA & 2u) != 0u) tintColour = colourData[tintColour + biome];
-    bool doTint = tintColour != 0xFFFFFFFFu && (tintState == 2u
-        || (tintState == 1u && abs(base.r - base.g) < 0.02 && abs(base.g - base.b) < 0.02));
-    if (doTint) {
-        base.rgb *= vec3((uvec3(tintColour) >> uvec3(16, 8, 0)) & uvec3(255u)) / 255.0;
+    // Colour: baked tile (or the face average) * biome / constant tint * directional shade.
+    uint tileOrigin = modelData[m + face];
+    uint tileSize = modelData[m + 14u];
+    vec2 tilePx = vec2(float(tileSize & 0xFFFFu), float(tileSize >> 16));
+    vec2 faceUV = vec2(0.0);
+    vec4 base;
+    if (tilePx.x > 0.0) {
+        vec2 originPx = vec2(float(tileOrigin & 0xFFFFu), float(tileOrigin >> 16));
+        faceUV = (originPx + tilePx * 0.5) / vec2(textureSize(BlockAtlas, 0));
+        base = textureLod(BlockAtlas, faceUV, 0.0);
+    } else {
+        uint avg = modelData[m + 6u + face];
+        base = vec4(float(avg & 0xFFu), float((avg >> 8) & 0xFFu), float((avg >> 16) & 0xFFu), float(avg >> 24)) / 255.0;
     }
-    float shade = ((flagsA & 8u) != 0u) ? directionalShade(face) : 1.0;
+    base.a = max(base.a, 1.0 / 255.0); // translucent pass keeps the atlas alpha (dh_water blend)
+    uint tintKind = (mflags >> 4) & 15u;
+    uint tintColour = 0xFFFFFFFFu;
+    if (tintKind == 4u) tintColour = modelData[m + 13u];
+    else if (tintKind >= 1u && tintKind <= 3u) tintColour = biomeTints[biome * 3u + (tintKind - 1u)];
+    if (tintColour != 0xFFFFFFFFu) {
+        base.rgb *= vec3(float(tintColour & 0xFFu), float((tintColour >> 8) & 0xFFu), float((tintColour >> 16) & 0xFFu)) / 255.0;
+    }
+    float shade = ((mflags & 2u) != 0u) ? directionalShade(face) : 1.0;
     base.rgb *= shade;
 
     vColor = base;
@@ -142,8 +144,8 @@ void main() {
     vLmCoord = clamp(vec2(float((light >> 4) & 0xFu), float(light & 0xFu)) / 15.0 * (15.0 / 16.0) + 0.5 / 16.0,
                      vec2(8.0 / 256.0), vec2(248.0 / 256.0));
     vNormal = mat3(modelView) * FACE_NORMALS[face];
-    dhMaterialId = int((flagsA >> 8) & 0xFu);
-    mc_Entity = ivec4(int(customId), 0, 0, 1);
+    dhMaterialId = int((mflags >> 8) & 0xFu);
+    mc_Entity = ivec4(int(mcEntity), 0, 0, 1);
     vWorldPos = worldPos;
     vViewPos = viewPos.xyz;
     vClipPos = clip;

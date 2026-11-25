@@ -90,6 +90,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
             WorldDepth::Tested,
         )
         .topology(PrimitiveTopology::Triangles)
+        .cull(false)
         .bind_group_layout(quad_layout())
         .pack_binding(crate::shader_pack::DhPackSlot::Terrain.pack_binding()),
     );
@@ -103,6 +104,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
         .define("TRANSLUCENT")
         .depth_write(false)
         .topology(PrimitiveTopology::Triangles)
+        .cull(false)
         .bind_group_layout(quad_layout())
         .pack_binding(crate::shader_pack::DhPackSlot::Water.pack_binding()),
     );
