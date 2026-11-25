@@ -30,7 +30,7 @@ use std::time::Instant;
 //   4. `voxy_composite.vsh/fsh` composites the LOD target over vanilla sky pixels.
 // ---------------------------------------------------------------------------------------------
 
-use crate::gpu_arena::{ArenaConfig, BuiltSection, DeviceBufferLimits, GpuArena};
+use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
 
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
 pub const SHADER_QUADS_VERT: &str = "distantsunrises:voxy_quads";
@@ -220,13 +220,12 @@ pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
 /// uploads pending sections and flushes metadata. Call from `client_tick_pre`.
 pub fn upload_pending(
     host: &mut dyn mod_api::ClientHost,
-    limits: DeviceBufferLimits,
     config: ArenaConfig,
 ) -> Result<(), crate::gpu_arena::ArenaError> {
     let mut guard = ARENA.lock().unwrap();
     if guard.is_none() {
         *guard = Some(ArenaState {
-            arena: GpuArena::new(host, limits, config)?,
+            arena: GpuArena::new(host, config)?,
             ids: HashMap::new(),
         });
     }
