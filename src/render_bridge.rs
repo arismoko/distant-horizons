@@ -442,7 +442,8 @@ pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
 const MAX_QUADS_PER_COMMAND: u32 = 1 << 16;
 
 /// A mesh holding only the shared quad index buffer; its one vertex binding is never read (the
-/// vertex stages pull quads from the arena by `gl_VertexID`).
+/// vertex stages pull quads from the arena by `gl_VertexID`). It has the stride of the default
+/// `position_tex_color` binding, which a pipeline with no declared binding must be drawn with.
 fn create_quad_mesh(
     host: &mut dyn mod_api::ClientHost,
 ) -> Result<mod_api::MeshRef, crate::gpu_arena::ArenaError> {
@@ -453,8 +454,8 @@ fn create_quad_mesh(
             bytes.extend_from_slice(&(q * 4 + i).to_le_bytes());
         }
     }
-    let dummy = [0u8; 4];
-    let vertex = [MeshBufferInit::from_bytes(4, &dummy)];
+    let dummy = [0u8; 24];
+    let vertex = [MeshBufferInit::from_bytes(24, &dummy)];
     let desc = MeshDescriptor::new(&vertex)
         .with_indices(MeshIndexInit::from_bytes(IndexFormat::Uint32, &bytes));
     host.create_mesh(&desc)
