@@ -350,14 +350,36 @@ fn bake_request(
     }
 }
 
-/// One model as the 16 words `voxy_quads.vsh/fsh` read: `[0..6]` atlas tile origins (unused: tile
-/// size 0 selects the flat colour), `[6..12]` per-face average colour, `[12]` flags (bit 0
-/// translucent, bit 1 face shading, bit 2 cutout, bits 4..8 tint kind), `[13]` constant tint,
-/// `[14]` tile size, `[15]` block light emission.
-fn model_words(m: &BakedModel) -> [u32; MODEL_WORDS as usize] {
+/// Side of the baked face atlas: one 1024² dynamic texture (the mod's whole 4 MiB budget).
+pub const ATLAS_SIDE: usize = 1024;
+/// Texels per face side (`bakery::FACE_GRID`).
+const TILE: usize = crate::bakery::FACE_GRID;
+/// Faces the atlas holds; later models draw with the flat per-face colour (tile size 0).
+const ATLAS_FACES: usize = (ATLAS_SIDE / TILE) * (ATLAS_SIDE / TILE);
+
+/// One model as the 16 words `voxy_quads.vsh/fsh` read: `[0..6]` atlas tile origins (`x | y << 16`
+/// in atlas pixels), `[6..12]` per-face average colour, `[12]` flags (bit 0 translucent, bit 1 face
+/// shading, bit 2 cutout, bits 4..8 tint kind), `[13]` constant tint, `[14]` tile size
+/// (`w | h << 16`, 0 = flat colour), `[15]` block light emission. Faces of model `index` are
+/// painted into `atlas` (RGBA8, `ATLAS_SIDE²`) when they fit.
+fn model_words(index: usize, m: &BakedModel, atlas: &mut [u8]) -> [u32; MODEL_WORDS as usize] {
     let mut w = [0u32; MODEL_WORDS as usize];
+    let textured = (index + 1) * 6 <= ATLAS_FACES;
     for (i, face) in m.faces.iter().enumerate() {
         w[6 + i] = pack_rgba(face.avg);
+        if textured {
+            let slot = index * 6 + i;
+            let (tx, ty) = ((slot % (ATLAS_SIDE / TILE)) * TILE, (slot / (ATLAS_SIDE / TILE)) * TILE);
+            w[i] = (tx as u32) | ((ty as u32) << 16);
+            for (n, texel) in face.texels.iter().enumerate() {
+                let (x, y) = (tx + n % TILE, ty + n / TILE);
+                let at = (y * ATLAS_SIDE + x) * 4;
+                atlas[at..at + 4].copy_from_slice(&texel.to_le_bytes());
+            }
+        }
+    }
+    if textured {
+        w[14] = (TILE as u32) | ((TILE as u32) << 16);
     }
     let tint_kind = match m.tint {
         BakedTint::None => 0,
@@ -431,9 +453,10 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
     }
     if p.models_dirty && p.baked == p.mapper.states.len() {
         p.models_dirty = false;
+        let mut atlas = vec![0u8; ATLAS_SIDE * ATLAS_SIDE * 4];
         let words: Vec<u32> = (0..p.models.len())
-            .filter_map(|i| p.models.model(i as u32))
-            .flat_map(model_words)
+            .filter_map(|i| p.models.model(i as u32).map(|m| (i, m)))
+            .flat_map(|(i, m)| model_words(i, m, &mut atlas))
             .collect();
         let biomes: Vec<&str> = p.mapper.biomes.iter().map(String::as_str).collect();
         let tints = BiomeTintTable::build(&biomes, |_| 0x3F76E4).gpu_rows();
@@ -441,7 +464,7 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             .iter()
             .flat_map(|t| [t.grass, t.foliage, t.water])
             .collect();
-        crate::render_bridge::queue_model_tables(words, tint_words);
+        crate::render_bridge::queue_model_tables(words, tint_words, atlas);
     }
     if p.baked < p.mapper.states.len() {
         return;

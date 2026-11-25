@@ -203,12 +203,18 @@ struct ArenaState {
     ids: HashMap<SectionKey, u32>,
 }
 
-static PENDING_TABLES: Mutex<Option<(Vec<u32>, Vec<u32>)>> = Mutex::new(None);
+/// Model words, biome tint words and the baked face atlas (RGBA8, `ATLAS_SIDE²`).
+type Tables = (Vec<u32>, Vec<u32>, Vec<u8>);
+static PENDING_TABLES: Mutex<Option<Tables>> = Mutex::new(None);
+static ATLAS_CREATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Id of the dynamic texture holding the baked per-face texels.
+pub const ATLAS_TEXTURE: &str = "distantsunrises:voxy_atlas";
 
 /// Queues the baked model words and biome tint words for the next `upload_pending` (they replace
 /// the previous tables, which a resource reload or new block id makes stale).
-pub fn queue_model_tables(model_words: Vec<u32>, biome_tint_words: Vec<u32>) {
-    *PENDING_TABLES.lock().unwrap() = Some((model_words, biome_tint_words));
+pub fn queue_model_tables(model_words: Vec<u32>, biome_tint_words: Vec<u32>, atlas: Vec<u8>) {
+    *PENDING_TABLES.lock().unwrap() = Some((model_words, biome_tint_words, atlas));
 }
 
 /// Called by the bakery / mesher worker for each finished section (empty = remove).
@@ -230,9 +236,22 @@ pub fn upload_pending(
         });
     }
     let state = guard.as_mut().unwrap();
-    if let Some((models, tints)) = PENDING_TABLES.lock().unwrap().take() {
+    if let Some((models, tints, atlas)) = PENDING_TABLES.lock().unwrap().take() {
         state.arena.write_models(host, 0, &models)?;
         state.arena.write_biome_tints(host, 0, &tints)?;
+        let id = mod_api::Identifier::parse(ATLAS_TEXTURE).expect("static texture id");
+        let side = crate::pipeline::ATLAS_SIDE as u32;
+        use mod_api::prelude::ClientRenderClientHost;
+        let done = if ATLAS_CREATED.load(std::sync::atomic::Ordering::Relaxed) {
+            host.update_dynamic_texture(&id, side, side, &atlas)
+        } else {
+            host.create_dynamic_texture(&id, side, side, &atlas)
+        };
+        // A refused atlas leaves every model on its flat colour: tile size stays in the table, so
+        // keep trying next time rather than drawing from a missing texture.
+        if done.is_ok() {
+            ATLAS_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     for (key, section) in std::mem::take(&mut *PENDING_SECTIONS.lock().unwrap()) {
         let old = state.ids.remove(&key);
@@ -381,9 +400,7 @@ pub fn record_stage(
         .storage_buffer("BiomeTintBuffer", &arena.biome_tints)
         .texture(
             "BlockAtlas",
-            TextureSource::Texture(
-                &mod_api::Identifier::parse("distantsunrises:voxy_atlas").unwrap(),
-            ),
+            TextureSource::DynamicTexture(&mod_api::Identifier::parse(ATLAS_TEXTURE).unwrap()),
         );
     for (name, cmds, count) in [
         (
