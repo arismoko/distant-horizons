@@ -22,4 +22,4 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-sunrise = "2a476123c878d2ed849e097f9b28873327179d46"
+sunrise = "fc2538dcc7353b6ef806c1791f77ee8c72aa2c67"
