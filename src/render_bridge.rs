@@ -1,8 +1,7 @@
-//! Thread-safe bridge between Distant Sunrises mod hooks, background workers, and the
-//! `sunrise-mod-render` mixin helpers (`render_needs` and `world_drawn`).
+//! Thread-safe bridge between Distant Sunrises mod hooks, background workers, and the GPU-driven
+//! renderer (`gpu_arena`, GLSL shaders under `assets/distantsunrises/shaders/`).
 //!
-//! Keeps all `wgpu` types inside `src/mixins/world_drawn.rs` while the mod crate owns LOD data,
-//! settings, visibility selection, shaders, and telemetry.
+//! No `wgpu` types and no `[native.*]`: everything goes through Sunrise's general render API.
 
 use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
@@ -19,488 +18,387 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-/// WGSL terrain shader for solid, translucent, and generic box-group LOD geometry.
-///
-/// Exact reversed-Z depth replacement:
-/// Sunrise's `world.jittered` matrix carries exact FOV, aspect, bob, spin, and TAA jitter,
-/// with `clip.w = -z_view` (`Mat4::perspective_rh` reversed Z). Replacing only `clip.z` with
-/// `(near_dh * far_dh - near_dh * w) / (far_dh - near_dh)` produces an exact reversed-Z depth
-/// in `[0, 1]` over `[near_dh, far_dh]` without fighting vanilla's far plane.
-pub const TERRAIN_WGSL: &str = r#"
-struct FrameUniforms {
-    jittered: mat4x4<f32>,
-    // [near_dh, far_dh, clip_dist, sun_brightness]
-    clip_and_light: vec4<f32>,
-    // [noise_intensity, fade_band, brightness_multiplier, saturation_multiplier]
-    noise_and_grade: vec4<f32>,
-    // [shading_enabled, noise_enabled, fade_enabled, debug_mode]
-    flags: vec4<u32>,
-};
+// ---------------------------------------------------------------------------------------------
+// GPU-driven Voxy-style renderer on Sunrise's general mod API (zero `[native.*]`).
+//
+// Frame (all at `RenderLevelStage::AfterOpaqueBlocks`, ruling 16: world-stage callbacks):
+//   1. `voxy_hiz.csh` builds an R32Float depth pyramid from vanilla `WorldDepth` (sunrise#5590/#5591),
+//   2. `voxy_cmdgen.csh` frustum + Hi-Z culls every section and rewrites its indirect slots
+//      (`instance_count = 0` when culled, ruling 18),
+//   3. one `draw_indirect` for the opaque slots and one for the translucent slots (sunrise#5592)
+//      pull 8-byte quads from the arena (`voxy_quads.vsh/fsh`),
+//   4. `voxy_composite.vsh/fsh` composites the LOD target over vanilla sky pixels.
+// ---------------------------------------------------------------------------------------------
 
-@group(0) @binding(0)
-var<uniform> u_frame: FrameUniforms;
+use crate::gpu_arena::{ArenaConfig, BuiltSection, DeviceBufferLimits, GpuArena};
 
-struct VsIn {
-    @location(0) local_pos: vec3<f32>,
-    @location(1) color_packed: u32,
-    @location(2) packed_meta: u32,
-    // Per-section instance attribute: [origin_x - cam_x, origin_y - cam_y, origin_z - cam_z, cell_size]
-    @location(3) section_offset: vec4<f32>,
-};
+/// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
+pub const SHADER_QUADS_VERT: &str = "distantsunrises:voxy_quads";
+pub const SHADER_QUADS_FRAG: &str = "distantsunrises:voxy_quads";
+pub const SHADER_COMPOSITE: &str = "distantsunrises:voxy_composite";
+pub const SHADER_HIZ: &str = "distantsunrises:voxy_hiz";
+pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
 
-struct VsOut {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) rel_pos: vec3<f32>,
-    @location(2) block_pos: vec3<f32>,
-    @location(3) @interpolate(flat) packed_meta: u32,
-    @location(4) @interpolate(flat) cell_size: f32,
-};
+/// Compute workgroup sizes; must match `local_size_*` in the `.csh` files.
+pub const CMDGEN_WORKGROUP: u32 = 128;
+pub const HIZ_WORKGROUP: u32 = 8;
 
-fn unpack_rgba(c: u32) -> vec4<f32> {
-    return vec4<f32>(
-        f32(c & 0xFFu) / 255.0,
-        f32((c >> 8u) & 0xFFu) / 255.0,
-        f32((c >> 16u) & 0xFFu) / 255.0,
-        f32((c >> 24u) & 0xFFu) / 255.0,
-    );
-}
-
-fn dir_shade(normal_idx: u32) -> f32 {
-    switch normal_idx {
-        case 0u: { return 0.50; } // down
-        case 1u: { return 1.00; } // up
-        case 2u, 3u: { return 0.80; } // north / south
-        default: { return 0.65; } // west / east
-    }
-}
-
-fn detail_debug_color(detail: u32) -> vec3<f32> {
-    switch detail {
-        case 0u: { return vec3<f32>(0.20, 0.90, 0.30); } // d0 green
-        case 1u: { return vec3<f32>(0.15, 0.85, 0.85); } // d1 cyan
-        case 2u: { return vec3<f32>(0.25, 0.55, 0.98); } // d2 blue
-        case 3u: { return vec3<f32>(0.55, 0.30, 0.95); } // d3 indigo
-        case 4u: { return vec3<f32>(0.85, 0.25, 0.85); } // d4 magenta
-        case 5u: { return vec3<f32>(0.95, 0.25, 0.25); } // d5 red
-        default: { return vec3<f32>(0.98, 0.60, 0.15); } // d6 orange
-    }
-}
-
-fn source_debug_color(src: u32) -> vec3<f32> {
-    switch src {
-        case 1u: { return vec3<f32>(0.95, 0.75, 0.20); } // distant surface
-        case 2u: { return vec3<f32>(0.20, 0.85, 0.35); } // loaded chunk
-        case 3u: { return vec3<f32>(0.30, 0.70, 0.98); } // generic object
-        default: { return vec3<f32>(0.60, 0.60, 0.60); }
-    }
-}
-
-@vertex
-fn vs_main(v: VsIn) -> VsOut {
-    var out: VsOut;
-    let rel = v.local_pos + v.section_offset.xyz;
-    var clip = u_frame.jittered * vec4<f32>(rel, 1.0);
-
-    let near_dh = u_frame.clip_and_light.x;
-    let far_dh = u_frame.clip_and_light.y;
-    // Reversed-Z projection on [near_dh, far_dh]: w = near_dh -> z/w = 1.0, w = far_dh -> z/w = 0.0
-    clip.z = (near_dh * far_dh - near_dh * clip.w) / max(far_dh - near_dh, 1.0);
-
-    let base = unpack_rgba(v.color_packed);
-    let normal_idx = v.packed_meta & 0x7u;
-    let sky_light = f32((v.packed_meta >> 4u) & 0xFu) / 15.0;
-    let block_light = f32((v.packed_meta >> 8u) & 0xFu) / 15.0;
-    let detail = (v.packed_meta >> 17u) & 0x7u;
-    let source = (v.packed_meta >> 20u) & 0x3u;
-    let is_generic = (v.packed_meta >> 22u) & 1u;
-    let unshaded = (v.packed_meta >> 23u) & 1u;
-    let shading_on = (u_frame.flags.x & 1u) != 0u;
-    let is_hdr = ((u_frame.flags.x >> 8u) & 1u) != 0u;
-    let debug_mode = u_frame.flags.w;
-
-    var graded: vec3<f32>;
-    if (debug_mode == 1u || debug_mode == 4u) {
-        let dbg = select(detail_debug_color(detail), pow(max(detail_debug_color(detail), vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
-        graded = dbg * dir_shade(normal_idx);
-    } else if (debug_mode == 2u) {
-        let dbg = select(source_debug_color(source), pow(max(source_debug_color(source), vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
-        graded = dbg * dir_shade(normal_idx);
-    } else if (debug_mode == 3u) {
-        let dbg = vec3<f32>(block_light, 0.5 * (sky_light + block_light), sky_light);
-        graded = select(dbg, pow(max(dbg, vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
-    } else if (unshaded != 0u) {
-        graded = select(base.rgb, pow(max(base.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
-    } else {
-        // Decode sRGB albedo to linear light BEFORE lighting/shading in HDR so light*shade is
-        // not crushed by pow(2.2) in the composite pass (docs/hdr-passes.md).
-        let albedo = select(base.rgb, pow(max(base.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
-        let sun = u_frame.clip_and_light.w;
-        let light = clamp(max(sky_light * sun, block_light) * 0.90 + 0.10, 0.08, 1.0);
-
-        var shade = 1.0;
-        if (shading_on && is_generic == 0u) {
-            shade = dir_shade(normal_idx);
-            let height_hint = clamp((v.local_pos.y - 62.0) / 180.0, -0.06, 0.08);
-            shade = clamp(shade + height_hint, 0.45, 1.06);
+/// Registers the five pipelines. Called from `Hooks::register_render_pipelines`.
+pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
+    use mod_api::{BindEntry, ComputePipeline, Identifier, PrimitiveTopology, RenderPipeline};
+    let id = |s: &str| Identifier::parse(s).expect("static pipeline id");
+    let quad_layout = || {
+        vec![
+            BindEntry::uniform_buffer("QuadParams", 160),
+            BindEntry::storage_buffer("QuadBuffer", true),
+            BindEntry::storage_buffer("SectionBuffer", true),
+            BindEntry::storage_buffer("ModelBuffer", true),
+            BindEntry::storage_buffer("BiomeTintBuffer", true),
+            BindEntry::sampler("BlockAtlas"),
+        ]
+    };
+    for (name, translucent) in [("opaque", false), ("translucent", true)] {
+        let mut p = RenderPipeline::builder(id(&format!("distantsunrises:voxy_{name}")))
+            .vertex_shader(id(SHADER_QUADS_VERT))
+            .fragment_shader(id(SHADER_QUADS_FRAG))
+            .topology(PrimitiveTopology::Quads)
+            .bind_group_layout(quad_layout());
+        if translucent {
+            p = p.define("TRANSLUCENT", "1").alpha_blend();
         }
-
-        let brightness = u_frame.noise_and_grade.z;
-        let saturation = u_frame.noise_and_grade.w;
-        graded = albedo * light * shade * brightness;
-        let luma = dot(graded, vec3<f32>(0.2126, 0.7152, 0.0722));
-        graded = max(mix(vec3<f32>(luma), graded, saturation), vec3<f32>(0.0));
-        if (!is_hdr) {
-            graded = min(graded, vec3<f32>(1.0));
-        }
+        event.pipelines.push(p);
     }
-
-    out.clip_pos = clip;
-    out.color = vec4<f32>(graded, base.a);
-    out.rel_pos = rel;
-    out.block_pos = v.local_pos;
-    out.packed_meta = v.packed_meta;
-    out.cell_size = max(v.section_offset.w, 1.0);
-    return out;
-}
-
-fn hash3(p: vec3<f32>) -> f32 {
-    let h = dot(p, vec3<f32>(12.9898, 78.233, 37.719));
-    return fract(sin(h) * 43758.5453);
-}
-
-fn bayer4x4(p: vec2<f32>) -> f32 {
-    let x = i32(p.x) & 3;
-    let y = i32(p.y) & 3;
-    let idx = y * 4 + x;
-    var m = array<f32, 16>(
-        0.0,  8.0,  2.0, 10.0,
-        12.0, 4.0, 14.0,  6.0,
-        3.0, 11.0,  1.0,  9.0,
-        15.0, 7.0, 13.0,  5.0
+    event.pipelines.push(
+        RenderPipeline::builder(id("distantsunrises:voxy_composite"))
+            .vertex_shader(id(SHADER_COMPOSITE))
+            .fragment_shader(id(SHADER_COMPOSITE))
+            .topology(PrimitiveTopology::Triangles)
+            .bind_group_layout(vec![
+                BindEntry::uniform_buffer("CompositeParams", 176),
+                BindEntry::sampler("LodColor"),
+                BindEntry::sampler("LodDepth"),
+                BindEntry::sampler("WorldDepth"),
+            ]),
     );
-    return (m[idx] + 0.5) / 16.0;
+    event.compute_pipelines.push(
+        ComputePipeline::builder(id("distantsunrises:voxy_hiz_copy"), id(SHADER_HIZ))
+            .define("HIZ_FROM_WORLD_DEPTH", "1")
+            .bind_group_layout(hiz_layout()),
+    );
+    event.compute_pipelines.push(
+        ComputePipeline::builder(id("distantsunrises:voxy_hiz_reduce"), id(SHADER_HIZ))
+            .bind_group_layout(hiz_layout()),
+    );
+    event.compute_pipelines.push(
+        ComputePipeline::builder(id("distantsunrises:voxy_cmdgen"), id(SHADER_CMDGEN))
+            .bind_group_layout(vec![
+                BindEntry::uniform_buffer("CmdgenParams", 112),
+                BindEntry::storage_buffer("SectionBuffer", true),
+                BindEntry::storage_buffer("OpaqueCommands", false),
+                BindEntry::storage_buffer("TranslucentCommands", false),
+                BindEntry::sampler("HizPyramid"),
+            ]),
+    );
+
+    fn hiz_layout() -> Vec<mod_api::BindEntry> {
+        vec![
+            mod_api::BindEntry::uniform_buffer("HizParams", 16),
+            mod_api::BindEntry::sampler("HizSource"),
+            mod_api::BindEntry::storage_image("HizDest", mod_api::StorageImageAccess::WriteOnly),
+        ]
+    }
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let skip_clip = (in.packed_meta >> 24u) & 1u;
-    let dist = length(in.rel_pos.xz);
-    let clip_dist = u_frame.clip_and_light.z;
-    let fade_band = u_frame.noise_and_grade.y;
-    if (skip_clip == 0u && clip_dist > 0.0) {
-        if (u_frame.flags.z != 0u && fade_band > 0.5) {
-            let t = smoothstep(clip_dist, clip_dist + fade_band, dist);
-            if (t <= bayer4x4(in.clip_pos.xy)) {
-                discard;
+/// Writes `v` as little-endian f32s / u32s / i32s into a std140 byte buffer.
+struct Std140(Vec<u8>);
+
+impl Std140 {
+    fn f32s(mut self, v: &[f32]) -> Self {
+        v.iter()
+            .for_each(|x| self.0.extend_from_slice(&x.to_le_bytes()));
+        self
+    }
+    fn u32s(mut self, v: &[u32]) -> Self {
+        v.iter()
+            .for_each(|x| self.0.extend_from_slice(&x.to_le_bytes()));
+        self
+    }
+    fn i32s(mut self, v: &[i32]) -> Self {
+        v.iter()
+            .for_each(|x| self.0.extend_from_slice(&x.to_le_bytes()));
+        self
+    }
+}
+
+/// `QuadParams` (160 bytes), shared by `voxy_quads.vsh` / `.fsh`.
+pub fn quad_params_bytes(
+    view_proj: [f32; 16],
+    camera: [f64; 3],
+    near_dh: f32,
+    far_dh: f32,
+    clip_dist: f32,
+    sun: f32,
+    fog: [f32; 4],
+    fog_color: [f32; 4],
+    is_hdr: bool,
+    shading: bool,
+) -> Vec<u8> {
+    let (base, sub) = camera_split(camera);
+    Std140(Vec::with_capacity(160))
+        .f32s(&view_proj)
+        .i32s(&[base[0], base[1], base[2], 0])
+        .f32s(&[sub[0], sub[1], sub[2], 0.0])
+        .f32s(&[near_dh, far_dh, clip_dist, sun])
+        .f32s(&fog)
+        .f32s(&fog_color)
+        .u32s(&[u32::from(is_hdr), u32::from(shading), 0, 0])
+        .0
+}
+
+/// `CmdgenParams` (112 bytes).
+pub fn cmdgen_params_bytes(
+    view_proj: [f32; 16],
+    camera: [f64; 3],
+    section_count: u32,
+    hiz_size: [u32; 2],
+    hiz_mips: u32,
+    hiz_enabled: bool,
+) -> Vec<u8> {
+    let (base, sub) = camera_split(camera);
+    Std140(Vec::with_capacity(112))
+        .f32s(&view_proj)
+        .i32s(&[base[0], base[1], base[2], section_count as i32])
+        .f32s(&[sub[0], sub[1], sub[2], 0.0])
+        .i32s(&[
+            hiz_size[0] as i32,
+            hiz_size[1] as i32,
+            hiz_mips as i32,
+            i32::from(hiz_enabled),
+        ])
+        .0
+}
+
+/// Camera block position split into its 32-block section (`>> 5`) and the sub-section remainder,
+/// so shader math stays in f32 near the camera (Voxy `baseSectionPos` / `cameraSubPos`).
+pub fn camera_split(camera: [f64; 3]) -> ([i32; 3], [f32; 3]) {
+    let base = camera.map(|c| (c.floor() as i64 >> 5) as i32);
+    let sub = std::array::from_fn(|i| (camera[i] - f64::from(base[i] << 5)) as f32);
+    (base, sub)
+}
+
+/// Mip count of the Hi-Z pyramid: `32 - leading_zeros(max(w, h))` (sunrise#5590 rule).
+pub fn hiz_mip_levels(width: u32, height: u32) -> u32 {
+    32 - width.max(height).leading_zeros()
+}
+
+/// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
+static PENDING_SECTIONS: Mutex<Vec<(SectionKey, BuiltSection)>> = Mutex::new(Vec::new());
+static ARENA: Mutex<Option<ArenaState>> = Mutex::new(None);
+
+/// Identity of an uploaded section: `(dimension, lod level, section position)`.
+pub type SectionKey = (String, u8, [i32; 3]);
+
+struct ArenaState {
+    arena: GpuArena,
+    ids: HashMap<SectionKey, u32>,
+}
+
+/// Called by the bakery / mesher worker for each finished section (empty = remove).
+pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
+    PENDING_SECTIONS.lock().unwrap().push((key, section));
+}
+
+/// Creates the arena on first use (ruling 2: it then survives reloads and world close),
+/// uploads pending sections and flushes metadata. Call from `client_tick_pre`.
+pub fn upload_pending(
+    host: &mut dyn mod_api::ClientHost,
+    limits: DeviceBufferLimits,
+    config: ArenaConfig,
+) -> Result<(), crate::gpu_arena::ArenaError> {
+    let mut guard = ARENA.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(ArenaState {
+            arena: GpuArena::new(host, limits, config)?,
+            ids: HashMap::new(),
+        });
+    }
+    let state = guard.as_mut().unwrap();
+    for (key, section) in std::mem::take(&mut *PENDING_SECTIONS.lock().unwrap()) {
+        let old = state.ids.remove(&key);
+        if section.is_empty() {
+            if let Some(old) = old {
+                state.arena.remove(old)?;
             }
-        } else if (dist < clip_dist) {
-            discard;
-        }
-    }
-
-    var rgb = in.color.rgb;
-    let debug_mode = u_frame.flags.w;
-    let is_fluid = (in.packed_meta >> 12u) & 1u;
-    let is_generic = (in.packed_meta >> 22u) & 1u;
-
-    if (debug_mode == 4u) {
-        let cell = in.cell_size;
-        let f = fract(in.block_pos.xz / cell);
-        let edge = min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y));
-        if (edge < 0.05) {
-            rgb = vec3<f32>(0.05, 0.05, 0.05);
-        }
-    } else if (debug_mode == 0u && u_frame.flags.y != 0u && is_fluid == 0u && is_generic == 0u) {
-        let intensity = u_frame.noise_and_grade.x;
-        let lum = (rgb.r + rgb.g + rgb.b) / 3.0;
-        let amp = (1.0 - pow(lum * 2.0 - 1.0, 2.0)) * intensity;
-        let qpos = floor(in.block_pos);
-        let rnd = hash3(qpos) * 2.0 * amp - amp;
-        let dropoff = clamp(dist / 512.0, 0.0, 1.0);
-        let noisy = clamp(rgb + (vec3<f32>(1.0) - rgb) * rnd, vec3<f32>(0.0), vec3<f32>(1.0));
-        rgb = mix(noisy, rgb, dropoff);
-    }
-
-    return vec4<f32>(rgb, in.color.a);
-}
-"#;
-
-/// Fullscreen sky-masked composite + spiral SSAO + full DH distance/height/environmental fog shader.
-///
-/// Reads Sunrise's reversed-Z `vanilla_depth` (`0.0` = sky) and Distant Sunrises' offscreen
-/// `dh_color` and `dh_depth` (`0.0` = empty). Only writes where vanilla drew sky AND DH drew
-/// terrain, applying depth-buffer SSAO and DH far/height/environmental fog before converting
-/// cleanly to Sunrise's linear HDR light space (`docs/hdr-passes.md`).
-pub const COMPOSITE_WGSL: &str = r#"
-struct CompositeUniforms {
-    inv_view_proj: mat4x4<f32>,
-    fog_color: vec4<f32>,
-    // [near_dh, far_dh, fog_start, fog_end]
-    fog_params: vec4<f32>,
-    // [camera_y, height_fog_base_y, env_fog_start, env_fog_end]
-    height_and_env: vec4<f32>,
-    // [ssao_radius, ssao_strength, ssao_bias, ssao_fade_dist]
-    ssao_params: vec4<f32>,
-    // [fog_enabled, is_hdr, fog_falloff, fog_spherical]
-    flags0: vec4<u32>,
-    // [height_fog_enabled, height_fog_mix_mode, ssao_samples, fog_type]
-    flags1: vec4<u32>,
-    // [cas_amount, 0.0, 0.0, 0.0]
-    sharpen_and_pad: vec4<f32>,
-};
-
-@group(0) @binding(0)
-var<uniform> u_comp: CompositeUniforms;
-@group(0) @binding(1)
-var t_dh_color: texture_2d<f32>;
-@group(0) @binding(2)
-var t_dh_depth: texture_depth_2d;
-@group(0) @binding(3)
-var t_mc_depth: texture_depth_2d;
-
-struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 3.0, -1.0),
-        vec2<f32>(-1.0,  3.0)
-    );
-    var out: VsOut;
-    out.pos = vec4<f32>(positions[vid], 0.0, 1.0);
-    return out;
-}
-
-fn unproject_dh(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let wpos = u_comp.inv_view_proj * ndc;
-    return wpos.xyz / max(abs(wpos.w), 1e-6) * sign(select(1.0, wpos.w, wpos.w != 0.0));
-}
-
-fn interleaved_gradient_noise(pixel: vec2<f32>) -> f32 {
-    return fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
-}
-
-fn compute_ssao(
-    px: vec2<i32>,
-    dims: vec2<i32>,
-    rel_pos: vec3<f32>,
-    view_dist: f32,
-) -> f32 {
-    let sample_count = u_comp.flags1.z;
-    if (sample_count == 0u) {
-        return 0.0;
-    }
-    let fade_dist = u_comp.ssao_params.w;
-    if (view_dist >= fade_dist) {
-        return 0.0;
-    }
-
-    let f_dims = max(vec2<f32>(dims), vec2<f32>(1.0));
-    let px_r = clamp(px + vec2<i32>(1, 0), vec2<i32>(0), dims - vec2<i32>(1));
-    let px_l = clamp(px - vec2<i32>(1, 0), vec2<i32>(0), dims - vec2<i32>(1));
-    let px_d = clamp(px + vec2<i32>(0, 1), vec2<i32>(0), dims - vec2<i32>(1));
-    let px_u = clamp(px - vec2<i32>(0, 1), vec2<i32>(0), dims - vec2<i32>(1));
-
-    let dr = textureLoad(t_dh_depth, px_r, 0);
-    let dl = textureLoad(t_dh_depth, px_l, 0);
-    let dd = textureLoad(t_dh_depth, px_d, 0);
-    let du = textureLoad(t_dh_depth, px_u, 0);
-
-    let pos_r = unproject_dh((vec2<f32>(px_r) + 0.5) / f_dims, max(dr, 1e-6));
-    let pos_l = unproject_dh((vec2<f32>(px_l) + 0.5) / f_dims, max(dl, 1e-6));
-    let pos_d = unproject_dh((vec2<f32>(px_d) + 0.5) / f_dims, max(dd, 1e-6));
-    let pos_u = unproject_dh((vec2<f32>(px_u) + 0.5) / f_dims, max(du, 1e-6));
-
-    let dx_r = pos_r - rel_pos;
-    let dx_l = rel_pos - pos_l;
-    let dpdx = select(dx_l, dx_r, dr > 0.0 && (dl <= 0.0 || dot(dx_r, dx_r) < dot(dx_l, dx_l)));
-
-    let dy_d = pos_d - rel_pos;
-    let dy_u = rel_pos - pos_u;
-    let dpdy = select(dy_u, dy_d, dd > 0.0 && (du <= 0.0 || dot(dy_d, dy_d) < dot(dy_u, dy_u)));
-
-    var n = cross(dpdy, dpdx);
-    let n_len = length(n);
-    if (n_len < 1e-5) {
-        return 0.0;
-    }
-    n = n / n_len;
-    // Orient normal toward the camera (-rel_pos).
-    if (dot(n, -rel_pos) < 0.0) {
-        n = -n;
-    }
-
-    let radius_world = u_comp.ssao_params.x;
-    let strength = u_comp.ssao_params.y;
-    let bias = u_comp.ssao_params.z;
-    let px_radius = clamp(radius_world * f_dims.y / max(view_dist * 1.4, 1.0), 2.5, 42.0);
-    let r_step = px_radius / f32(sample_count);
-
-    var angle = interleaved_gradient_noise(vec2<f32>(px)) * 6.2831853;
-    var r = r_step;
-    var ao = 0.0;
-    var hits = 0.0;
-
-    for (var i = 0u; i < sample_count; i = i + 1u) {
-        let off = vec2<f32>(cos(angle), sin(angle)) * r;
-        r = r + r_step;
-        angle = angle + 2.39996323; // golden angle
-
-        let sp = clamp(px + vec2<i32>(round(off)), vec2<i32>(0), dims - vec2<i32>(1));
-        let sd = textureLoad(t_dh_depth, sp, 0);
-        if (sd <= 0.0) {
             continue;
         }
-        let s_rel = unproject_dh((vec2<f32>(sp) + 0.5) / f_dims, sd);
-        let diff = s_rel - rel_pos;
-        let s_dist = length(diff);
-        if (s_dist > 1e-3 && s_dist < radius_world * 2.5) {
-            let ndotl = max(dot(n, diff / s_dist) - bias, 0.0);
-            let falloff = 1.0 - clamp(s_dist / (radius_world * 2.5), 0.0, 1.0);
-            ao = ao + ndotl * falloff;
-            hits = hits + 1.0;
-        }
+        let id = state.arena.upload_replace(host, old, &section)?;
+        state.ids.insert(key, id);
     }
-
-    let raw_ao = ao / max(hits, 1.0);
-    let dist_fade = 1.0 - clamp(view_dist / max(fade_dist, 1.0), 0.0, 1.0);
-    return clamp(smoothstep(0.0, 0.55, raw_ao) * strength * dist_fade, 0.0, 0.65);
+    state.arena.flush(host)
 }
 
-fn fog_curve(t_raw: f32, falloff: u32) -> f32 {
-    let t = clamp(t_raw, 0.0, 1.0);
-    if (falloff == 0u) {
-        return t;
-    } else if (falloff == 1u) {
-        return clamp(1.0 - exp(-2.5 * t), 0.0, 1.0);
-    } else {
-        return clamp(1.0 - exp(-2.8 * t * t), 0.0, 1.0);
+/// Drops every section of `dimension` (world / dimension change); the buffers stay.
+pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaError> {
+    let mut guard = ARENA.lock().unwrap();
+    let Some(state) = guard.as_mut() else {
+        return Ok(());
+    };
+    let doomed: Vec<_> = state
+        .ids
+        .keys()
+        .filter(|k| k.0 == dimension)
+        .cloned()
+        .collect();
+    for key in doomed {
+        let id = state.ids.remove(&key).unwrap();
+        state.arena.remove(id)?;
     }
+    Ok(())
 }
 
-fn mix_height_fog(far_f: f32, height_f: f32, mode: u32) -> f32 {
-    switch mode {
-        case 0u: { return far_f; }
-        case 1u: { return max(far_f, height_f); }
-        case 2u: { return clamp(far_f + height_f, 0.0, 1.0); }
-        case 3u: { return far_f * height_f; }
-        default: { return 1.0 - (1.0 - far_f) * (1.0 - height_f); }
+/// Frees the arena's GPU buffers (mod unload / re-init only).
+pub fn release_arena(
+    host: &mut dyn mod_api::ClientHost,
+) -> Result<(), crate::gpu_arena::ArenaError> {
+    match ARENA.lock().unwrap().take() {
+        Some(state) => state.arena.release(host),
+        None => Ok(()),
     }
 }
 
-fn fetch_dh_masked(sp: vec2<i32>, dims: vec2<i32>, fallback: vec3<f32>) -> vec3<f32> {
-    let c = clamp(sp, vec2<i32>(0), dims - vec2<i32>(1));
-    if (textureLoad(t_dh_depth, c, 0) <= 0.0) {
-        return fallback;
+/// Records one frame: Hi-Z build, cmdgen, the two indirect draws. Called from
+/// `Hooks::render_level_stage` at `AfterOpaqueBlocks`.
+pub fn record_stage(
+    host: &dyn mod_api::ClientHost,
+    event: &mut mod_api::RenderLevelStageEvent<'_>,
+    frame: &RenderFrameParams,
+    camera: &CameraMatrices,
+) {
+    use mod_api::{DrawBindings, IndirectDraw, StorageImageBinding, TextureSource, UniformValue};
+    let guard = ARENA.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return };
+    let arena = &state.arena;
+    let sections = arena.section_high_water();
+    if !frame.enabled || sections == 0 {
+        return;
     }
-    return textureLoad(t_dh_color, c, 0).rgb;
-}
+    let assets = host.render_assets();
+    let view_proj = camera.view_projection();
+    let near_dh = 8.0;
+    let far_dh = (frame.config.render_distance_blocks() * 1.4).max(1024.0);
+    let [w, h] = event.view.size();
+    let mips = hiz_mip_levels(w, h);
 
-fn apply_cas(px: vec2<i32>, dims: vec2<i32>, e: vec3<f32>, amount: f32) -> vec3<f32> {
-    if (amount <= 0.001) {
-        return e;
+    // 1. Hi-Z pyramid: mip 0 <- WorldDepth, mip N <- mip N-1 (distinct subresources).
+    let pyramid = event.hiz_target(w, h, mips);
+    let copy = assets
+        .compute_pipeline(&mod_api::Identifier::parse("distantsunrises:voxy_hiz_copy").unwrap());
+    let reduce = assets
+        .compute_pipeline(&mod_api::Identifier::parse("distantsunrises:voxy_hiz_reduce").unwrap());
+    let cmdgen = assets
+        .compute_pipeline(&mod_api::Identifier::parse("distantsunrises:voxy_cmdgen").unwrap());
+    let (Ok(copy), Ok(reduce), Ok(cmdgen)) = (copy, reduce, cmdgen) else {
+        return;
+    };
+    let groups = |n: u32| n.div_ceil(HIZ_WORKGROUP);
+    let (mut sw, mut sh) = (w, h);
+    for level in 0..mips {
+        let (dw, dh) = if level == 0 {
+            (w, h)
+        } else {
+            ((sw / 2).max(1), (sh / 2).max(1))
+        };
+        let params = Std140(Vec::new())
+            .i32s(&[sw as i32, sh as i32, dw as i32, dh as i32])
+            .0;
+        let source = if level == 0 {
+            TextureSource::WorldDepth
+        } else {
+            TextureSource::render_target_color_mip(pyramid, 0, level - 1, 1)
+        };
+        let bindings = DrawBindings::new()
+            .uniform("HizParams", UniformValue::Inline(&params))
+            .texture("HizSource", source)
+            .storage_image(
+                "HizDest",
+                StorageImageBinding::new(pyramid, 0, level, mod_api::StorageImageAccess::WriteOnly),
+            );
+        let _ = event.compute.dispatch(
+            if level == 0 { copy } else { reduce },
+            &bindings,
+            [groups(dw), groups(dh), 1],
+        );
+        (sw, sh) = (dw, dh);
     }
-    let a = fetch_dh_masked(px + vec2<i32>(-1, -1), dims, e);
-    let b = fetch_dh_masked(px + vec2<i32>( 0, -1), dims, e);
-    let c = fetch_dh_masked(px + vec2<i32>( 1, -1), dims, e);
-    let d = fetch_dh_masked(px + vec2<i32>(-1,  0), dims, e);
-    let f = fetch_dh_masked(px + vec2<i32>( 1,  0), dims, e);
-    let g = fetch_dh_masked(px + vec2<i32>(-1,  1), dims, e);
-    let h = fetch_dh_masked(px + vec2<i32>( 0,  1), dims, e);
-    let i = fetch_dh_masked(px + vec2<i32>( 1,  1), dims, e);
 
-    let mn_rgb = min(min(min(d, e), min(f, b)), h) + min(min(min(a, g), c), i);
-    let mx_rgb = max(max(max(d, e), max(f, b)), h) + max(max(max(a, g), c), i);
-
-    let rcp_mx = vec3<f32>(1.0) / max(mx_rgb, vec3<f32>(1e-4));
-    let amp = inverseSqrt(max(clamp(min(mn_rgb, vec3<f32>(2.0) - mx_rgb) * rcp_mx, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1e-4)));
-    let peak = 8.0 - 3.0 * clamp(amount, 0.0, 1.0);
-    let w_rgb = vec3<f32>(-1.0) / (amp * peak);
-    let rcp_w = vec3<f32>(1.0) / max(vec3<f32>(1.0) + 4.0 * w_rgb, vec3<f32>(1e-4));
-    return clamp(((b + d + f + h) * w_rgb + e) * rcp_w, vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let dh_dims = textureDimensions(t_dh_color);
-    let mc_dims = textureDimensions(t_mc_depth);
-    let i_dh_dims = vec2<i32>(dh_dims);
-    let px = clamp(vec2<i32>(in.pos.xy), vec2<i32>(0), i_dh_dims - vec2<i32>(1));
-    let mc_px = clamp(
-        vec2<i32>((vec2<f32>(px) + vec2<f32>(0.5)) * vec2<f32>(mc_dims) / max(vec2<f32>(dh_dims), vec2<f32>(1.0))),
-        vec2<i32>(0),
-        vec2<i32>(mc_dims) - vec2<i32>(1)
+    // 2. cmdgen: one invocation per section id up to the high-water mark.
+    let params = cmdgen_params_bytes(view_proj, camera.position, sections, [w, h], mips, true);
+    let bindings = DrawBindings::new()
+        .uniform("CmdgenParams", UniformValue::Inline(&params))
+        .storage_buffer("SectionBuffer", &arena.sections)
+        .storage_buffer("OpaqueCommands", &arena.opaque_commands)
+        .storage_buffer("TranslucentCommands", &arena.translucent_commands)
+        .texture(
+            "HizPyramid",
+            TextureSource::render_target_color_mip(pyramid, 0, 0, mips),
+        );
+    let _ = event.compute.dispatch(
+        cmdgen,
+        &bindings,
+        [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
     );
 
-    let mc_depth = textureLoad(t_mc_depth, mc_px, 0);
-    // Vanilla reversed-Z: anything > 0.0 is foreground vanilla geometry.
-    if (mc_depth > 0.0) {
-        discard;
+    // 3. One multi-draw per pass; culled slots carry instance_count = 0.
+    let fog = [frame.env_fog_start, frame.env_fog_end, 0.0, 0.0];
+    let quad_params = quad_params_bytes(
+        view_proj,
+        camera.position,
+        near_dh,
+        far_dh,
+        (frame.vanilla_far_blocks * frame.config.overdraw_prevention).max(0.0),
+        frame.sun_brightness,
+        fog,
+        frame.fog_color,
+        true,
+        frame.config.shading_enabled,
+    );
+    let bindings = DrawBindings::new()
+        .uniform("QuadParams", UniformValue::Inline(&quad_params))
+        .storage_buffer("QuadBuffer", &arena.quads)
+        .storage_buffer("SectionBuffer", &arena.sections)
+        .storage_buffer("ModelBuffer", &arena.models)
+        .storage_buffer("BiomeTintBuffer", &arena.biome_tints)
+        .texture(
+            "BlockAtlas",
+            TextureSource::Texture(
+                &mod_api::Identifier::parse("distantsunrises:voxy_atlas").unwrap(),
+            ),
+        );
+    for (name, cmds, count) in [
+        (
+            "distantsunrises:voxy_opaque",
+            &arena.opaque_commands,
+            arena.opaque_command_count(),
+        ),
+        (
+            "distantsunrises:voxy_translucent",
+            &arena.translucent_commands,
+            arena.translucent_command_count(),
+        ),
+    ] {
+        let Ok(pipeline) = assets.render_pipeline(&mod_api::Identifier::parse(name).unwrap())
+        else {
+            continue;
+        };
+        let draw = IndirectDraw::new(pipeline, cmds, 0, count)
+            .mesh(&event.quad_index_mesh)
+            .bindings(&bindings);
+        let _ = event.draw.draw_indirect(&draw);
     }
-
-    let dh_depth = textureLoad(t_dh_depth, px, 0);
-    if (dh_depth <= 0.0) {
-        discard;
-    }
-
-    var col = textureLoad(t_dh_color, px, 0).rgb;
-    col = apply_cas(px, i_dh_dims, col, u_comp.sharpen_and_pad.x);
-
-    let near_dh = u_comp.fog_params.x;
-    let far_dh = u_comp.fog_params.y;
-    let view_dist = (near_dh * far_dh) / max(dh_depth * (far_dh - near_dh) + near_dh, 1e-5);
-    let uv = (vec2<f32>(px) + vec2<f32>(0.5)) / max(vec2<f32>(dh_dims), vec2<f32>(1.0));
-    let rel_pos = unproject_dh(uv, dh_depth);
-
-    // 1. Distant SSAO (applied before atmospheric fog, matching upstream DH ao -> fog order).
-    let ao = compute_ssao(px, i_dh_dims, rel_pos, view_dist);
-    col = col * (1.0 - ao);
-
-    // 2. Atmospheric / height / environmental fog.
-    let fog_type = u_comp.flags1.w;
-    var fog_factor = 0.0;
-    if (fog_type != 0u) {
-        // Underwater / Lava / PowderSnow: use vanilla environmental fog distances.
-        let env_start = u_comp.height_and_env.z;
-        let env_end = max(u_comp.height_and_env.w, env_start + 1.0);
-        let sphere_d = length(rel_pos);
-        fog_factor = clamp((sphere_d - env_start) / (env_end - env_start), 0.0, 1.0);
-    } else if (u_comp.flags0.x != 0u) {
-        let fog_start = u_comp.fog_params.z;
-        let fog_end = max(u_comp.fog_params.w, fog_start + 1.0);
-        let active_dist = select(length(rel_pos.xz), length(rel_pos), u_comp.flags0.w != 0u);
-        let far_t = (active_dist - fog_start) / (fog_end - fog_start);
-        let far_fog = fog_curve(far_t, u_comp.flags0.z);
-
-        var height_fog = 0.0;
-        if (u_comp.flags1.x != 0u) {
-            let world_y = rel_pos.y + u_comp.height_and_env.x;
-            let base_y = u_comp.height_and_env.y;
-            let below = max(base_y - world_y, 0.0);
-            let h_t = clamp(below / 96.0, 0.0, 1.0) * clamp((active_dist - fog_start * 0.45) / max(fog_end * 0.55, 1.0), 0.0, 1.0);
-            height_fog = fog_curve(h_t, u_comp.flags0.z) * 0.65;
-        }
-        fog_factor = mix_height_fog(far_fog, height_fog, u_comp.flags1.y);
-    }
-
-    if (u_comp.flags0.y != 0u) {
-        // LOD color is already in linear HDR from vs_main; convert sRGB fog color to linear.
-        let lin_fog = pow(max(u_comp.fog_color.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
-        col = mix(col, lin_fog, fog_factor);
-    } else {
-        col = mix(col, u_comp.fog_color.rgb, fog_factor);
-    }
-
-    return vec4<f32>(max(col, vec3<f32>(0.0)), 1.0);
+    record_frame_stats(sections as u64, arena.live_sections() as u64);
 }
-"#;
 
-/// Snapshot of client frame parameters passed from the mod crate to `world_drawn`.
+/// Snapshot of client frame parameters passed from the mod crate to the stage renderer.
 #[derive(Clone, Debug)]
 pub struct RenderFrameParams {
     pub enabled: bool,
@@ -528,7 +426,7 @@ pub struct DhStats {
     pub frames_drawn: u64,
 }
 
-/// Shared runtime state accessible from both `Hooks` and the `sunrise-mod-render` mixins.
+/// Shared runtime state accessible from `Hooks` and the stage renderer.
 pub struct DhRuntime {
     pub enabled_flag: AtomicBool,
     pub rendered_sections: AtomicU64,
@@ -684,13 +582,8 @@ pub fn runtime() -> &'static Arc<DhRuntime> {
     })
 }
 
-/// Called from `src/mixins/render_needs.rs`.
-pub fn needs_world_depth() -> bool {
-    runtime().enabled_flag.load(Ordering::Relaxed)
-}
-
 /// Drain background IO/mesher results and return frame parameters, pending GPU section uploads,
-/// pending generic box-group uploads, and reset epoch for `src/mixins/world_drawn.rs`.
+/// pending generic box-group uploads, and reset epoch for the stage renderer.
 pub fn begin_render_frame(
     camera: [f64; 3],
 ) -> (
@@ -802,7 +695,7 @@ pub fn begin_render_frame(
     (params, uploads, generic_uploads, epoch)
 }
 
-/// Called from `src/mixins/world_drawn.rs` at the end of a frame.
+/// Called by `record_stage` at the end of a frame.
 pub fn record_frame_stats(rendered_sections: u64, rendered_quads: u64) {
     let rt = runtime();
     rt.rendered_sections
