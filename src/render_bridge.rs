@@ -115,23 +115,31 @@ fn vs_main(v: VsIn) -> VsOut {
     let source = (v.packed_meta >> 20u) & 0x3u;
     let is_generic = (v.packed_meta >> 22u) & 1u;
     let unshaded = (v.packed_meta >> 23u) & 1u;
+    let shading_on = (u_frame.flags.x & 1u) != 0u;
+    let is_hdr = ((u_frame.flags.x >> 8u) & 1u) != 0u;
     let debug_mode = u_frame.flags.w;
 
     var graded: vec3<f32>;
     if (debug_mode == 1u || debug_mode == 4u) {
-        graded = detail_debug_color(detail) * dir_shade(normal_idx);
+        let dbg = select(detail_debug_color(detail), pow(max(detail_debug_color(detail), vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
+        graded = dbg * dir_shade(normal_idx);
     } else if (debug_mode == 2u) {
-        graded = source_debug_color(source) * dir_shade(normal_idx);
+        let dbg = select(source_debug_color(source), pow(max(source_debug_color(source), vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
+        graded = dbg * dir_shade(normal_idx);
     } else if (debug_mode == 3u) {
-        graded = vec3<f32>(block_light, 0.5 * (sky_light + block_light), sky_light);
+        let dbg = vec3<f32>(block_light, 0.5 * (sky_light + block_light), sky_light);
+        graded = select(dbg, pow(max(dbg, vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
     } else if (unshaded != 0u) {
-        graded = base.rgb;
+        graded = select(base.rgb, pow(max(base.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
     } else {
+        // Decode sRGB albedo to linear light BEFORE lighting/shading in HDR so light*shade is
+        // not crushed by pow(2.2) in the composite pass (docs/hdr-passes.md).
+        let albedo = select(base.rgb, pow(max(base.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)), is_hdr);
         let sun = u_frame.clip_and_light.w;
         let light = clamp(max(sky_light * sun, block_light) * 0.90 + 0.10, 0.08, 1.0);
 
         var shade = 1.0;
-        if (u_frame.flags.x != 0u && is_generic == 0u) {
+        if (shading_on && is_generic == 0u) {
             shade = dir_shade(normal_idx);
             let height_hint = clamp((v.local_pos.y - 62.0) / 180.0, -0.06, 0.08);
             shade = clamp(shade + height_hint, 0.45, 1.06);
@@ -139,9 +147,12 @@ fn vs_main(v: VsIn) -> VsOut {
 
         let brightness = u_frame.noise_and_grade.z;
         let saturation = u_frame.noise_and_grade.w;
-        graded = base.rgb * light * shade * brightness;
+        graded = albedo * light * shade * brightness;
         let luma = dot(graded, vec3<f32>(0.2126, 0.7152, 0.0722));
-        graded = clamp(mix(vec3<f32>(luma), graded, saturation), vec3<f32>(0.0), vec3<f32>(1.0));
+        graded = max(mix(vec3<f32>(luma), graded, saturation), vec3<f32>(0.0));
+        if (!is_hdr) {
+            graded = min(graded, vec3<f32>(1.0));
+        }
     }
 
     out.clip_pos = clip;
@@ -478,10 +489,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     if (u_comp.flags0.y != 0u) {
-        // Convert sRGB LOD albedo and fog color to linear HDR (docs/hdr-passes.md).
-        let lin_col = pow(max(col, vec3<f32>(0.0)), vec3<f32>(2.2));
+        // LOD color is already in linear HDR from vs_main; convert sRGB fog color to linear.
         let lin_fog = pow(max(u_comp.fog_color.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
-        col = mix(lin_col, lin_fog, fog_factor);
+        col = mix(col, lin_fog, fog_factor);
     } else {
         col = mix(col, u_comp.fog_color.rgb, fog_factor);
     }
