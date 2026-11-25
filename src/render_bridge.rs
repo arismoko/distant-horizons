@@ -675,7 +675,9 @@ pub fn prepare_draws(
         far_dh,
         (frame.vanilla_far_blocks * frame.config.overdraw_prevention).max(0.0),
         frame.sun_brightness,
-        [frame.env_fog_start, frame.env_fog_end, 0.0, 0.0],
+        // DH's own far fog: vanilla's environmental end is about the vanilla render distance, where
+        // the LOD starts, so using it would fog every LOD quad into the sky colour.
+        [far_dh * 0.75, far_dh, 0.0, 0.0],
         frame.fog_color,
         true,
         frame.config.shading_enabled,
@@ -783,6 +785,16 @@ pub fn prepare_draws(
         if let Ok(batch) = context.draw_indirect(OPAQUE_STAGE, &draw) {
             PREPARED.lock().unwrap().push((OPAQUE_STAGE, batch));
         }
+    }
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed).is_multiple_of(300) {
+        eprintln!(
+            "distantsunrises: arena sections high-water {sections}, live {}, opaque commands {}, quad bytes used {}, vanilla far {} blocks",
+            arena.live_sections(),
+            arena.opaque_command_count(),
+            arena.used_geometry_bytes(),
+            frame.vanilla_far_blocks
+        );
     }
     record_frame_stats(sections as u64, arena.live_sections() as u64);
 }
