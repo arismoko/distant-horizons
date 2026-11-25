@@ -8,8 +8,8 @@ use crate::config::{
     DEBUG_SHOW_LIGHTING, DhConfig, KEY_BEACON_BEAMS_ENABLED, KEY_CAVE_CULLING, KEY_CLOUDS_ENABLED,
     KEY_DEBUG_MODE, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FADE_ENABLED, KEY_FOG_ENABLED,
     KEY_HEIGHT_FOG_ENABLED, KEY_HORIZONTAL_QUALITY, KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE,
-    KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED, KEY_SSAO_QUALITY, KEY_VERTICAL_QUALITY, MOD_ID,
-    setting_key,
+    KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED, KEY_SSAO_QUALITY, KEY_THREAD_PRESET,
+    KEY_VERTICAL_QUALITY, MOD_ID, ThreadPreset, setting_key,
 };
 use crate::render_bridge::{runtime, stats};
 use mod_api::{
@@ -132,6 +132,7 @@ pub fn register_client_commands(commands: &mut Vec<ClientCommandRegistration>) {
         " beacons <mode:word>",
         " debug <mode:word>",
         " gen <mode:word>",
+        " threads <preset:word>",
         " cavecull <mode:word>",
         " clear",
         " remesh",
@@ -450,6 +451,26 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
                 ));
             }
         },
+        "threads" => match arg.and_then(ThreadPreset::parse) {
+            Some(preset) => {
+                write_setting(
+                    host,
+                    KEY_THREAD_PRESET,
+                    SettingValue::Choice(preset as usize),
+                );
+                refresh_config(host);
+                let _ = host.chat_line(Text::translate(
+                    "distantsunrises.command.threads_set",
+                    vec![Text::translate(preset.label_key(), Vec::new())],
+                ));
+            }
+            None => {
+                let _ = host.chat_line(Text::translate(
+                    "distantsunrises.command.usage_threads",
+                    Vec::new(),
+                ));
+            }
+        },
         "clear" => {
             let cleared = clear_active_dimension_cache();
             let _ = host.chat_line(Text::translate(
@@ -491,6 +512,7 @@ fn refresh_config(host: &dyn ClientHost) -> DhConfig {
     let rt = runtime();
     rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
     rt.inner.lock().unwrap().config = cfg;
+    rt.gen_pool.reconfigure(cfg.thread_preset);
     cfg
 }
 
