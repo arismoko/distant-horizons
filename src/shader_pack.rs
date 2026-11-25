@@ -6,7 +6,7 @@
 //! MakeUp, Bliss, Photon, etc.), and declares the static pack-binding table matching
 //! `sunrise-org/sunrise#5371` (`PackBinding` on `RenderPipeline`).
 
-use mod_api::client::render_pipeline::{
+use mod_api::{
     PackBinding, PackDepthTarget, PackPassSlot, PackProgramMode, PackUniformDecl, PackUniformType,
     ShaderPackState,
 };
