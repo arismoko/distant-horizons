@@ -356,15 +356,24 @@ pub fn biome_water_color(biome_id: &str, water_color_hint: u32) -> [u8; 3] {
     match name {
         "warm_ocean" => [67, 213, 238],
         "lukewarm_ocean" | "deep_lukewarm_ocean" => [69, 173, 242],
-        "cold_ocean" | "deep_cold_ocean" | "snowy_taiga" => [61, 87, 214],
+        "cold_ocean" | "deep_cold_ocean" | "snowy_taiga" | "snowy_beach" => [61, 87, 214],
         "frozen_ocean" | "deep_frozen_ocean" | "frozen_river" => [57, 56, 201],
         "swamp" => [97, 123, 100],
         "mangrove_swamp" => [58, 122, 106],
         "meadow" => [14, 78, 207],
         "cherry_grove" => [93, 183, 239],
         "pale_garden" => [118, 136, 157],
+        "dappled_forest" => [55, 81, 84],
+        "sulfur_caves" => [52, 191, 137],
         _ => [63, 118, 228],
     }
+}
+
+/// Water surface RGB matching vanilla `LiquidBlockRenderer`: `biome_water_color * water_still.png`.
+pub fn water_surface_color(biome_id: &str, water_color_hint: u32) -> [u8; 3] {
+    let tint = biome_water_color(biome_id, water_color_hint);
+    let tex = crate::resource_colors::water_still_rgba();
+    multiply_rgb([tex[0], tex[1], tex[2]], tint)
 }
 
 fn multiply_rgb(a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
@@ -380,7 +389,7 @@ fn multiply_rgb(a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
 pub fn block_color(block_id: &str, biome_id: &str, water_color_hint: u32) -> [u8; 3] {
     let name = strip_mc_namespace(block_id);
     if matches!(name, "water" | "bubble_column") {
-        return biome_water_color(biome_id, water_color_hint);
+        return water_surface_color(biome_id, water_color_hint);
     }
     if let Some(pack_rgb) = crate::resource_colors::lookup_pack_block_rgb(name) {
         if name == "grass_block" {

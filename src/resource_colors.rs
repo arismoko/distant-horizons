@@ -74,13 +74,42 @@ impl DecodedImage {
             (b_sum / w_sum) as u8,
         ])
     }
+
+    /// Compute unweighted mean RGBA of all pixels (used for translucent `water_still.png`).
+    pub fn average_rgba(&self) -> Option<[u8; 4]> {
+        if self.width == 0 || self.height == 0 || self.rgba.len() < 4 {
+            return None;
+        }
+        let mut r_sum = 0u64;
+        let mut g_sum = 0u64;
+        let mut b_sum = 0u64;
+        let mut a_sum = 0u64;
+        let count = (self.rgba.len() / 4) as u64;
+        for px in self.rgba.as_chunks::<4>().0 {
+            r_sum += px[0] as u64;
+            g_sum += px[1] as u64;
+            b_sum += px[2] as u64;
+            a_sum += px[3] as u64;
+        }
+        Some([
+            (r_sum / count) as u8,
+            (g_sum / count) as u8,
+            (b_sum / count) as u8,
+            (a_sum / count) as u8,
+        ])
+    }
 }
+
+/// Vanilla 26.3 `textures/block/water_still.png` average RGBA (`[177, 177, 177, 180]`).
+pub const VANILLA_WATER_STILL_RGBA: [u8; 4] = [177, 177, 177, 180];
 
 /// Active resource-pack color overrides (thread-safe read from server/mesher threads).
 #[derive(Default)]
 pub struct ResourceColorPack {
     /// Block name without namespace (e.g. `"stone"`, `"oak_planks"`) -> average texture RGB.
     pub block_rgb: HashMap<String, [u8; 3]>,
+    /// Mean RGBA of `textures/block/water_still.png` from the active resource pack.
+    pub water_still_rgba: Option<[u8; 4]>,
     /// Active 256×256 grass colormap (`textures/colormap/grass.png`), if loaded.
     pub grass_colormap: Option<DecodedImage>,
     /// Active 256×256 foliage colormap (`textures/colormap/foliage.png`), if loaded.
@@ -120,6 +149,16 @@ pub fn sample_colormap(grass: bool, temperature: f32, downfall: f32) -> Option<[
     let y = ((1.0 - d) * (img.height - 1) as f32).round() as u32;
     let px = img.pixel(x, y);
     Some([px[0], px[1], px[2]])
+}
+
+/// Mean RGBA of `textures/block/water_still.png` from the active resource pack (falling back to
+/// vanilla 26.3's `[177, 177, 177, 180]`).
+pub fn water_still_rgba() -> [u8; 4] {
+    pack_store()
+        .read()
+        .ok()
+        .and_then(|g| g.water_still_rgba)
+        .unwrap_or(VANILLA_WATER_STILL_RGBA)
 }
 
 /// Number of block textures currently loaded from the active resource pack.
@@ -174,6 +213,9 @@ pub fn reload_from_resources(host: &dyn ReloadContext) -> usize {
             .strip_suffix(".png")
             .unwrap_or(path);
         if tex_id.namespace() == "minecraft" {
+            if stem == "water_still" {
+                next.water_still_rgba = img.average_rgba();
+            }
             raw_textures.insert(stem.to_owned(), rgb);
         } else {
             raw_textures.insert(format!("{}:{stem}", tex_id.namespace()), rgb);

@@ -223,6 +223,12 @@ impl LodColumn {
         self
     }
 
+    #[inline]
+    pub const fn with_fluid_light(mut self, sky_light: u8, block_light: u8) -> Self {
+        self.fluid_rgba[3] = Self::pack_light(sky_light, block_light);
+        self
+    }
+
     pub fn to_bytes(self) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[0..2].copy_from_slice(&self.solid_top_y.to_le_bytes());
@@ -849,54 +855,67 @@ impl DimensionLodStore {
                 );
             }
         }
-        for bucket in &mut by_detail {
-            bucket.sort_by(|a, b| {
-                a.min_horizontal_distance(cam_x, cam_z)
-                    .total_cmp(&b.min_horizontal_distance(cam_x, cam_z))
-            });
-        }
         let mut ordered = Vec::new();
         let mut seen = HashSet::new();
-        // Prioritize the immediate near-horizon detail 0/1 ring so the vanilla border is sharp first.
-        for &detail in &[0usize, 1usize] {
-            let near_cap = if detail == 0 { 192.0 } else { 384.0 };
-            for &pos in &by_detail[detail] {
-                if pos.min_horizontal_distance(cam_x, cam_z) <= near_cap && seen.insert(pos) {
-                    ordered.push(pos);
-                }
-            }
-        }
-        // Then sweep coarse-to-fine across the full render distance.
-        for detail in (0..=MAX_DETAIL as usize).rev() {
-            for &pos in &by_detail[detail] {
+        for bucket in &by_detail {
+            for &pos in bucket {
                 if seen.insert(pos) {
                     ordered.push(pos);
                 }
             }
         }
+        // Sort by DH `WorldGenerationQueue.java:302-304` priority:
+        // `chebyshevDist(center, cam) / (detail + 1)` — coarse sections around the camera fill
+        // the horizon first, then finer detail levels refine outward from the player.
+        ordered.sort_by(|a, b| {
+            let score = |p: SectionPos| {
+                let (ox, oz) = p.block_origin();
+                let half = (p.block_span() as f64) * 0.5;
+                let chebyshev = ((ox as f64 + half) - cam_x)
+                    .abs()
+                    .max(((oz as f64 + half) - cam_z).abs());
+                chebyshev / (p.detail as f64 + 1.0)
+            };
+            score(*a)
+                .total_cmp(&score(*b))
+                .then_with(|| b.detail.cmp(&a.detail))
+        });
         ordered
     }
 }
 
-/// Returns `true` if `pos` or any descendant of `pos` has a ready mesh in `ready_meshes`.
-fn has_ready_descendant(pos: SectionPos, ready_meshes: &HashSet<SectionPos>) -> bool {
+/// Returns `true` if `pos` is completely covered by ready meshes within `max_dist`: either
+/// `pos` itself is ready, it is outside `max_dist`, or every in-range child is completely covered.
+fn is_fully_covered(
+    pos: SectionPos,
+    cam_x: f64,
+    cam_z: f64,
+    max_dist: f64,
+    config: DhConfig,
+    ready_meshes: &HashSet<SectionPos>,
+) -> bool {
+    let dist = pos.min_horizontal_distance(cam_x, cam_z);
+    if dist > max_dist {
+        return true;
+    }
     if ready_meshes.contains(&pos) {
         return true;
     }
-    if let Some(children) = pos.children() {
-        children
+    if pos.detail > 0
+        && dist < config.detail_split_distance_blocks(pos.detail) as f64
+        && let Some(children) = pos.children()
+    {
+        return children
             .iter()
-            .any(|&c| has_ready_descendant(c, ready_meshes))
-    } else {
-        false
+            .all(|&c| is_fully_covered(c, cam_x, cam_z, max_dist, config, ready_meshes));
     }
+    false
 }
 
-/// Returns `true` if `pos` should subdivide at `(cam_x, cam_z)`: a node subdivides into its
-/// children whenever it is within its split distance and at least one child subtree is ready
-/// (avoiding sticking on a partially-populated coarse ancestor while finer detail-0/detail-1
-/// children have already been built and meshed). If some sibling quadrants are not yet ready,
-/// only the ready children are emitted so no child is silently hidden behind a 4096-block root.
+/// Selects renderable LOD sections for `pos` (matches DH `LodQuadTree` coarse-parent fallback):
+/// a ready parent subdivides into its children only when every in-range child is completely
+/// covered, preventing empty void holes when 1–3 sibling quadrants are not yet meshed. If the
+/// parent itself has no ready mesh yet, any ready children are still emitted.
 fn select_node(
     pos: SectionPos,
     cam_x: f64,
@@ -914,10 +933,11 @@ fn select_node(
         && dist < config.detail_split_distance_blocks(pos.detail) as f64
         && let Some(children) = pos.children()
     {
-        let any_descendant_ready = children
+        let parent_ready = ready_meshes.contains(&pos);
+        let all_children_covered = children
             .iter()
-            .any(|&c| has_ready_descendant(c, ready_meshes));
-        if any_descendant_ready {
+            .all(|&c| is_fully_covered(c, cam_x, cam_z, max_dist, config, ready_meshes));
+        if all_children_covered || !parent_ready {
             let mut sub_out = Vec::new();
             for child in children {
                 select_node(
@@ -1023,32 +1043,28 @@ mod tests {
     }
 
     #[test]
-    fn quadtree_selection_subdivides_to_ready_detail0_children_even_when_partial_siblings_missing()
-    {
+    fn quadtree_selection_keeps_ready_parent_until_all_in_range_children_are_covered() {
         let cfg = DhConfig::default();
+        let d1 = SectionPos::new(1, 0, 0);
+        let d0_children = d1.children().unwrap();
         let mut ready = HashSet::new();
-        // Simulate 4 detail-0 sections around origin propagated up to detail-6 root (all ancestors
-        // ready, but only 1 of 4 quadrants populated at detail 5/4/3/2/1).
-        let d0_sections = [
-            SectionPos::new(0, 0, 0),
-            SectionPos::new(0, 1, 0),
-            SectionPos::new(0, 0, 1),
-            SectionPos::new(0, 1, 1),
-        ];
-        for s in d0_sections {
-            ready.insert(s);
-            let mut cur = s;
-            while let Some(p) = cur.parent() {
-                ready.insert(p);
-                cur = p;
-            }
+        ready.insert(d1);
+        // Only 1 of 4 detail-0 children ready: parent d1 must stay rendered so 3 quadrants
+        // do not become empty holes.
+        ready.insert(d0_children[0]);
+        let vis_partial = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
+        assert_eq!(vis_partial, vec![d1]);
+
+        // Once all 4 detail-0 children are ready, d1 subdivides cleanly into its 4 children.
+        for c in d0_children {
+            ready.insert(c);
         }
-        let vis = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
-        assert_eq!(vis.len(), 4);
-        for s in d0_sections {
+        let vis_full = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
+        assert_eq!(vis_full.len(), 4);
+        for c in d0_children {
             assert!(
-                vis.contains(&s),
-                "expected detail-0 section {s:?} in {vis:?}"
+                vis_full.contains(&c),
+                "expected detail-0 child {c:?} in {vis_full:?}"
             );
         }
     }

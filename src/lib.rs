@@ -29,7 +29,7 @@ pub mod storage;
 
 use crate::api::{LodGenRequest, LodGenStep, LodSectionPos, ingest_gen_output};
 use crate::colors::{
-    biome_water_color, block_color, classify_dh_material, is_skippable_for_lod, is_water_block,
+    block_color, classify_dh_material, is_skippable_for_lod, is_water_block, water_surface_color,
 };
 use crate::commands::DhKeybinds;
 use crate::config::{DhConfig, MOD_ID};
@@ -365,9 +365,11 @@ impl Hooks for DistantHorizonsMod {
         };
         st.env_fog_start = event.fog.environmental_start;
         st.env_fog_end = event.fog.environmental_end;
-        if event.fog.render_distance_end.is_finite() && event.fog.render_distance_end > 16.0 {
-            st.vanilla_far_blocks = event.fog.render_distance_end;
-        }
+        // Vanilla render distance in blocks (matches DH `MinecraftClientWrapper.getRenderDistance()` * 16).
+        // Do NOT read `event.fog.render_distance_end`, which becomes `2e9` when Sunrise fog is disabled
+        // and would push `clip_dist` to ~1e9 (discarding all DS chunks).
+        let rd_chunks = host.graphics_options().render_distance.max(2);
+        st.vanilla_far_blocks = (rd_chunks as f32) * 16.0;
         // Disable vanilla atmospheric environmental + render-distance fog so foreground chunks
         // are not hazed out at the vanilla border before Distant Sunrises draws far fog
         // (matches DH `MixinFogRenderer.java:144-148` and Sunrise `fog.rs:447-448`).
@@ -631,6 +633,7 @@ fn sample_loaded_chunks(
 
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
+    let max_spans = st.config.vertical_quality.clamp(1, 8) as usize;
     let store = st.dimensions.entry(dim.to_owned()).or_default();
 
     for (ci, ([cx, cz], snap_opt)) in snapshots.iter().enumerate() {
@@ -647,15 +650,23 @@ fn sample_loaded_chunks(
                 };
                 let bx = bx0 + i32::from(lx);
                 let bz = bz0 + i32::from(lz);
-                let y_min = base_y - (LOADED_SCAN_BELOW as i32) + 1;
+                let ocean_y = snap
+                    .heightmap(Heightmap::OceanFloor, lx, lz)
+                    .unwrap_or(base_y);
+                let y_min = (base_y - (LOADED_SCAN_BELOW as i32) + 1)
+                    .min(ocean_y - 2)
+                    .max(snap.min_y());
                 let y_max = base_y + (LOADED_SCAN_ABOVE as i32);
 
                 let mut fluid_top: Option<i32> = None;
-                let mut solid_top: Option<(i32, &str)> = None;
+                // Contiguous vertical solid spans `(top_y, lowest_solid_y, top_block_id)` for
+                // tree canopies, overhangs, and ground underneath (DH `EDhApiVerticalQuality`).
+                let mut solid_spans: Vec<(i32, i32, &str)> = Vec::with_capacity(max_spans);
+                let mut in_solid_span = false;
                 let mut beacon_y: Option<i32> = None;
                 let mut beacon_tint: Option<[u8; 3]> = None;
 
-                // Scan top-down through the sampled band for surface + any sky-visible beacon & stained glass tint.
+                // Scan top-down through the sampled band for surface + vertical spans + beacons.
                 for y in (y_min..=y_max).rev() {
                     let block_id = match snap.block_state(lx, y, lz) {
                         Some(state) => *block_id_cache
@@ -667,19 +678,23 @@ fn sample_loaded_chunks(
                         beacon_y = Some(y);
                     }
                     if is_water_block(block_id) {
+                        in_solid_span = false;
                         if fluid_top.is_none() {
                             fluid_top = Some(y);
                         }
                         continue;
                     }
                     if is_skippable_for_lod(block_id) {
+                        in_solid_span = false;
                         continue;
                     }
-                    if solid_top.is_none() {
-                        solid_top = Some((y, block_id));
-                        if beacon_y.is_some() {
-                            break;
+                    if in_solid_span {
+                        if let Some(last) = solid_spans.last_mut() {
+                            last.1 = y;
                         }
+                    } else if solid_spans.len() < max_spans {
+                        solid_spans.push((y, y, block_id));
+                        in_solid_span = true;
                     }
                 }
 
@@ -703,10 +718,17 @@ fn sample_loaded_chunks(
                     }
                 }
 
-                let (top_y, block_id) = match solid_top {
-                    Some(v) => v,
+                let (top_y, primary_bot_y, block_id) = match solid_spans.first().copied() {
+                    Some((ty, by, id)) => {
+                        let bot = if solid_spans.len() > 1 {
+                            by - 1
+                        } else {
+                            (by - 1).min(ty - 8)
+                        };
+                        (ty, bot, id)
+                    }
                     None => match fluid_top {
-                        Some(fy) => (fy - 4, "minecraft:sand"),
+                        Some(fy) => (fy - 4, fy - 12, "minecraft:sand"),
                         None => continue,
                     },
                 };
@@ -715,24 +737,74 @@ fn sample_loaded_chunks(
                     .biome(lx, top_y, lz)
                     .map(|k| k.identifier().as_str())
                     .unwrap_or("minecraft:plains");
+                let fluid_biome_id = fluid_top
+                    .and_then(|fy| snap.biome(lx, fy, lz))
+                    .map(|k| k.identifier().as_str())
+                    .unwrap_or(biome_id);
                 let solid_rgb = block_color(block_id, biome_id, 0);
-                let fluid_rgb = biome_water_color(biome_id, 0);
+                let fluid_rgb = water_surface_color(fluid_biome_id, 0);
+                let (solid_sky, solid_blk) = if snap.has_light() {
+                    snap.light(lx, top_y + 1, lz).unwrap_or((15, 0))
+                } else {
+                    let sky = match fluid_top {
+                        Some(fy) if fy > top_y => 15u8.saturating_sub((fy - top_y).min(15) as u8),
+                        _ => 15,
+                    };
+                    (sky, 0)
+                };
+                let (fluid_sky, fluid_blk) = match fluid_top {
+                    Some(fy) if snap.has_light() => snap.light(lx, fy + 1, lz).unwrap_or((15, 0)),
+                    _ => (15, 0),
+                };
                 let lod_col = LodColumn::from_solid_and_fluid(
                     top_y,
-                    top_y - 8,
+                    primary_bot_y,
                     solid_rgb,
                     fluid_top,
                     fluid_rgb,
-                    15,
-                    0,
+                    solid_sky,
+                    solid_blk,
                     SOURCE_LOADED_CHUNK,
                 )
+                .with_fluid_light(fluid_sky, fluid_blk)
                 .with_material(classify_dh_material(block_id));
+
+                let mut extra_spans = Vec::new();
+                for &(s_top, s_bot, s_block) in solid_spans.iter().skip(1) {
+                    let s_biome = snap
+                        .biome(lx, s_top, lz)
+                        .map(|k| k.identifier().as_str())
+                        .unwrap_or(biome_id);
+                    let s_rgb = block_color(s_block, s_biome, 0);
+                    let (s_sky, s_blk) = if snap.has_light() {
+                        snap.light(lx, s_top + 1, lz).unwrap_or((12, 0))
+                    } else {
+                        (12, 0)
+                    };
+                    let s_bot_clamped = (s_bot - 1).clamp(i16::MIN as i32 + 1, s_top - 1) as i16;
+                    extra_spans.push(crate::lod::ExtraSpan {
+                        top_y: s_top.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16,
+                        bottom_y: s_bot_clamped,
+                        rgba: [
+                            s_rgb[0],
+                            s_rgb[1],
+                            s_rgb[2],
+                            LodColumn::pack_light(s_sky, s_blk),
+                        ],
+                        is_fluid: false,
+                        material_id: classify_dh_material(s_block),
+                    });
+                }
 
                 let sec_pos = SectionPos::from_block(0, bx, bz);
                 let (cell_x, cell_z) = sec_pos.local_cell(bx, bz);
                 let sec = store.get_or_create_mut(sec_pos);
-                if sec.set_cell(cell_x, cell_z, lod_col) {
+                let changed = if extra_spans.is_empty() {
+                    sec.set_cell(cell_x, cell_z, lod_col)
+                } else {
+                    sec.set_cell_with_spans(cell_x, cell_z, lod_col, extra_spans)
+                };
+                if changed {
                     dirty_sections.insert(sec_pos);
                     if collect_deltas {
                         let entry = deltas.entry(sec_pos).or_default();
@@ -997,17 +1069,25 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
                         .entry(col.block)
                         .or_insert_with(|| col.block.id(host).unwrap_or("minecraft:stone"));
                     let solid_rgb = block_color(block_id, &col.biome, 0);
-                    let fluid_rgb = biome_water_color(&col.biome, 0);
+                    let fluid_rgb = water_surface_color(&col.biome, 0);
+                    // Water attenuates sky light by 1 per block of depth (vanilla `WaterFluid.getLightBlock = 1`).
+                    let solid_sky = match col.water {
+                        Some(wy) if wy > col.height => {
+                            15u8.saturating_sub((wy - col.height).min(15) as u8)
+                        }
+                        _ => 15,
+                    };
                     let lod_col = LodColumn::from_solid_and_fluid(
                         col.height,
                         col.height - skirt,
                         solid_rgb,
                         col.water,
                         fluid_rgb,
-                        15,
+                        solid_sky,
                         0,
                         SOURCE_DISTANT_SURFACE,
                     )
+                    .with_fluid_light(15, 0)
                     .with_material(classify_dh_material(block_id));
                     if sec.set_cell(cx, cz, lod_col) {
                         updated_any = true;
