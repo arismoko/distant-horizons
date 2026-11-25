@@ -8,7 +8,7 @@
 //! - Background meshing worker generates greedy-merged, face-culled solid and fluid meshes.
 //! - Client side tracks camera, day-time lighting, settings (`Options > Mods`), fog colors
 //!   (`render_fog`), and F3 debug telemetry (`register_debug_entries`).
-//! - `sunrise-mod-render` mixins (`render_needs`, `world_drawn`) render LOD geometry with an
+//! - A GPU-driven renderer (`gpu_arena` + GLSL compute/indirect pipelines, no `[native.*]`) renders LOD geometry with an
 //!   independent reversed-Z depth buffer and sky-masked atmospheric fog compositing.
 
 pub mod api;
@@ -19,6 +19,7 @@ pub mod config;
 pub mod dh_v2;
 pub mod gen_worker;
 pub mod generic_render;
+pub mod gpu_arena;
 pub mod lod;
 pub mod mesh;
 pub mod network;
@@ -81,6 +82,29 @@ impl Hooks for DistantHorizonsMod {
         DhConfig::register_settings(registrar);
         commands::register_key_mappings(registrar);
         network::register_payloads(registrar);
+    }
+
+    fn register_render_pipelines(
+        &self,
+        _context: &RegistrationContext,
+        event: &mut mod_api::RegisterRenderPipelinesEvent<'_>,
+    ) {
+        render_bridge::register_pipelines(event);
+    }
+
+    fn render_level_stage(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::RenderLevelStageEvent<'_>,
+    ) {
+        if event.stage != mod_api::RenderLevelStage::AfterOpaqueBlocks || !host.on(MOD_ID) {
+            return;
+        }
+        let Some(camera) = runtime().inner.lock().unwrap().camera else {
+            return;
+        };
+        let (frame, _, _, _) = render_bridge::begin_render_frame(camera.position);
+        render_bridge::record_stage(host, event, &frame, &camera);
     }
 
     fn client_setup(&self, host: &mut dyn ClientSetupContext, _event: &mut ClientSetupEvent) {
@@ -167,6 +191,7 @@ impl Hooks for DistantHorizonsMod {
         _host: &mut dyn ClientHost,
         event: &mut ClientLevelUnloadEvent<'_>,
     ) {
+        let _ = render_bridge::clear_dimension(event.dimension);
         let remote_cache = {
             let mut st = runtime().inner.lock().unwrap();
             st.remote_requested.remove(event.dimension);
@@ -217,6 +242,22 @@ impl Hooks for DistantHorizonsMod {
     }
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
+        if host.on(MOD_ID) {
+            let limits = host.device_buffer_limits();
+            let _ = render_bridge::upload_pending(
+                host,
+                gpu_arena::DeviceBufferLimits {
+                    max_buffer_size: limits.max_buffer_size,
+                    max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+                },
+                gpu_arena::ArenaConfig {
+                    max_sections: gpu_arena::VOXY_MAX_SECTIONS,
+                    geometry_bytes: gpu_arena::voxy_geometry_capacity(
+                        limits.max_storage_buffer_binding_size,
+                    ),
+                },
+            );
+        }
         let rt = runtime();
         let cfg = DhConfig::read_from_host(host);
         rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
