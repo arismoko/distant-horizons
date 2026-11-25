@@ -62,11 +62,12 @@ const LOADED_SCAN_ABOVE: u32 = 2;
 
 /// Number of loaded chunks sampled per server tick when time remains.
 const CHUNKS_PER_TICK: usize = 4;
-/// Minimum and maximum quiet interval after a synchronous `terrain_surface` batch on the server
-/// thread. Actual cooldown is `batch_duration * DISTANT_SAMPLE_COOLDOWN_MULT` clamped to this
-/// range, keeping synchronous fallback generation (until off-thread detached generation lands)
-/// at ~10% of the server thread on slow CPUs while still filling quickly on fast CPUs.
-const DISTANT_SAMPLE_MIN_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(20);
+/// Per-tick wall-time budget for synchronous server-thread `terrain_surface` fallback batches
+/// (8% of a 50 ms server tick). On fast CPUs multiple 64-column batches run per tick within this
+/// budget; if a single batch exceeds it on a slower CPU, a post-completion cooldown of
+/// `elapsed * DISTANT_SAMPLE_COOLDOWN_MULT` (capped at `DISTANT_SAMPLE_MAX_COOLDOWN`) keeps the
+/// server thread under ~10% duty cycle until off-thread detached generation lands.
+const DISTANT_SAMPLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
 const DISTANT_SAMPLE_MAX_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(250);
 const DISTANT_SAMPLE_COOLDOWN_MULT: u32 = 9;
 
@@ -523,31 +524,35 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             },
             st.config,
             st.active_dimension.clone(),
-            st.server_player_round_robin,
+            st.server_player_round_robin.get(dim).copied().unwrap_or(0),
         )
     };
 
     if distant_on && host.server_has_time() {
         let dim_id = mod_api::Identifier::parse(dim).ok();
-        let player_centers: Vec<[f64; 3]> = host
+        let player_centers: Vec<(u128, [f64; 3])> = host
             .players()
             .server_players()
             .into_iter()
             .filter(|&p| dim_id.is_some() && p.dimension(host) == dim_id)
-            .filter_map(|p| EntityRef::from(p).position(host))
+            .filter_map(|p| EntityRef::from(p).position(host).map(|pos| (p.uuid(), pos)))
             .collect();
         let center_opt = if !player_centers.is_empty() {
             Some(player_centers[rr_cursor % player_centers.len()])
         } else if dim == active_dim {
-            cam
+            cam.map(|pos| (0u128, pos))
         } else {
             None
         };
-        if let Some(center) = center_opt
-            && sample_distant_sections(host, dim, center, cfg, &mut dirty_sections)
+        if let Some((player_key, center)) = center_opt
+            && sample_distant_sections(host, dim, player_key, center, cfg, &mut dirty_sections)
         {
             let mut st = rt.inner.lock().unwrap();
-            st.server_player_round_robin = st.server_player_round_robin.wrapping_add(1);
+            let entry = st
+                .server_player_round_robin
+                .entry(dim.to_owned())
+                .or_insert(0);
+            *entry = entry.wrapping_add(1);
         }
     }
 
@@ -771,26 +776,28 @@ fn sample_loaded_chunks(
 }
 
 /// Advances unthrottled async disk-load checks and, when this dimension's cooldown has elapsed,
-/// runs one small distant-sampling batch. Returns `true` when sampling work actually ran (so
-/// callers can advance multi-player round-robin fairly).
+/// runs distant-sampling batches up to `DISTANT_SAMPLE_BUDGET` (4 ms/tick). Returns `true` when
+/// sampling work actually ran (so callers can advance per-dimension player round-robin fairly).
 fn sample_distant_sections(
     host: &dyn ServerHost,
     dim: &str,
+    player_key: u128,
     cam: [f64; 3],
     cfg: DhConfig,
     dirty_sections: &mut HashSet<SectionPos>,
 ) -> bool {
     let rt = runtime();
     let cam_block = [cam[0].floor() as i32, cam[2].floor() as i32];
+    let cache_key = (dim.to_owned(), player_key);
 
-    // Refresh the cached desired-section list when config changes or the camera moves at least
-    // `SECTION_SIZE` (64) blocks Manhattan distance (matching DH's `QuadTree.setCenterBlockPos`
-    // using `FullDataSourceV2.WIDTH` = 64 for `blockDistanceForNodeClearing`). Within that
-    // 64-block window, section ordering and detail splits may lag by up to 63 blocks.
-    // Issue async disk loads unthrottled; throttle only the synchronous sampling batch per dim.
-    let (target_section, custom_gen, builtin_disabled) = {
+    // Refresh the cached desired-section list for `(dim, player_key)` when config changes or the
+    // camera moves at least `SECTION_SIZE` (64) blocks Manhattan distance (matching DH's
+    // `QuadTree.setCenterBlockPos` using `FullDataSourceV2.WIDTH` = 64 for
+    // `blockDistanceForNodeClearing`). Within that 64-block window, ordering and detail splits
+    // may lag by up to 63 blocks. Async disk loads always run unthrottled.
+    {
         let mut st = rt.inner.lock().unwrap();
-        let needs_rebuild = match st.desired_cache.get(dim) {
+        let needs_rebuild = match st.desired_cache.get(&cache_key) {
             Some(c) => {
                 c.config != cfg
                     || (c.center[0] - cam_block[0]).abs() + (c.center[1] - cam_block[1]).abs()
@@ -801,7 +808,7 @@ fn sample_distant_sections(
         if needs_rebuild {
             let list = DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg);
             st.desired_cache.insert(
-                dim.to_owned(),
+                cache_key.clone(),
                 render_bridge::DesiredCache {
                     center: cam_block,
                     config: cfg,
@@ -812,8 +819,6 @@ fn sample_distant_sections(
             );
         }
 
-        let custom_gen = st.world_generators.get(dim).cloned();
-        let builtin_disabled = st.disabled_builtin_gen.contains(dim);
         let save_root = st.world_dir.clone();
         let now = std::time::Instant::now();
         let sample_due = st
@@ -822,7 +827,7 @@ fn sample_distant_sections(
             .is_none_or(|&next| now >= next);
 
         let st_ref = &mut *st;
-        let cache = st_ref.desired_cache.get_mut(dim).unwrap();
+        let cache = st_ref.desired_cache.get_mut(&cache_key).unwrap();
         let store = st_ref.dimensions.entry(dim.to_owned()).or_default();
 
         // Trigger background disk loads for up to 8 unseen sections per tick (unthrottled).
@@ -841,154 +846,183 @@ fn sample_distant_sections(
         if !sample_due {
             return false;
         }
+    }
 
-        let mut picked = None;
-        while cache.sample_cursor < cache.list.len() {
-            let pos = cache.list[cache.sample_cursor];
-            if store.sampled_distant_sections.contains(&pos) {
-                cache.sample_cursor += 1;
-                continue;
-            }
-            let sec = store.sections.get(&pos);
-            let mut missing = Vec::with_capacity(DISTANT_COLS_PER_TICK);
-            for cz in 0..SECTION_SIZE {
-                for cx in 0..SECTION_SIZE {
-                    let is_empty = sec.map(|s| s.get(cx, cz).is_empty()).unwrap_or(true);
-                    if is_empty {
-                        missing.push((cx, cz));
-                        if missing.len() >= DISTANT_COLS_PER_TICK.min(MAX_TERRAIN_COLUMNS) {
-                            break;
+    let budget_start = std::time::Instant::now();
+    let mut ran_any = false;
+
+    loop {
+        let (target_section, custom_gen, builtin_disabled) = {
+            let mut st = rt.inner.lock().unwrap();
+            let custom_gen = st.world_generators.get(dim).cloned();
+            let builtin_disabled = st.disabled_builtin_gen.contains(dim);
+            let st_ref = &mut *st;
+            let Some(cache) = st_ref.desired_cache.get_mut(&cache_key) else {
+                break;
+            };
+            let store = st_ref.dimensions.entry(dim.to_owned()).or_default();
+
+            let mut picked = None;
+            while cache.sample_cursor < cache.list.len() {
+                let pos = cache.list[cache.sample_cursor];
+                if store.sampled_distant_sections.contains(&pos) {
+                    cache.sample_cursor += 1;
+                    continue;
+                }
+                let sec = store.sections.get(&pos);
+                let mut missing = Vec::with_capacity(DISTANT_COLS_PER_TICK);
+                for cz in 0..SECTION_SIZE {
+                    for cx in 0..SECTION_SIZE {
+                        let is_empty = sec.map(|s| s.get(cx, cz).is_empty()).unwrap_or(true);
+                        if is_empty {
+                            missing.push((cx, cz));
+                            if missing.len() >= DISTANT_COLS_PER_TICK.min(MAX_TERRAIN_COLUMNS) {
+                                break;
+                            }
                         }
                     }
+                    if missing.len() >= DISTANT_COLS_PER_TICK.min(MAX_TERRAIN_COLUMNS) {
+                        break;
+                    }
                 }
-                if missing.len() >= DISTANT_COLS_PER_TICK.min(MAX_TERRAIN_COLUMNS) {
+                if missing.is_empty() {
+                    store.sampled_distant_sections.insert(pos);
+                    cache.sample_cursor += 1;
+                } else {
+                    picked = Some((pos, missing));
                     break;
                 }
             }
-            if missing.is_empty() {
-                store.sampled_distant_sections.insert(pos);
-                cache.sample_cursor += 1;
-            } else {
-                picked = Some((pos, missing));
+            (picked, custom_gen, builtin_disabled)
+        };
+
+        let Some((pos, cells)) = target_section else {
+            break;
+        };
+
+        // If a mod registered a custom `LodWorldGenerator` covering this detail level, delegate
+        // generation to it instead of calling built-in `terrain_surface`.
+        if let Some(generator) = custom_gen
+            && generator.detail_range().contains(&pos.detail)
+        {
+            generator.pre_task_start();
+            let req = LodGenRequest {
+                dimension: dim.to_owned(),
+                pos: LodSectionPos::from(pos),
+                target_step: LodGenStep::Surface,
+            };
+            let mut produced = 0usize;
+            generator.generate(&req, &mut |out| {
+                if let Ok(n) = ingest_gen_output(dim, out) {
+                    produced = produced.saturating_add(n);
+                }
+            });
+            let mut st = rt.inner.lock().unwrap();
+            let store = st.dimensions.entry(dim.to_owned()).or_default();
+            store.sampled_distant_sections.insert(pos);
+            store.generated_columns = store.generated_columns.saturating_add(produced as u64);
+            ran_any = true;
+            if budget_start.elapsed() >= DISTANT_SAMPLE_BUDGET {
                 break;
             }
+            continue;
         }
-        (picked, custom_gen, builtin_disabled)
-    };
 
-    let Some((pos, cells)) = target_section else {
-        return false;
-    };
+        if builtin_disabled {
+            let mut st = rt.inner.lock().unwrap();
+            st.next_distant_sample.insert(
+                dim.to_owned(),
+                std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
+            );
+            return ran_any;
+        }
 
-    // If a mod registered a custom `LodWorldGenerator` covering this detail level, delegate
-    // generation to it instead of calling built-in `terrain_surface`.
-    if let Some(generator) = custom_gen
-        && generator.detail_range().contains(&pos.detail)
-    {
-        let t0 = std::time::Instant::now();
-        generator.pre_task_start();
-        let req = LodGenRequest {
-            dimension: dim.to_owned(),
-            pos: LodSectionPos::from(pos),
-            target_step: LodGenStep::Surface,
+        let (ox, oz) = pos.block_origin();
+        let step = pos.cell_size();
+        let half = step >> 1;
+        let query_cols: Vec<(i32, i32)> = cells
+            .iter()
+            .map(|&(cx, cz)| {
+                (
+                    ox + (cx as i32) * step + half,
+                    oz + (cz as i32) * step + half,
+                )
+            })
+            .collect();
+
+        let Ok(samples) = host.terrain_surface(dim, &query_cols) else {
+            let cooldown = (budget_start.elapsed() * DISTANT_SAMPLE_COOLDOWN_MULT)
+                .min(DISTANT_SAMPLE_MAX_COOLDOWN);
+            rt.inner
+                .lock()
+                .unwrap()
+                .next_distant_sample
+                .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
+            return ran_any;
         };
-        let mut produced = 0usize;
-        generator.generate(&req, &mut |out| {
-            if let Ok(n) = ingest_gen_output(dim, out) {
-                produced = produced.saturating_add(n);
-            }
-        });
-        let cooldown = (t0.elapsed() * DISTANT_SAMPLE_COOLDOWN_MULT)
-            .clamp(DISTANT_SAMPLE_MIN_COOLDOWN, DISTANT_SAMPLE_MAX_COOLDOWN);
+
         let mut st = rt.inner.lock().unwrap();
-        st.next_distant_sample
-            .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
         let store = st.dimensions.entry(dim.to_owned()).or_default();
-        store.sampled_distant_sections.insert(pos);
-        store.generated_columns = store.generated_columns.saturating_add(produced as u64);
-        return true;
-    }
+        let mut updated_any = false;
+        let mut non_empty_count = 0u64;
 
-    if builtin_disabled {
-        let mut st = rt.inner.lock().unwrap();
-        st.next_distant_sample.insert(
-            dim.to_owned(),
-            std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
-        );
-        return false;
-    }
-
-    let (ox, oz) = pos.block_origin();
-    let step = pos.cell_size();
-    let half = step >> 1;
-    let query_cols: Vec<(i32, i32)> = cells
-        .iter()
-        .map(|&(cx, cz)| {
-            (
-                ox + (cx as i32) * step + half,
-                oz + (cz as i32) * step + half,
-            )
-        })
-        .collect();
-
-    let t0 = std::time::Instant::now();
-    let samples_res = host.terrain_surface(dim, &query_cols);
-    let cooldown = (t0.elapsed() * DISTANT_SAMPLE_COOLDOWN_MULT)
-        .clamp(DISTANT_SAMPLE_MIN_COOLDOWN, DISTANT_SAMPLE_MAX_COOLDOWN);
-
-    let Ok(samples) = samples_res else {
-        rt.inner
-            .lock()
-            .unwrap()
-            .next_distant_sample
-            .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
-        return true;
-    };
-
-    let mut st = rt.inner.lock().unwrap();
-    st.next_distant_sample
-        .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
-    let store = st.dimensions.entry(dim.to_owned()).or_default();
-    let mut updated_any = false;
-    let mut non_empty_count = 0u64;
-
-    {
-        let sec = store.get_or_create_mut(pos);
-        for (&(cx, cz), sample) in cells.iter().zip(samples.iter()) {
-            let Some(col) = sample else {
-                continue;
-            };
-            let block_id = col.block.id(host).unwrap_or("minecraft:stone");
-            let solid_rgb = block_color(block_id, &col.biome, 0);
-            let fluid_rgb = biome_water_color(&col.biome, 0);
-            let skirt = (step * 4).clamp(8, 32);
-            let lod_col = LodColumn::from_solid_and_fluid(
-                col.height,
-                col.height - skirt,
-                solid_rgb,
-                col.water,
-                fluid_rgb,
-                15,
-                0,
-                SOURCE_DISTANT_SURFACE,
-            )
-            .with_material(classify_dh_material(block_id));
-            if sec.set_cell(cx, cz, lod_col) {
-                updated_any = true;
+        {
+            let sec = store.get_or_create_mut(pos);
+            for (&(cx, cz), sample) in cells.iter().zip(samples.iter()) {
+                let Some(col) = sample else {
+                    continue;
+                };
+                let block_id = col.block.id(host).unwrap_or("minecraft:stone");
+                let solid_rgb = block_color(block_id, &col.biome, 0);
+                let fluid_rgb = biome_water_color(&col.biome, 0);
+                let skirt = (step * 4).clamp(8, 32);
+                let lod_col = LodColumn::from_solid_and_fluid(
+                    col.height,
+                    col.height - skirt,
+                    solid_rgb,
+                    col.water,
+                    fluid_rgb,
+                    15,
+                    0,
+                    SOURCE_DISTANT_SURFACE,
+                )
+                .with_material(classify_dh_material(block_id));
+                if sec.set_cell(cx, cz, lod_col) {
+                    updated_any = true;
+                }
+                non_empty_count += 1;
             }
-            non_empty_count += 1;
+        }
+
+        store.generated_columns = store.generated_columns.saturating_add(non_empty_count);
+        if !updated_any {
+            // Void / partial-None section with no further fillable cells: mark sampled so
+            // `sample_cursor` advances past it instead of re-picking it forever.
+            store.sampled_distant_sections.insert(pos);
+        }
+        if updated_any {
+            dirty_sections.insert(pos);
+        }
+        ran_any = true;
+
+        if budget_start.elapsed() >= DISTANT_SAMPLE_BUDGET {
+            break;
         }
     }
 
-    store.generated_columns = store.generated_columns.saturating_add(non_empty_count);
-    if non_empty_count == 0 {
-        // Void / generatorless dimension: don't loop forever on the same section.
-        store.sampled_distant_sections.insert(pos);
+    if ran_any {
+        let elapsed = budget_start.elapsed();
+        if elapsed > DISTANT_SAMPLE_BUDGET {
+            let cooldown =
+                (elapsed * DISTANT_SAMPLE_COOLDOWN_MULT).min(DISTANT_SAMPLE_MAX_COOLDOWN);
+            rt.inner
+                .lock()
+                .unwrap()
+                .next_distant_sample
+                .insert(dim.to_owned(), std::time::Instant::now() + cooldown);
+        }
     }
-    if updated_any {
-        dirty_sections.insert(pos);
-    }
-    true
+    ran_any
 }
 
 fn flush_dimension_dirty(world_dir: Option<std::path::PathBuf>, dim: &str) {

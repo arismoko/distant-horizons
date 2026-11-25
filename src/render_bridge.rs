@@ -575,12 +575,14 @@ pub struct DhState {
     pub remote_config_requested: bool,
     /// Per-server local disk cache root when connected to a remote multiplayer server.
     pub remote_cache_dir: Option<PathBuf>,
-    /// Round-robin cursor across connected players for dedicated/LAN server distant generation.
-    pub server_player_round_robin: usize,
-    /// Per-dimension cached desired-section order, keyed by camera center (rebuilt when Manhattan
-    /// distance reaches `SECTION_SIZE` = 64 blocks, matching DH's `QuadTree.setCenterBlockPos`
-    /// threshold `FullDataSourceV2.WIDTH`) and config.
-    pub desired_cache: HashMap<String, DesiredCache>,
+    /// Per-dimension round-robin cursor across connected players for dedicated/LAN server distant
+    /// generation (per dimension so two dimensions with equal player counts do not alias).
+    pub server_player_round_robin: HashMap<String, usize>,
+    /// Cached desired-section order keyed by `(dimension, player_uuid)` (`0` for local camera),
+    /// rebuilt when config changes or the camera moves at least `SECTION_SIZE` (64) blocks
+    /// Manhattan distance (matching DH's `QuadTree.setCenterBlockPos` threshold
+    /// `FullDataSourceV2.WIDTH`).
+    pub desired_cache: HashMap<(String, u128), DesiredCache>,
     /// Earliest instant the next synchronous distant-sampling batch may run for each dimension.
     pub next_distant_sample: HashMap<String, Instant>,
     /// Generic box groups (beacons, clouds, and third-party mod groups) per dimension.
@@ -639,7 +641,7 @@ impl Default for DhState {
             remote_session_config: None,
             remote_config_requested: false,
             remote_cache_dir: None,
-            server_player_round_robin: 0,
+            server_player_round_robin: HashMap::new(),
             desired_cache: HashMap::new(),
             next_distant_sample: HashMap::new(),
             generic_groups: HashMap::new(),

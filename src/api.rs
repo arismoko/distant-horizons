@@ -583,7 +583,12 @@ pub fn invalidate_lod_section(dimension: &str, pos: LodSectionPos) -> bool {
         store.sampled_distant_sections.remove(&sec_pos);
         store.disk_checked.remove(&sec_pos);
     }
-    st.desired_cache.remove(dimension);
+    for ((dim, _), cache) in &mut st.desired_cache {
+        if dim == dimension {
+            cache.disk_cursor = 0;
+            cache.sample_cursor = 0;
+        }
+    }
     if let Some(meshed) = st.meshed_sections.get_mut(dimension) {
         meshed.remove(&sec_pos);
     }
