@@ -159,13 +159,17 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
         ),
     ] {
         event.register(
-            RenderPipeline::new(id(name), id(SHADER_QUADS), blend, WorldDepth::Tested)
-                .vertex_shader(id(slot.vertex_shader()))
-                .topology(PrimitiveTopology::Triangles)
-                .cull(false)
-                .bind_group_layout(pack_layout())
-                .pack_binding(slot.pack_binding())
-                .optional(),
+            RenderPipeline::new(
+                id(name),
+                id(slot.vertex_shader()),
+                blend,
+                WorldDepth::Tested,
+            )
+            .topology(PrimitiveTopology::Triangles)
+            .cull(false)
+            .bind_group_layout(pack_layout())
+            .pack_binding(slot.pack_binding())
+            .optional(),
         );
     }
     register_compute(event);
