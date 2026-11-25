@@ -107,13 +107,13 @@ pub fn ingest_loaded_chunk(
     let mut guard = PIPELINE.lock().unwrap();
     let p = &mut *guard;
     let store = p.stores.entry(dim.to_owned()).or_default();
-    let mapper = &mut p.mapper;
+    let mapper = std::cell::RefCell::new(&mut p.mapper);
     let accepted = ingest_chunk_snapshot(
         store,
         chunk,
         snapshot,
-        &mut |state| mapper.block(host, state),
-        &mut |biome| mapper.biome(biome),
+        &mut |state| mapper.borrow_mut().block(host, state),
+        &mut |biome| mapper.borrow_mut().biome(biome),
     );
     if accepted {
         let mapper = &p.mapper;
@@ -248,6 +248,15 @@ fn model_words(m: &BakedModel) -> [u32; MODEL_WORDS as usize] {
     w
 }
 
+/// The mesher packs light as `block << 4 | sky`; `voxy_quads.fsh` reads `sky << 4 | block`
+/// (Voxy's light id), so the nibbles swap on the way into the arena.
+fn arena_quad(q: crate::mesh::PackedQuad) -> crate::gpu_arena::PackedQuad {
+    const SHIFT: u32 = 55;
+    let light = (q.0 >> SHIFT) & 0xFF;
+    let swapped = ((light & 0xF) << 4) | (light >> 4);
+    crate::gpu_arena::PackedQuad((q.0 & !(0xFF << SHIFT)) | (swapped << SHIFT))
+}
+
 /// Buckets a mesh for the arena: bucket 0 translucent, 1 double-sided (unused), `2 + face` opaque.
 fn built_section(quads: &SectionQuads) -> BuiltSection {
     let mut by_bucket: [Vec<_>; BUCKETS] = Default::default();
@@ -259,7 +268,7 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
     let mut all = Vec::with_capacity(quads.quad_count() as usize);
     for (i, bucket) in by_bucket.into_iter().enumerate() {
         counts[i] = bucket.len() as u16;
-        all.extend(bucket);
+        all.extend(bucket.into_iter().map(arena_quad));
     }
     let size = |i: usize| quads.aabb_max[i].saturating_sub(quads.aabb_min[i]).clamp(1, 32);
     BuiltSection {
