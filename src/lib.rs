@@ -365,9 +365,11 @@ impl Hooks for DistantHorizonsMod {
         };
         st.env_fog_start = event.fog.environmental_start;
         st.env_fog_end = event.fog.environmental_end;
-        if event.fog.render_distance_end.is_finite() && event.fog.render_distance_end > 16.0 {
-            st.vanilla_far_blocks = event.fog.render_distance_end;
-        }
+        // Vanilla render distance in blocks (matches DH `MinecraftClientWrapper.getRenderDistance()` * 16).
+        // Do NOT read `event.fog.render_distance_end`, which becomes `2e9` when Sunrise fog is disabled
+        // and would push `clip_dist` to ~1e9 (discarding all DS chunks).
+        let rd_chunks = host.graphics_options().render_distance.max(2);
+        st.vanilla_far_blocks = (rd_chunks as f32) * 16.0;
         // Disable vanilla atmospheric environmental + render-distance fog so foreground chunks
         // are not hazed out at the vanilla border before Distant Sunrises draws far fog
         // (matches DH `MixinFogRenderer.java:144-148` and Sunrise `fog.rs:447-448`).
