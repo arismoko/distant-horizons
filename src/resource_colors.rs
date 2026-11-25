@@ -127,6 +127,13 @@ pub fn loaded_block_color_count() -> usize {
     pack_store().read().map(|g| g.block_rgb.len()).unwrap_or(0)
 }
 
+fn read_resource_bytes(host: &dyn ReloadContext, id: &Identifier) -> Option<Vec<u8>> {
+    let mut reader = host.open_resource(PackType::ClientResources, id).ok()??;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut bytes).ok()?;
+    Some(bytes)
+}
+
 /// Reload block texture averages and grass/foliage colormaps from Sunrise's active client
 /// resource-pack stack. Safe to call in `client_setup` and `client_resources_reloaded`.
 pub fn reload_from_resources(host: &dyn ReloadContext) -> usize {
@@ -136,13 +143,13 @@ pub fn reload_from_resources(host: &dyn ReloadContext) -> usize {
     };
 
     if let Ok(id) = Identifier::parse("minecraft:textures/colormap/grass.png")
-        && let Some(bytes) = host.resource(PackType::ClientResources, &id)
+        && let Some(bytes) = read_resource_bytes(host, &id)
         && let Ok(img) = decode_png(&bytes)
     {
         next.grass_colormap = Some(img);
     }
     if let Ok(id) = Identifier::parse("minecraft:textures/colormap/foliage.png")
-        && let Some(bytes) = host.resource(PackType::ClientResources, &id)
+        && let Some(bytes) = read_resource_bytes(host, &id)
         && let Ok(img) = decode_png(&bytes)
     {
         next.foliage_colormap = Some(img);
@@ -151,7 +158,7 @@ pub fn reload_from_resources(host: &dyn ReloadContext) -> usize {
     let textures = host.list_resources(PackType::ClientResources, "textures/block", ".png");
     let mut raw_textures: HashMap<String, [u8; 3]> = HashMap::with_capacity(textures.len());
     for tex_id in textures {
-        let Some(bytes) = host.resource(PackType::ClientResources, &tex_id) else {
+        let Some(bytes) = read_resource_bytes(host, &tex_id) else {
             continue;
         };
         let Ok(img) = decode_png(&bytes) else {
