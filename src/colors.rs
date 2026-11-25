@@ -568,7 +568,12 @@ mod tests {
         let desert_sand = block_color("minecraft:sand", "minecraft:desert", 0);
         let water_hint = block_color("minecraft:water", "minecraft:ocean", 0x3F76E4);
         assert_ne!(plains_grass, desert_sand);
-        assert_eq!(water_hint, [0x3F, 0x76, 0xE4]);
+        assert_eq!(
+            biome_water_color("minecraft:ocean", 0x3F76E4),
+            [0x3F, 0x76, 0xE4]
+        );
+        // `block_color` multiplies biome tint by `water_still.png` average RGB (177/255).
+        assert_eq!(water_hint, [43, 81, 158]);
         assert!(is_skippable_for_lod("minecraft:short_grass"));
         assert!(!is_skippable_for_lod("minecraft:oak_leaves"));
         assert!(is_water_block("minecraft:water"));

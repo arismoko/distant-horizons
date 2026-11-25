@@ -183,6 +183,7 @@ mod tests {
             partial_tick: 0.5,
             yaw: 45.0,
             pitch: -15.0,
+            roll: 0.0,
             fov_degrees: 80.0,
             near: 0.05,
             far: 256.0,
