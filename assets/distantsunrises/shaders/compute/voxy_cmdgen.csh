@@ -42,7 +42,11 @@ ivec3 section_pos(uvec2 p) {
     return ivec3(x, y, z);
 }
 
+// Matches MAX_QUADS_PER_COMMAND in render_bridge.rs: the size of the shared quad index buffer.
+const uint MAX_QUADS_PER_COMMAND = 65536u;
+
 DrawCommand make(uint start, uint count, uint id, bool visible) {
+    count = min(count, MAX_QUADS_PER_COMMAND);
     DrawCommand c;
     c.index_count = visible ? count * 6u : 0u;
     c.instance_count = visible ? 1u : 0u;

@@ -742,6 +742,44 @@ pub fn prepare_draws(
             PREPARED.lock().unwrap().push((stage, batch));
         }
     }
+    // The shadow pass takes the pack-linked shadow pipeline through the same world stage when the
+    // pack compiled `dh_shadow` (`pipeline_pack_bound`), drawn with the pack's shadow matrices.
+    if let (Some(shadow), Ok(p)) = (
+        host.shader_pack_state().and_then(|s| s.shadow),
+        assets.render_pipeline(&id(PIPELINE_PACK_SHADOW)),
+    ) && assets.pipeline_pack_bound(p)
+    {
+        let bytes = crate::shader_pack::PackSceneUniform {
+            model_view: std::array::from_fn(|c| {
+                std::array::from_fn(|r| shadow.model_view[c * 4 + r])
+            }),
+            projection: std::array::from_fn(|c| {
+                std::array::from_fn(|r| shadow.projection[c * 4 + r])
+            }),
+            base_block_pos: [base[0] << 5, base[1] << 5, base[2] << 5],
+            frame_id: FRAME_ID.load(Ordering::Relaxed),
+            camera_sub_pos: sub,
+            depth_remap: [0.0; 2],
+        }
+        .to_bytes();
+        let bindings = DrawBindings::new()
+            .inline_uniform("SceneUniform", &bytes)
+            .storage_buffer("QuadArena", s.quads)
+            .storage_buffer("SectionBuffer", s.sections)
+            .storage_buffer("ModelBuffer", s.models)
+            .storage_buffer("BiomeTintBuffer", s.biome_tints)
+            .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id));
+        let draw = IndirectDraw::new(
+            p,
+            arena.opaque_commands,
+            arena.opaque_command_count(),
+            &bindings,
+        )
+        .with_mesh(state.quad_mesh);
+        if let Ok(batch) = context.draw_indirect(OPAQUE_STAGE, &draw) {
+            PREPARED.lock().unwrap().push((OPAQUE_STAGE, batch));
+        }
+    }
     record_frame_stats(sections as u64, arena.live_sections() as u64);
 }
 
