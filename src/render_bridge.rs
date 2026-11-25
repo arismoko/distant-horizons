@@ -33,80 +33,109 @@ use std::time::Instant;
 use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
 
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
-pub const SHADER_QUADS_VERT: &str = "distantsunrises:voxy_quads";
-pub const SHADER_QUADS_FRAG: &str = "distantsunrises:voxy_quads";
-pub const SHADER_COMPOSITE: &str = "distantsunrises:voxy_composite";
-pub const SHADER_HIZ: &str = "distantsunrises:voxy_hiz";
-pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
+pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
+pub const SHADER_COMPOSITE: &str = "distantsunrises:core/voxy_composite";
+pub const SHADER_HIZ: &str = "distantsunrises:compute/voxy_hiz";
+pub const SHADER_CMDGEN: &str = "distantsunrises:compute/voxy_cmdgen";
+
+pub const PIPELINE_OPAQUE: &str = "distantsunrises:voxy_opaque";
+pub const PIPELINE_TRANSLUCENT: &str = "distantsunrises:voxy_translucent";
+pub const PIPELINE_COMPOSITE: &str = "distantsunrises:voxy_composite";
 
 /// Compute workgroup sizes; must match `local_size_*` in the `.csh` files.
 pub const CMDGEN_WORKGROUP: u32 = 128;
 pub const HIZ_WORKGROUP: u32 = 8;
 
-/// Registers the five pipelines. Called from `Hooks::register_render_pipelines`.
-pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
-    use mod_api::{BindEntry, ComputePipeline, Identifier, PrimitiveTopology, RenderPipeline};
-    let id = |s: &str| Identifier::parse(s).expect("static pipeline id");
-    let quad_layout = || {
-        vec![
-            BindEntry::uniform_buffer("QuadParams", 160),
-            BindEntry::storage_buffer("QuadBuffer", true),
-            BindEntry::storage_buffer("SectionBuffer", true),
-            BindEntry::storage_buffer("ModelBuffer", true),
-            BindEntry::storage_buffer("BiomeTintBuffer", true),
-            BindEntry::sampler("BlockAtlas"),
-        ]
-    };
-    for (name, translucent) in [("opaque", false), ("translucent", true)] {
-        let mut p = RenderPipeline::builder(id(&format!("distantsunrises:voxy_{name}")))
-            .vertex_shader(id(SHADER_QUADS_VERT))
-            .fragment_shader(id(SHADER_QUADS_FRAG))
-            .topology(PrimitiveTopology::Quads)
-            .bind_group_layout(quad_layout());
-        if translucent {
-            p = p.define("TRANSLUCENT", "1").alpha_blend();
-        }
-        event.pipelines.push(p);
-    }
-    event.pipelines.push(
-        RenderPipeline::builder(id("distantsunrises:voxy_composite"))
-            .vertex_shader(id(SHADER_COMPOSITE))
-            .fragment_shader(id(SHADER_COMPOSITE))
-            .topology(PrimitiveTopology::Triangles)
-            .bind_group_layout(vec![
-                BindEntry::uniform_buffer("CompositeParams", 176),
-                BindEntry::sampler("LodColor"),
-                BindEntry::sampler("LodDepth"),
-                BindEntry::sampler("WorldDepth"),
-            ]),
-    );
-    event.compute_pipelines.push(
-        ComputePipeline::builder(id("distantsunrises:voxy_hiz_copy"), id(SHADER_HIZ))
-            .define("HIZ_FROM_WORLD_DEPTH", "1")
-            .bind_group_layout(hiz_layout()),
-    );
-    event.compute_pipelines.push(
-        ComputePipeline::builder(id("distantsunrises:voxy_hiz_reduce"), id(SHADER_HIZ))
-            .bind_group_layout(hiz_layout()),
-    );
-    event.compute_pipelines.push(
-        ComputePipeline::builder(id("distantsunrises:voxy_cmdgen"), id(SHADER_CMDGEN))
-            .bind_group_layout(vec![
-                BindEntry::uniform_buffer("CmdgenParams", 112),
-                BindEntry::storage_buffer("SectionBuffer", true),
-                BindEntry::storage_buffer("OpaqueCommands", false),
-                BindEntry::storage_buffer("TranslucentCommands", false),
-                BindEntry::sampler("HizPyramid"),
-            ]),
-    );
+fn id(text: &str) -> mod_api::Identifier {
+    mod_api::Identifier::parse(text).expect("static identifier")
+}
 
-    fn hiz_layout() -> Vec<mod_api::BindEntry> {
-        vec![
-            mod_api::BindEntry::uniform_buffer("HizParams", 16),
-            mod_api::BindEntry::sampler("HizSource"),
-            mod_api::BindEntry::storage_image("HizDest", mod_api::StorageImageAccess::WriteOnly),
-        ]
-    }
+/// A storage-buffer layout entry (`std430`, set 1). The GLSL block must be at least as large as
+/// the bound slice.
+fn storage(name: &str, read_only: bool) -> mod_api::BindEntry {
+    mod_api::BindEntry::new(name, mod_api::BindingKind::StorageBuffer { read_only })
+}
+
+/// The quad pipelines' set-1 layout (`voxy_quads.vsh/fsh`).
+pub fn quad_layout() -> mod_api::BindGroupLayout {
+    use mod_api::{SamplerAddress, SamplerFilter};
+    mod_api::BindGroupLayout::builder()
+        .uniform_buffer("QuadParams", 160)
+        .entry(storage("QuadBuffer", true))
+        .entry(storage("SectionBuffer", true))
+        .entry(storage("ModelBuffer", true))
+        .entry(storage("BiomeTintBuffer", true))
+        .sampler(
+            "BlockAtlas",
+            SamplerFilter::Nearest,
+            SamplerAddress::ClampToEdge,
+        )
+        .build()
+        .expect("static quad layout")
+}
+
+/// Registers the render pipelines. Called from `Hooks::register_render_pipelines`. The compute
+/// pipelines (Hi-Z, command generation) are added with the compute primitives.
+pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
+    use mod_api::{
+        PipelineBlend, PrimitiveTopology, RenderPipeline, SamplerAddress, SamplerFilter, WorldDepth,
+    };
+    // Opaque: depth-tested, culled by the index order of the quad mesh; translucent: sorted by the
+    // arena's bucket order, blended, no depth write.
+    event.register(
+        RenderPipeline::new(
+            id(PIPELINE_OPAQUE),
+            id(SHADER_QUADS),
+            PipelineBlend::Opaque,
+            WorldDepth::Tested,
+        )
+        .topology(PrimitiveTopology::Triangles)
+        .bind_group_layout(quad_layout())
+        .pack_binding(crate::shader_pack::DhPackSlot::Terrain.pack_binding()),
+    );
+    event.register(
+        RenderPipeline::new(
+            id(PIPELINE_TRANSLUCENT),
+            id(SHADER_QUADS),
+            PipelineBlend::Translucent,
+            WorldDepth::Tested,
+        )
+        .define("TRANSLUCENT")
+        .depth_write(false)
+        .topology(PrimitiveTopology::Triangles)
+        .bind_group_layout(quad_layout())
+        .pack_binding(crate::shader_pack::DhPackSlot::Water.pack_binding()),
+    );
+    event.register(
+        RenderPipeline::new(
+            id(PIPELINE_COMPOSITE),
+            id(SHADER_COMPOSITE),
+            PipelineBlend::Opaque,
+            WorldDepth::ThroughWalls,
+        )
+        .topology(PrimitiveTopology::Triangles)
+        .bind_group_layout(
+            mod_api::BindGroupLayout::builder()
+                .uniform_buffer("CompositeParams", 176)
+                .sampler(
+                    "LodColor",
+                    SamplerFilter::Nearest,
+                    SamplerAddress::ClampToEdge,
+                )
+                .sampler(
+                    "LodDepth",
+                    SamplerFilter::Nearest,
+                    SamplerAddress::ClampToEdge,
+                )
+                .sampler(
+                    "WorldDepth",
+                    SamplerFilter::Nearest,
+                    SamplerAddress::ClampToEdge,
+                )
+                .build()
+                .expect("static composite layout"),
+        ),
+    );
 }
 
 /// Writes `v` as little-endian f32s / u32s / i32s into a std140 byte buffer.

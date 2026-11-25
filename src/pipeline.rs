@@ -18,8 +18,8 @@ use crate::octree_ingest::{OctreeIngestStore, ingest_chunk_snapshot, ingest_save
 use crate::render_bridge::submit_built_section;
 use crate::storage::{DEFAULT_OCTREE_COMPRESSION, LodIoWorker, OctreeMapping};
 use mod_api::{
-    HostBlockStates, BlockKey, BlockState, ChunkSnapshot, ClientHost, Direction, Host, PlayerRef, ServerHost,
-    TerrainColumn,
+    BlockKey, BlockState, ChunkSnapshot, ClientHost, Direction, Host, HostBlockStates, PlayerRef,
+    ServerHost, TerrainColumn,
 };
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -369,7 +369,10 @@ fn model_words(index: usize, m: &BakedModel, atlas: &mut [u8]) -> [u32; MODEL_WO
         w[6 + i] = pack_rgba(face.avg);
         if textured {
             let slot = index * 6 + i;
-            let (tx, ty) = ((slot % (ATLAS_SIDE / TILE)) * TILE, (slot / (ATLAS_SIDE / TILE)) * TILE);
+            let (tx, ty) = (
+                (slot % (ATLAS_SIDE / TILE)) * TILE,
+                (slot / (ATLAS_SIDE / TILE)) * TILE,
+            );
             w[i] = (tx as u32) | ((ty as u32) << 16);
             for (n, texel) in face.texels.iter().enumerate() {
                 let (x, y) = (tx + n % TILE, ty + n / TILE);

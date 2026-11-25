@@ -400,15 +400,19 @@ impl DhPackSlot {
     pub fn pack_binding(self) -> PackBinding {
         let mut binding = PackBinding::new()
             .program_mode(PackProgramMode::ModVertexPackFragment)
-            .programs(self.programs().iter().map(|p| p.to_string()).collect())
-            .slot(self.pass_slot())
-            .defines(
-                DH_PACK_DEFINES
-                    .iter()
-                    .map(|(n, v)| (n.to_string(), v.map(str::to_string)))
-                    .collect(),
-            )
-            .frame_uniforms(dh_frame_uniform_decls());
+            .slot(self.pass_slot());
+        for program in self.programs() {
+            binding = binding.program(*program);
+        }
+        for (name, value) in DH_PACK_DEFINES {
+            binding = match value {
+                Some(v) => binding.define_value(*name, *v),
+                None => binding.define(*name),
+            };
+        }
+        for uniform in dh_frame_uniform_decls() {
+            binding = binding.frame_uniform(uniform);
+        }
         if self.stencil_masked() {
             binding = binding.depth_target(PackDepthTarget::Main);
         }
@@ -417,19 +421,13 @@ impl DhPackSlot {
 }
 
 fn dh_frame_uniform_decls() -> Vec<PackUniformDecl> {
-    let decl = |name: &str, ty, prev: Option<&str>| {
-        PackUniformDecl::new(name, ty, prev.map(str::to_string))
-    };
+    let decl = |name: &str, ty| PackUniformDecl::new(name, ty);
     vec![
-        decl("dhNearPlane", PackUniformType::Float, None),
-        decl("dhFarPlane", PackUniformType::Float, None),
-        decl("dhRenderDistance", PackUniformType::Int, None),
-        decl(
-            "dhProjection",
-            PackUniformType::Mat4,
-            Some("dhPreviousProjection"),
-        ),
-        decl("dhProjectionInverse", PackUniformType::Mat4, None),
+        decl("dhNearPlane", PackUniformType::Float),
+        decl("dhFarPlane", PackUniformType::Float),
+        decl("dhRenderDistance", PackUniformType::Int),
+        decl("dhProjection", PackUniformType::Mat4).with_previous("dhPreviousProjection"),
+        decl("dhProjectionInverse", PackUniformType::Mat4),
     ]
 }
 

@@ -21,9 +21,7 @@
 //! one fixed slot per `(section id, bucket)`, rewritten every frame by `voxy_cmdgen.csh`, so the
 //! draw count is simply the id high-water mark times the bucket count.
 
-use mod_api::{
-    BufferError, ClientHost, ClientRenderClientHost, StorageBufferDescriptor, StorageBufferRef,
-};
+use mod_api::{BufferError, ClientHost, StorageBufferDescriptor, StorageBufferRef};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Bytes per packed quad (Voxy `BufferArena(geometryCapacity, 8)`).
@@ -469,7 +467,7 @@ impl GpuArena {
             }
             Err(e) => {
                 for b in made.drain(..) {
-                    let _ = host.storage_buffer_release(b);
+                    let _ = b.release(&*host);
                 }
                 Err(ArenaError::from(e))
             }
@@ -566,7 +564,7 @@ impl GpuArena {
         for q in &section.quads {
             bytes.extend_from_slice(&q.to_bytes());
         }
-        if let Err(e) = host.storage_buffer_write_range(self.quads, start * QUAD_BYTES, &bytes) {
+        if let Err(e) = self.quads.write_range(&*host, start * QUAD_BYTES, &bytes) {
             self.ids.free(id);
             self.quad_alloc.free(start);
             return Err(e.into());
@@ -597,8 +595,8 @@ impl GpuArena {
         let mut next = 0u32;
         for (id, meta) in dirty {
             if !run.is_empty() && id != next {
-                host.storage_buffer_write_range(
-                    self.sections,
+                self.sections.write_range(
+                    &*host,
                     run_start as u64 * SECTION_METADATA_BYTES,
                     &run,
                 )?;
@@ -611,11 +609,8 @@ impl GpuArena {
             next = id + 1;
         }
         if !run.is_empty() {
-            host.storage_buffer_write_range(
-                self.sections,
-                run_start as u64 * SECTION_METADATA_BYTES,
-                &run,
-            )?;
+            self.sections
+                .write_range(&*host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
         }
         Ok(())
     }
@@ -628,7 +623,8 @@ impl GpuArena {
         words: &[u32],
     ) -> Result<(), ArenaError> {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        host.storage_buffer_write_range(self.models, first_model as u64 * MODEL_WORDS * 4, &bytes)?;
+        self.models
+            .write_range(&*host, first_model as u64 * MODEL_WORDS * 4, &bytes)?;
         Ok(())
     }
 
@@ -640,7 +636,8 @@ impl GpuArena {
         words: &[u32],
     ) -> Result<(), ArenaError> {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        host.storage_buffer_write_range(self.biome_tints, first_biome as u64 * 12, &bytes)?;
+        self.biome_tints
+            .write_range(&*host, first_biome as u64 * 12, &bytes)?;
         Ok(())
     }
 
@@ -648,12 +645,12 @@ impl GpuArena {
     /// otherwise survives resource reload and world close (ruling point 2). To empty it on a
     /// world change, `remove` each section instead.
     pub fn release(self, host: &mut dyn ClientHost) -> Result<(), ArenaError> {
-        host.storage_buffer_release(self.quads)?;
-        host.storage_buffer_release(self.sections)?;
-        host.storage_buffer_release(self.opaque_commands)?;
-        host.storage_buffer_release(self.translucent_commands)?;
-        host.storage_buffer_release(self.models)?;
-        host.storage_buffer_release(self.biome_tints)?;
+        self.quads.release(&*host)?;
+        self.sections.release(&*host)?;
+        self.opaque_commands.release(&*host)?;
+        self.translucent_commands.release(&*host)?;
+        self.models.release(&*host)?;
+        self.biome_tints.release(&*host)?;
         Ok(())
     }
 }
