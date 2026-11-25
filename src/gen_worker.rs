@@ -299,7 +299,7 @@ impl GenWorkerPool {
             .in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|(d, _)| d != dim);
+            .retain(|(d, _), _| d != dim);
     }
 
     /// Cancel all queued and running work and join every worker thread on world close.
