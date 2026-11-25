@@ -298,7 +298,8 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
             min_y = min_y.min(y);
             max_y = max_y.max(y);
 
-            let color = LodVertex::pack_rgba(key.rgba[0], key.rgba[1], key.rgba[2], 196);
+            let water_alpha = crate::resource_colors::water_still_rgba()[3];
+            let color = LodVertex::pack_rgba(key.rgba[0], key.rgba[1], key.rgba[2], water_alpha);
             let meta = LodVertex::pack_meta_ext(
                 1,
                 LodColumn::sky_light(key.rgba),

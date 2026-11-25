@@ -223,6 +223,12 @@ impl LodColumn {
         self
     }
 
+    #[inline]
+    pub const fn with_fluid_light(mut self, sky_light: u8, block_light: u8) -> Self {
+        self.fluid_rgba[3] = Self::pack_light(sky_light, block_light);
+        self
+    }
+
     pub fn to_bytes(self) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[0..2].copy_from_slice(&self.solid_top_y.to_le_bytes());
