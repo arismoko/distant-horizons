@@ -946,9 +946,9 @@ fn sample_distant_sections(
             })
             .collect();
 
-        let gen = detached_gen
+        let generator = detached_gen
             .get_or_insert_with(|| host.level(dim).and_then(|l| l.detached_generator(host)));
-        let Some(samples) = gen
+        let Some(samples) = generator
             .as_ref()
             .and_then(|g| g.sample_surface_columns(&query_cols).ok())
         else {
