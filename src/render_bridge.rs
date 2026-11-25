@@ -58,7 +58,10 @@ fn id(text: &str) -> mod_api::Identifier {
 fn storage(name: &str, read_only: bool, min_size: u32) -> mod_api::BindEntry {
     mod_api::BindEntry::new(
         name,
-        mod_api::BindingKind::StorageBuffer { read_only, min_size },
+        mod_api::BindingKind::StorageBuffer {
+            read_only,
+            min_size,
+        },
     )
 }
 
@@ -279,6 +282,67 @@ pub fn hiz_mip_levels(width: u32, height: u32) -> u32 {
     32 - width.max(height).leading_zeros()
 }
 
+/// The mod-owned Hi-Z pyramid (sunrise#5590): an `R32Float` target with a full mip chain,
+/// created for `WriteOnly` storage images and sampled by cmdgen. Resized with the viewport.
+struct HizTarget {
+    target: mod_api::RenderTargetRef,
+    size: [u32; 2],
+    mips: u32,
+}
+
+static HIZ: Mutex<Option<HizTarget>> = Mutex::new(None);
+
+impl HizTarget {
+    /// Mip views: level `l` as a storage-image destination and as a sampled source.
+    fn dest(&self, level: u32) -> mod_api::StorageImageBinding {
+        mod_api::StorageImageBinding::new(self.target, 0, level)
+    }
+    fn source(&self, level: u32) -> mod_api::TextureSource<'static> {
+        mod_api::TextureSource::RenderTargetColorMip(mod_api::RenderTargetMipView::single(
+            self.target,
+            0,
+            level,
+        ))
+    }
+    /// All mips, for cmdgen's `HizPyramid` sampler.
+    fn all_mips(&self) -> mod_api::TextureSource<'static> {
+        mod_api::TextureSource::RenderTargetColorMip(mod_api::RenderTargetMipView::new(
+            self.target,
+            0,
+            0,
+            self.mips,
+        ))
+    }
+}
+
+/// The Hi-Z pyramid for a `size` viewport, created or resized on demand. `None` when the
+/// adapter refuses the target; the caller then skips Hi-Z culling (`hiz_enabled = false`).
+fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<(HizTarget, bool)> {
+    use mod_api::{RenderTargetDescriptor, RenderTargetFormat, StorageImageAccess};
+    let mut slot = HIZ.lock().unwrap();
+    if let Some(h) = slot.as_ref().filter(|h| h.size == size) {
+        return Some((HizTarget { ..*h }, false));
+    }
+    if let Some(old) = slot.take() {
+        let _ = old.target.release(host);
+    }
+    let mips = hiz_mip_levels(size[0], size[1]);
+    let desc = RenderTargetDescriptor::new(size)
+        .color_target(RenderTargetFormat::R32Float)
+        .mip_levels(mips)
+        .storage(StorageImageAccess::WriteOnly);
+    let target = host.create_render_target(&desc).ok()?;
+    let made = HizTarget { target, size, mips };
+    *slot = Some(HizTarget { ..made });
+    Some((made, true))
+}
+
+/// Whether the Hi-Z sampler can filter linearly. `R32Float` without float32 filtering must be
+/// bound `Nearest` (the cmdgen layout always does), so this only reports the adapter.
+pub fn hiz_linear_filter(host: &dyn mod_api::ClientHost) -> bool {
+    host.render_capabilities().float32_filterable
+}
+
 /// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
 static PENDING_SECTIONS: Mutex<Vec<(SectionKey, BuiltSection)>> = Mutex::new(Vec::new());
 static ARENA: Mutex<Option<ArenaState>> = Mutex::new(None);
@@ -392,7 +456,7 @@ pub fn record_stage(
     frame: &RenderFrameParams,
     camera: &CameraMatrices,
 ) {
-    use mod_api::{DrawBindings, IndirectDraw, StorageImageBinding, TextureSource, UniformValue};
+    use mod_api::{DrawBindings, IndirectDraw, TextureSource, UniformValue};
     let guard = ARENA.lock().unwrap();
     let Some(state) = guard.as_ref() else { return };
     let arena = &state.arena;
@@ -408,7 +472,9 @@ pub fn record_stage(
     let mips = hiz_mip_levels(w, h);
 
     // 1. Hi-Z pyramid: mip 0 <- WorldDepth, mip N <- mip N-1 (distinct subresources).
-    let pyramid = event.hiz_target(w, h, mips);
+    let Some((hiz, _)) = ensure_hiz(host, [w, h]) else {
+        return;
+    };
     let copy = assets
         .compute_pipeline(&mod_api::Identifier::parse("distantsunrises:voxy_hiz_copy").unwrap());
     let reduce = assets
@@ -432,15 +498,12 @@ pub fn record_stage(
         let source = if level == 0 {
             TextureSource::WorldDepth
         } else {
-            TextureSource::render_target_color_mip(pyramid, 0, level - 1, 1)
+            hiz.source(level - 1)
         };
         let bindings = DrawBindings::new()
             .uniform("HizParams", UniformValue::Inline(&params))
             .texture("HizSource", source)
-            .storage_image(
-                "HizDest",
-                StorageImageBinding::new(pyramid, 0, level, mod_api::StorageImageAccess::WriteOnly),
-            );
+            .storage_image("HizDest", hiz.dest(level));
         let _ = event.compute.dispatch(
             if level == 0 { copy } else { reduce },
             &bindings,
@@ -456,10 +519,7 @@ pub fn record_stage(
         .storage_buffer("SectionBuffer", &arena.sections)
         .storage_buffer("OpaqueCommands", &arena.opaque_commands)
         .storage_buffer("TranslucentCommands", &arena.translucent_commands)
-        .texture(
-            "HizPyramid",
-            TextureSource::render_target_color_mip(pyramid, 0, 0, mips),
-        );
+        .texture("HizPyramid", hiz.all_mips());
     let _ = event.compute.dispatch(
         cmdgen,
         &bindings,
