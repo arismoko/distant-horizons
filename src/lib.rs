@@ -1,10 +1,10 @@
-//! Distant Horizons native mod for Sunrise.
+//! Distant Sunrises native mod for Sunrise.
 //!
 //! Stage 1 architecture:
 //! - Server side samples loaded chunks (`read_columns`) and distant ungenerated terrain
 //!   (`terrain_surface`) during `level_tick_post` under `host.server_has_time()` budgeting,
 //!   downsamples into the multi-detail-level quadtree, and persists RLE-compressed sections to
-//!   `<world_dir>/distant_horizons/<dimension>/` on a background IO worker.
+//!   `<world_dir>/distant_sunrises/<dimension>/` on a background IO worker.
 //! - Background meshing worker generates greedy-merged, face-culled solid and fluid meshes.
 //! - Client side tracks camera, day-time lighting, settings (`Options > Mods`), fog colors
 //!   (`render_fog`), and F3 debug telemetry (`register_debug_entries`).
@@ -372,7 +372,7 @@ impl Hooks for DistantHorizonsMod {
             st.vanilla_far_blocks = event.fog.render_distance_end;
         }
         // Push vanilla's atmospheric render-distance fog out past vanilla's clip so the horizon
-        // reveals Distant Horizons LOD terrain (DH applies its own atmospheric/height fog in the
+        // reveals Distant Sunrises LOD terrain (DH applies its own atmospheric/height fog in the
         // composite pass). Underwater/lava/powder-snow fog stays vanilla-exact.
         if st.config.enabled
             && st.config.disable_vanilla_fog

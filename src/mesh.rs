@@ -653,7 +653,7 @@ fn neighbor_covers_span(section: &LodSection, nx: usize, nz: usize, span: &Extra
     })
 }
 
-/// Apply Distant Horizons brightness and saturation multipliers to an sRGB color.
+/// Apply Distant Sunrises brightness and saturation multipliers to an sRGB color.
 #[inline]
 pub fn grade_rgb(rgb: [u8; 3], brightness: f32, saturation: f32) -> [u8; 3] {
     if (brightness - 1.0).abs() < 1e-4 && (saturation - 1.0).abs() < 1e-4 {

@@ -1,4 +1,4 @@
-//! Active resource-pack block color and biome colormap sampler for Distant Horizons.
+//! Active resource-pack block color and biome colormap sampler for Distant Sunrises.
 //!
 //! Reads `textures/block/*.png`, `textures/colormap/grass.png`, and
 //! `textures/colormap/foliage.png` from Sunrise's active client resource-pack stack

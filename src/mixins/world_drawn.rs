@@ -1,8 +1,8 @@
 fn world_drawn(world: &mut WorldDrawn<'_>) {
-    use distanthorizons::generic_render::{GenericGroupMesh, dh_view_proj_and_inverse};
-    use distanthorizons::lod::SectionPos;
-    use distanthorizons::mesh::{LodVertex, SectionMeshData};
-    use distanthorizons::render_bridge::{
+    use distantsunrises::generic_render::{GenericGroupMesh, dh_view_proj_and_inverse};
+    use distantsunrises::lod::SectionPos;
+    use distantsunrises::mesh::{LodVertex, SectionMeshData};
+    use distantsunrises::render_bridge::{
         COMPOSITE_WGSL, TERRAIN_WGSL, begin_render_frame, record_frame_stats,
     };
     use std::collections::HashMap;
@@ -719,7 +719,7 @@ fn world_drawn(world: &mut WorldDrawn<'_>) {
         .queue
         .write_buffer(&state.terrain_uniform_buf, 0, &u_bytes);
 
-    // Pass 1: Render Distant Horizons solid + translucent LOD terrain and generic box groups.
+    // Pass 1: Render Distant Sunrises solid + translucent LOD terrain and generic box groups.
     {
         let mut pass = world
             .encoder

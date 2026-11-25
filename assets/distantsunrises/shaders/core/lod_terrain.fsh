@@ -1,6 +1,6 @@
 #version 330
 
-// Distant Horizons LOD terrain fragment shader (vanilla Sunrise core-shader GLSL style).
+// Distant Sunrises LOD terrain fragment shader (vanilla Sunrise core-shader GLSL style).
 // Applies near-edge dither fade, debug cell wireframes, and procedural surface noise.
 
 layout(std140) uniform DhFrameUniforms {

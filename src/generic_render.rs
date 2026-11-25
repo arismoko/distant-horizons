@@ -1,8 +1,8 @@
-//! Distant Horizons Generic Object Renderer (`IDhApiGenericObjectRenderer` /
+//! Distant Sunrises Generic Object Renderer (`IDhApiGenericObjectRenderer` /
 //! `DhApiRenderableBoxGroup`), Distant Beacon Beams (`BeaconRenderHandler`), and procedural 3D
 //! LOD Clouds (`CloudRenderHandler`).
 //!
-//! Matching upstream Distant Horizons, beacons, clouds, and third-party mod distant box groups
+//! Matching upstream Distant Sunrises, beacons, clouds, and third-party mod distant box groups
 //! all share one axis-aligned box group representation rendered inside DH's reversed-Z offscreen
 //! LOD pass so they occlude cleanly against distant terrain and receive matching DH fog.
 
@@ -20,9 +20,9 @@ pub const CLOUD_BASE_Y: f32 = 192.0;
 /// Drift speed of LOD clouds along `-X` in blocks per second (`MOVE_SPEED_IN_BLOCKS_PER_SECOND`).
 pub const CLOUD_DRIFT_BLOCKS_PER_SEC: f64 = 6.0;
 /// Built-in group ID for distant beacon beams.
-pub const GROUP_ID_BEACONS: &str = "distanthorizons:beacons";
+pub const GROUP_ID_BEACONS: &str = "distantsunrises:beacons";
 /// Built-in group ID for LOD clouds.
-pub const GROUP_ID_CLOUDS: &str = "distanthorizons:clouds";
+pub const GROUP_ID_CLOUDS: &str = "distantsunrises:clouds";
 
 /// Per-face directional shading multipliers for a [`RenderableBoxGroup`]
 /// (matches upstream `DhApiRenderableBoxGroupShading`).
@@ -113,7 +113,7 @@ impl RenderableBox {
     }
 }
 
-/// Named group of axis-aligned boxes rendered in Distant Horizons' reversed-Z world pass
+/// Named group of axis-aligned boxes rendered in Distant Sunrises' reversed-Z world pass
 /// (matches upstream `IDhApiRenderableBoxGroup`).
 #[derive(Clone, Debug)]
 pub struct RenderableBoxGroup {
@@ -257,7 +257,7 @@ pub struct BeaconBeam {
 }
 
 /// Per-dimension beacon tracker that updates when loaded chunks are scanned and builds the
-/// `distanthorizons:beacons` [`RenderableBoxGroup`] for distant beams.
+/// `distantsunrises:beacons` [`RenderableBoxGroup`] for distant beams.
 #[derive(Default)]
 pub struct BeaconTracker {
     /// Active beacons indexed by block `(x, y, z)`.
@@ -444,7 +444,7 @@ impl CloudField {
         (coarse * 0.68 + detail * 0.32) > 0.56
     }
 
-    /// Build or update the `distanthorizons:clouds` [`RenderableBoxGroup`] when the camera moves
+    /// Build or update the `distantsunrises:clouds` [`RenderableBoxGroup`] when the camera moves
     /// across a cloud cell, settings change, or weather/dimension changes.
     ///
     /// Returns `(Some(group), drift_x)` when geometry needs re-upload, or `(None, drift_x)` when

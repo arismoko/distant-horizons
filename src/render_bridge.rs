@@ -1,4 +1,4 @@
-//! Thread-safe bridge between Distant Horizons mod hooks, background workers, and the
+//! Thread-safe bridge between Distant Sunrises mod hooks, background workers, and the
 //! `sunrise-mod-render` mixin helpers (`render_needs` and `world_drawn`).
 //!
 //! Keeps all `wgpu` types inside `src/mixins/world_drawn.rs` while the mod crate owns LOD data,
@@ -216,7 +216,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 /// Fullscreen sky-masked composite + spiral SSAO + full DH distance/height/environmental fog shader.
 ///
-/// Reads Sunrise's reversed-Z `vanilla_depth` (`0.0` = sky) and Distant Horizons' offscreen
+/// Reads Sunrise's reversed-Z `vanilla_depth` (`0.0` = sky) and Distant Sunrises' offscreen
 /// `dh_color` and `dh_depth` (`0.0` = empty). Only writes where vanilla drew sky AND DH drew
 /// terrain, applying depth-buffer SSAO and DH far/height/environmental fog before converting
 /// cleanly to Sunrise's linear HDR light space (`docs/hdr-passes.md`).

@@ -1,6 +1,6 @@
 #version 330
 
-// Distant Horizons LOD terrain vertex shader (vanilla Sunrise core-shader GLSL style).
+// Distant Sunrises LOD terrain vertex shader (vanilla Sunrise core-shader GLSL style).
 // Targets Sunrise's `sunrise-glsl` / `#2005` mod render pipeline contract (`#4758`
 // `WorldRenderView` + `Camera` matrices) with an independent reversed-Z projection over
 // `[NearDh, FarDh]`, debug visualization modes, and generic box-group support.

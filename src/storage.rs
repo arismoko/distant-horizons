@@ -1,5 +1,5 @@
 //! Fast, crash-safe region-packed Zstd binary LOD storage (`DHREG002`) under
-//! `<world_dir>/distant_horizons/<dim>/d<detail>/r.<rx>.<rz>.dhreg`.
+//! `<world_dir>/distant_sunrises/<dim>/d<detail>/r.<rx>.<rz>.dhreg`.
 //!
 //! Architecture:
 //! - Packs `16 × 16 = 256` LOD sections per region file, cutting filesystem metadata/inode
@@ -284,7 +284,7 @@ pub const fn section_region_slot(pos: SectionPos) -> (i32, i32, usize) {
 pub fn region_path(world_dir: &Path, dimension: &str, pos: SectionPos) -> PathBuf {
     let (rx, rz, _) = section_region_slot(pos);
     world_dir
-        .join("distant_horizons")
+        .join("distant_sunrises")
         .join(sanitize_dimension(dimension))
         .join(format!("d{}", pos.detail))
         .join(format!("r.{rx}.{rz}.dhreg"))
@@ -293,7 +293,7 @@ pub fn region_path(world_dir: &Path, dimension: &str, pos: SectionPos) -> PathBu
 /// Legacy single-section `.dhlod` path (kept read-only for seamless migration of existing worlds).
 pub fn legacy_section_path(world_dir: &Path, dimension: &str, pos: SectionPos) -> PathBuf {
     world_dir
-        .join("distant_horizons")
+        .join("distant_sunrises")
         .join(legacy_sanitize_dimension(dimension))
         .join(format!("d{}", pos.detail))
         .join(format!("s.{}.{}.dhlod", pos.x, pos.z))

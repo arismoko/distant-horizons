@@ -1,6 +1,6 @@
 #version 330
 
-// Fullscreen sky-masked composite + spiral SSAO + far/height/environmental fog for Distant Horizons.
+// Fullscreen sky-masked composite + spiral SSAO + far/height/environmental fog for Distant Sunrises.
 // Preserves Sunrise's linear HDR light pipeline (docs/hdr-passes.md).
 
 layout(std140) uniform DhCompositeUniforms {

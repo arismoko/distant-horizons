@@ -1,5 +1,5 @@
-id = "distanthorizons"
-name = "Distant Horizons"
+id = "distantsunrises"
+name = "Distant Sunrises"
 version = "3.3.5"
 description = "Generates and renders simplified level-of-detail terrain beyond the normal view distance."
 authors = [
@@ -14,8 +14,8 @@ authors = [
     "arismoko",
 ]
 license = "LGPL-3.0-or-later"
-homepage = "https://github.com/arismoko/distant-horizons"
-issues = "https://github.com/arismoko/distant-horizons/issues"
+homepage = "https://github.com/arismoko/distant-sunrises"
+issues = "https://github.com/arismoko/distant-sunrises/issues"
 api = "0.2"
 side = "both"
 capabilities = ["registries"]

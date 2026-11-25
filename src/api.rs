@@ -1,8 +1,8 @@
-//! Public mod-to-mod API for Distant Horizons on Sunrise.
+//! Public mod-to-mod API for Distant Sunrises on Sunrise.
 //!
-//! External Sunrise mods depend on `distanthorizons` via `[dependencies]` in `sunrise-mod.toml`
+//! External Sunrise mods depend on `distantsunrises` via `[dependencies]` in `sunrise-mod.toml`
 //! (or optionally via `mod_api::if_installed!`) to:
-//! - Override Distant Horizons' background world generation for a dimension
+//! - Override Distant Sunrises' background world generation for a dimension
 //!   ([`register_world_generator`], [`LodWorldGenerator`]);
 //! - Supply server-sent LOD sections directly from a network protocol or external cache
 //!   ([`register_remote_lod_provider`], [`RemoteLodProvider`], [`submit_lod_section`],
@@ -28,20 +28,20 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// Semantic version of the public `distanthorizons::api` module.
+/// Semantic version of the public `distantsunrises::api` module.
 pub const API_VERSION: (u32, u32, u32) = (1, 0, 0);
 
-/// Returns the semantic version `(major, minor, patch)` of the Distant Horizons Sunrise API.
+/// Returns the semantic version `(major, minor, patch)` of the Distant Sunrises Sunrise API.
 pub const fn api_version() -> (u32, u32, u32) {
     API_VERSION
 }
 
-/// Returns `true` when Distant Horizons LOD rendering is currently enabled.
+/// Returns `true` when Distant Sunrises LOD rendering is currently enabled.
 pub fn is_active() -> bool {
     runtime().enabled_flag.load(Ordering::Relaxed)
 }
 
-/// Register or update a named generic [`RenderableBoxGroup`] rendered in Distant Horizons'
+/// Register or update a named generic [`RenderableBoxGroup`] rendered in Distant Sunrises'
 /// reversed-Z LOD pass for `dimension` (matches upstream `IDhApiCustomRenderRegister.add`).
 pub fn register_box_group(dimension: &str, group: RenderableBoxGroup) {
     let mesh = build_box_group_mesh(&group);
@@ -155,7 +155,7 @@ impl From<LodSectionPos> for SectionPos {
     }
 }
 
-/// Errors returned by `distanthorizons::api` submission calls.
+/// Errors returned by `distantsunrises::api` submission calls.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DhApiError {
     InvalidDetail(u8),
@@ -358,7 +358,7 @@ pub trait LodWorldGenerator: Send + Sync + 'static {
 
 /// Client-side pull hook for mods that fetch LOD sections from a remote server or web cache.
 ///
-/// Distant Horizons calls [`RemoteLodProvider::request_section`] for missing visible sections;
+/// Distant Sunrises calls [`RemoteLodProvider::request_section`] for missing visible sections;
 /// the provider responds asynchronously (on any thread) via [`submit_dh_v2_bytes`],
 /// [`submit_dh_v2_dto`], [`submit_lod_section`], or [`submit_lod_chunk`].
 pub trait RemoteLodProvider: Send + Sync + 'static {
@@ -401,7 +401,7 @@ pub fn unregister_world_generator(dimension: &str) -> bool {
     }
 }
 
-/// Disables or re-enables Distant Horizons' built-in distant generator for `dimension`.
+/// Disables or re-enables Distant Sunrises' built-in distant generator for `dimension`.
 pub fn disable_builtin_generation(dimension: &str, disabled: bool) {
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
@@ -441,7 +441,7 @@ pub fn unregister_remote_lod_provider(dimension: &str) -> bool {
     }
 }
 
-/// Disables or re-enables Distant Horizons' built-in multiplayer LOD network handling for
+/// Disables or re-enables Distant Sunrises' built-in multiplayer LOD network handling for
 /// `dimension`.
 pub fn disable_builtin_network(dimension: &str, disabled: bool) {
     let rt = runtime();
@@ -453,7 +453,7 @@ pub fn disable_builtin_network(dimension: &str, disabled: bool) {
     }
 }
 
-/// Submits a `64 x 64` [`LodSectionData`] directly into Distant Horizons' LOD store, propagates
+/// Submits a `64 x 64` [`LodSectionData`] directly into Distant Sunrises' LOD store, propagates
 /// parent detail levels, queues meshing, and schedules disk persistence if a save directory is
 /// active. Returns the number of cells modified.
 pub fn submit_lod_section(dimension: &str, section: LodSectionData) -> Result<usize, DhApiError> {
@@ -499,7 +499,7 @@ pub fn submit_lod_section(dimension: &str, section: LodSectionData) -> Result<us
     Ok(modified)
 }
 
-/// Submits a `16 x 16` [`LodChunk`] at detail 0 into Distant Horizons' LOD store, propagates
+/// Submits a `16 x 16` [`LodChunk`] at detail 0 into Distant Sunrises' LOD store, propagates
 /// parent detail levels, and queues meshing/persistence. Returns the number of cells modified.
 pub fn submit_lod_chunk(dimension: &str, chunk: LodChunk) -> Result<usize, DhApiError> {
     if chunk.columns.len() != 256 {
@@ -552,7 +552,7 @@ pub fn submit_lod_chunk(dimension: &str, chunk: LodChunk) -> Result<usize, DhApi
     Ok(modified)
 }
 
-/// Decodes and ingests an upstream Distant Horizons [`DhV2FullDataDto`] into `dimension`.
+/// Decodes and ingests an upstream Distant Sunrises [`DhV2FullDataDto`] into `dimension`.
 pub fn submit_dh_v2_dto(
     dimension: &str,
     dto: &DhV2FullDataDto,

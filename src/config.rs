@@ -1,6 +1,6 @@
 use mod_api::{ClientHost, Registrar, SettingSpec};
 
-pub const MOD_ID: &str = "distanthorizons";
+pub const MOD_ID: &str = "distantsunrises";
 
 pub const KEY_ENABLED: &str = "enabled";
 pub const KEY_RENDER_DISTANCE: &str = "render_distance_chunks";
@@ -39,7 +39,7 @@ pub const DEBUG_SHOW_GEN_MODE: u32 = 2;
 pub const DEBUG_SHOW_LIGHTING: u32 = 3;
 pub const DEBUG_SHOW_DETAIL_WIREFRAME: u32 = 4;
 
-/// Runtime settings mirrored from Sunrise's mod settings UI (`Options > Mods > Distant Horizons`).
+/// Runtime settings mirrored from Sunrise's mod settings UI (`Options > Mods > Distant Sunrises`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DhConfig {
     pub enabled: bool,
@@ -164,240 +164,240 @@ impl DhConfig {
 
     pub fn register_settings(registrar: &mut dyn Registrar) {
         let specs = [
-            SettingSpec::toggle(KEY_ENABLED, "distanthorizons.setting.enabled", true)
-                .tooltip("distanthorizons.setting.enabled.tooltip"),
+            SettingSpec::toggle(KEY_ENABLED, "distantsunrises.setting.enabled", true)
+                .tooltip("distantsunrises.setting.enabled.tooltip"),
             SettingSpec::range(
                 KEY_RENDER_DISTANCE,
-                "distanthorizons.setting.render_distance_chunks",
+                "distantsunrises.setting.render_distance_chunks",
                 32.0,
                 512.0,
                 8.0,
                 128.0,
             )
-            .tooltip("distanthorizons.setting.render_distance_chunks.tooltip"),
+            .tooltip("distantsunrises.setting.render_distance_chunks.tooltip"),
             SettingSpec::choice(
                 KEY_HORIZONTAL_QUALITY,
-                "distanthorizons.setting.horizontal_quality",
+                "distantsunrises.setting.horizontal_quality",
                 [
-                    "distanthorizons.setting.quality.low",
-                    "distanthorizons.setting.quality.medium",
-                    "distanthorizons.setting.quality.high",
+                    "distantsunrises.setting.quality.low",
+                    "distantsunrises.setting.quality.medium",
+                    "distantsunrises.setting.quality.high",
                 ],
                 1,
             )
-            .tooltip("distanthorizons.setting.horizontal_quality.tooltip"),
+            .tooltip("distantsunrises.setting.horizontal_quality.tooltip"),
             SettingSpec::choice(
                 KEY_VERTICAL_QUALITY,
-                "distanthorizons.setting.vertical_quality",
+                "distantsunrises.setting.vertical_quality",
                 [
-                    "distanthorizons.setting.quality.low",
-                    "distanthorizons.setting.quality.medium",
-                    "distanthorizons.setting.quality.high",
-                    "distanthorizons.setting.quality.extreme",
+                    "distantsunrises.setting.quality.low",
+                    "distantsunrises.setting.quality.medium",
+                    "distantsunrises.setting.quality.high",
+                    "distantsunrises.setting.quality.extreme",
                 ],
                 1,
             )
-            .tooltip("distanthorizons.setting.vertical_quality.tooltip"),
+            .tooltip("distantsunrises.setting.vertical_quality.tooltip"),
             SettingSpec::toggle(
                 KEY_DISTANT_GENERATION,
-                "distanthorizons.setting.distant_generation",
+                "distantsunrises.setting.distant_generation",
                 true,
             )
-            .tooltip("distanthorizons.setting.distant_generation.tooltip"),
+            .tooltip("distantsunrises.setting.distant_generation.tooltip"),
             SettingSpec::choice(
                 KEY_DISTANT_GENERATION_MODE,
-                "distanthorizons.setting.distant_generation_mode",
+                "distantsunrises.setting.distant_generation_mode",
                 [
-                    "distanthorizons.setting.gen_mode.surface",
-                    "distanthorizons.setting.gen_mode.carvers",
-                    "distanthorizons.setting.gen_mode.features",
-                    "distanthorizons.setting.gen_mode.full",
+                    "distantsunrises.setting.gen_mode.surface",
+                    "distantsunrises.setting.gen_mode.carvers",
+                    "distantsunrises.setting.gen_mode.features",
+                    "distantsunrises.setting.gen_mode.full",
                 ],
                 1,
             )
-            .tooltip("distanthorizons.setting.distant_generation_mode.tooltip"),
+            .tooltip("distantsunrises.setting.distant_generation_mode.tooltip"),
             SettingSpec::toggle(
                 KEY_CAVE_CULLING,
-                "distanthorizons.setting.cave_culling_enabled",
+                "distantsunrises.setting.cave_culling_enabled",
                 true,
             )
-            .tooltip("distanthorizons.setting.cave_culling_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.cave_culling_enabled.tooltip"),
             SettingSpec::range(
                 KEY_CAVE_CULLING_HEIGHT,
-                "distanthorizons.setting.cave_culling_height",
+                "distantsunrises.setting.cave_culling_height",
                 -64.0,
                 320.0,
                 4.0,
                 60.0,
             )
-            .tooltip("distanthorizons.setting.cave_culling_height.tooltip"),
-            SettingSpec::toggle(KEY_FOG_ENABLED, "distanthorizons.setting.fog_enabled", true)
-                .tooltip("distanthorizons.setting.fog_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.cave_culling_height.tooltip"),
+            SettingSpec::toggle(KEY_FOG_ENABLED, "distantsunrises.setting.fog_enabled", true)
+                .tooltip("distantsunrises.setting.fog_enabled.tooltip"),
             SettingSpec::toggle(
                 KEY_NOISE_ENABLED,
-                "distanthorizons.setting.noise_enabled",
+                "distantsunrises.setting.noise_enabled",
                 true,
             )
-            .tooltip("distanthorizons.setting.noise_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.noise_enabled.tooltip"),
             SettingSpec::range(
                 KEY_NOISE_INTENSITY,
-                "distanthorizons.setting.noise_intensity",
+                "distantsunrises.setting.noise_intensity",
                 0.0,
                 0.5,
                 0.02,
                 0.12,
             )
-            .tooltip("distanthorizons.setting.noise_intensity.tooltip"),
+            .tooltip("distantsunrises.setting.noise_intensity.tooltip"),
             SettingSpec::range(
                 KEY_OVERDRAW_PREVENTION,
-                "distanthorizons.setting.overdraw_prevention",
+                "distantsunrises.setting.overdraw_prevention",
                 0.0,
                 1.0,
                 0.05,
                 0.35,
             )
-            .tooltip("distanthorizons.setting.overdraw_prevention.tooltip"),
+            .tooltip("distantsunrises.setting.overdraw_prevention.tooltip"),
             SettingSpec::toggle(
                 KEY_FADE_ENABLED,
-                "distanthorizons.setting.fade_enabled",
+                "distantsunrises.setting.fade_enabled",
                 true,
             )
-            .tooltip("distanthorizons.setting.fade_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.fade_enabled.tooltip"),
             SettingSpec::toggle(
                 KEY_SHADING_ENABLED,
-                "distanthorizons.setting.shading_enabled",
+                "distantsunrises.setting.shading_enabled",
                 true,
             )
-            .tooltip("distanthorizons.setting.shading_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.shading_enabled.tooltip"),
             SettingSpec::range(
                 KEY_BRIGHTNESS,
-                "distanthorizons.setting.brightness_multiplier",
+                "distantsunrises.setting.brightness_multiplier",
                 0.5,
                 2.0,
                 0.05,
                 1.0,
             )
-            .tooltip("distanthorizons.setting.brightness_multiplier.tooltip"),
+            .tooltip("distantsunrises.setting.brightness_multiplier.tooltip"),
             SettingSpec::range(
                 KEY_SATURATION,
-                "distanthorizons.setting.saturation_multiplier",
+                "distantsunrises.setting.saturation_multiplier",
                 0.0,
                 2.0,
                 0.05,
                 1.0,
             )
-            .tooltip("distanthorizons.setting.saturation_multiplier.tooltip"),
+            .tooltip("distantsunrises.setting.saturation_multiplier.tooltip"),
             SettingSpec::toggle(
                 KEY_SSAO_ENABLED,
-                "distanthorizons.setting.ssao_enabled",
+                "distantsunrises.setting.ssao_enabled",
                 true,
             )
-            .tooltip("distanthorizons.setting.ssao_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.ssao_enabled.tooltip"),
             SettingSpec::choice(
                 KEY_SSAO_QUALITY,
-                "distanthorizons.setting.ssao_quality",
+                "distantsunrises.setting.ssao_quality",
                 [
-                    "distanthorizons.setting.quality.low",
-                    "distanthorizons.setting.quality.medium",
-                    "distanthorizons.setting.quality.high",
+                    "distantsunrises.setting.quality.low",
+                    "distantsunrises.setting.quality.medium",
+                    "distantsunrises.setting.quality.high",
                 ],
                 1,
             )
-            .tooltip("distanthorizons.setting.ssao_quality.tooltip"),
+            .tooltip("distantsunrises.setting.ssao_quality.tooltip"),
             SettingSpec::range(
                 KEY_SSAO_STRENGTH,
-                "distanthorizons.setting.ssao_strength",
+                "distantsunrises.setting.ssao_strength",
                 0.0,
                 1.0,
                 0.05,
                 0.45,
             )
-            .tooltip("distanthorizons.setting.ssao_strength.tooltip"),
+            .tooltip("distantsunrises.setting.ssao_strength.tooltip"),
             SettingSpec::toggle(
                 KEY_DISABLE_VANILLA_FOG,
-                "distanthorizons.setting.disable_vanilla_fog",
+                "distantsunrises.setting.disable_vanilla_fog",
                 true,
             )
-            .tooltip("distanthorizons.setting.disable_vanilla_fog.tooltip"),
+            .tooltip("distantsunrises.setting.disable_vanilla_fog.tooltip"),
             SettingSpec::choice(
                 KEY_FOG_FALLOFF,
-                "distanthorizons.setting.fog_falloff",
+                "distantsunrises.setting.fog_falloff",
                 [
-                    "distanthorizons.setting.fog_falloff.linear",
-                    "distanthorizons.setting.fog_falloff.exponential",
-                    "distanthorizons.setting.fog_falloff.exponential_squared",
+                    "distantsunrises.setting.fog_falloff.linear",
+                    "distantsunrises.setting.fog_falloff.exponential",
+                    "distantsunrises.setting.fog_falloff.exponential_squared",
                 ],
                 2,
             )
-            .tooltip("distanthorizons.setting.fog_falloff.tooltip"),
+            .tooltip("distantsunrises.setting.fog_falloff.tooltip"),
             SettingSpec::toggle(
                 KEY_FOG_SPHERICAL,
-                "distanthorizons.setting.fog_spherical",
+                "distantsunrises.setting.fog_spherical",
                 false,
             )
-            .tooltip("distanthorizons.setting.fog_spherical.tooltip"),
+            .tooltip("distantsunrises.setting.fog_spherical.tooltip"),
             SettingSpec::toggle(
                 KEY_HEIGHT_FOG_ENABLED,
-                "distanthorizons.setting.height_fog_enabled",
+                "distantsunrises.setting.height_fog_enabled",
                 true,
             )
-            .tooltip("distanthorizons.setting.height_fog_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.height_fog_enabled.tooltip"),
             SettingSpec::range(
                 KEY_HEIGHT_FOG_BASE_HEIGHT,
-                "distanthorizons.setting.height_fog_base_height",
+                "distantsunrises.setting.height_fog_base_height",
                 -64.0,
                 320.0,
                 4.0,
                 70.0,
             )
-            .tooltip("distanthorizons.setting.height_fog_base_height.tooltip"),
+            .tooltip("distantsunrises.setting.height_fog_base_height.tooltip"),
             SettingSpec::choice(
                 KEY_HEIGHT_FOG_MIX_MODE,
-                "distanthorizons.setting.height_fog_mix_mode",
+                "distantsunrises.setting.height_fog_mix_mode",
                 [
-                    "distanthorizons.setting.height_fog_mix.basic",
-                    "distanthorizons.setting.height_fog_mix.max",
-                    "distanthorizons.setting.height_fog_mix.addition",
-                    "distanthorizons.setting.height_fog_mix.multiply",
-                    "distanthorizons.setting.height_fog_mix.inverse_multiply",
+                    "distantsunrises.setting.height_fog_mix.basic",
+                    "distantsunrises.setting.height_fog_mix.max",
+                    "distantsunrises.setting.height_fog_mix.addition",
+                    "distantsunrises.setting.height_fog_mix.multiply",
+                    "distantsunrises.setting.height_fog_mix.inverse_multiply",
                 ],
                 4,
             )
-            .tooltip("distanthorizons.setting.height_fog_mix_mode.tooltip"),
+            .tooltip("distantsunrises.setting.height_fog_mix_mode.tooltip"),
             SettingSpec::toggle(
                 KEY_CLOUDS_ENABLED,
-                "distanthorizons.setting.clouds_enabled",
+                "distantsunrises.setting.clouds_enabled",
                 true,
             )
-            .tooltip("distanthorizons.setting.clouds_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.clouds_enabled.tooltip"),
             SettingSpec::toggle(
                 KEY_BEACON_BEAMS_ENABLED,
-                "distanthorizons.setting.beacon_beams_enabled",
+                "distantsunrises.setting.beacon_beams_enabled",
                 true,
             )
-            .tooltip("distanthorizons.setting.beacon_beams_enabled.tooltip"),
+            .tooltip("distantsunrises.setting.beacon_beams_enabled.tooltip"),
             SettingSpec::range(
                 KEY_SHARPENING_AMOUNT,
-                "distanthorizons.setting.sharpening_amount",
+                "distantsunrises.setting.sharpening_amount",
                 0.0,
                 1.0,
                 0.05,
                 0.35,
             )
-            .tooltip("distanthorizons.setting.sharpening_amount.tooltip"),
+            .tooltip("distantsunrises.setting.sharpening_amount.tooltip"),
             SettingSpec::choice(
                 KEY_DEBUG_MODE,
-                "distanthorizons.setting.debug_mode",
+                "distantsunrises.setting.debug_mode",
                 [
-                    "distanthorizons.setting.debug.off",
-                    "distanthorizons.setting.debug.detail",
-                    "distanthorizons.setting.debug.gen_mode",
-                    "distanthorizons.setting.debug.lighting",
-                    "distanthorizons.setting.debug.wireframe",
+                    "distantsunrises.setting.debug.off",
+                    "distantsunrises.setting.debug.detail",
+                    "distantsunrises.setting.debug.gen_mode",
+                    "distantsunrises.setting.debug.lighting",
+                    "distantsunrises.setting.debug.wireframe",
                 ],
                 0,
             )
-            .tooltip("distanthorizons.setting.debug_mode.tooltip"),
+            .tooltip("distantsunrises.setting.debug_mode.tooltip"),
         ];
         for spec in specs {
             let _ = registrar.register_setting(spec);

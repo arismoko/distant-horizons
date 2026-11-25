@@ -1,7 +1,7 @@
 //! Built-in multiplayer LOD synchronization over Sunrise's optional, droppable, network-thread
-//! bidirectional play payload channel (`distanthorizons:lod_sync`).
+//! bidirectional play payload channel (`distantsunrises:lod_sync`).
 //!
-//! - **Optional**: joining vanilla servers or servers without Distant Horizons is never blocked;
+//! - **Optional**: joining vanilla servers or servers without Distant Sunrises is never blocked;
 //!   the client checks `host.has_channel(&lod_sync_channel_id())` before sending requests.
 //! - **Network-thread & droppable**: Zstd compression/decompression and RLE encoding run on
 //!   Sunrise's `HandlerThread::Network`, and congestion drops stale LOD packets cleanly instead
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 /// Namespaced channel identifier negotiated between Sunrise DH clients and servers.
-pub const LOD_SYNC_CHANNEL: &str = "distanthorizons:lod_sync";
+pub const LOD_SYNC_CHANNEL: &str = "distantsunrises:lod_sync";
 /// Wire schema version for [`LOD_SYNC_CHANNEL`].
 pub const LOD_SYNC_VERSION: &str = "1";
 
@@ -156,7 +156,7 @@ pub fn server_storage_subdir(server_key: &str, dimension: &str) -> String {
 }
 
 /// Derive a collision-free, path-traversal-safe local disk cache root for a remote multiplayer
-/// server (`<instance_dir>/distant_horizons_remote/<percent-encoded server_key>`).
+/// server (`<instance_dir>/distant_sunrises_remote/<percent-encoded server_key>`).
 pub fn remote_cache_root(instance_dir: &Path, server_key: &str) -> PathBuf {
     let mut slug = String::with_capacity(server_key.len());
     for b in server_key.bytes() {
@@ -170,7 +170,7 @@ pub fn remote_cache_root(instance_dir: &Path, server_key: &str) -> PathBuf {
     if slug.is_empty() {
         slug.push_str("remote");
     }
-    instance_dir.join("distant_horizons_remote").join(slug)
+    instance_dir.join("distant_sunrises_remote").join(slug)
 }
 
 /// Pending column changes for one detail-0 section to broadcast to remote DH clients.
@@ -181,7 +181,7 @@ pub struct SectionColumnDelta {
 }
 
 /// Broadcast incremental LOD column deltas from a published server (LAN host or dedicated server)
-/// to remote players currently in `dim` whose connections negotiated `distanthorizons:lod_sync`.
+/// to remote players currently in `dim` whose connections negotiated `distantsunrises:lod_sync`.
 pub fn broadcast_partial_updates(
     host: &mut dyn ServerHost,
     dim: &str,
@@ -388,7 +388,7 @@ pub fn lod_sync_channel_id() -> PayloadId {
     PayloadId(LOD_SYNC_CHANNEL.to_owned())
 }
 
-/// Registers the optional bidirectional `distanthorizons:lod_sync` channel during
+/// Registers the optional bidirectional `distantsunrises:lod_sync` channel during
 /// `Hooks::register`.
 pub fn register_payloads(registrar: &mut dyn Registrar) {
     registrar

@@ -1,6 +1,6 @@
-//! Vanilla 26.3 block and biome surface color palette for Distant Horizons LOD columns.
+//! Vanilla 26.3 block and biome surface color palette for Distant Sunrises LOD columns.
 
-/// Iris / Distant Horizons standard material IDs (`StandardMacros.java:81-96`).
+/// Iris / Distant Sunrises standard material IDs (`StandardMacros.java:81-96`).
 ///
 /// Exposed to translated Iris/OptiFine shader packs via `DH_BLOCK_*` preprocessor defines and
 /// vertex attribute `dhMaterialId`.
