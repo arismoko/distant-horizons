@@ -41,6 +41,9 @@ pub const SHADER_CMDGEN: &str = "distantsunrises:compute/voxy_cmdgen";
 pub const PIPELINE_OPAQUE: &str = "distantsunrises:voxy_opaque";
 pub const PIPELINE_TRANSLUCENT: &str = "distantsunrises:voxy_translucent";
 pub const PIPELINE_COMPOSITE: &str = "distantsunrises:voxy_composite";
+pub const PIPELINE_PACK_TERRAIN: &str = "distantsunrises:voxy_pack_terrain";
+pub const PIPELINE_PACK_WATER: &str = "distantsunrises:voxy_pack_water";
+pub const PIPELINE_PACK_SHADOW: &str = "distantsunrises:voxy_pack_shadow";
 
 /// Compute workgroup sizes; must match `local_size_*` in the `.csh` files.
 pub const CMDGEN_WORKGROUP: u32 = 128;
@@ -74,6 +77,28 @@ pub fn quad_layout() -> mod_api::BindGroupLayout {
         .expect("static quad layout")
 }
 
+/// The pack-linked pipelines' set-1 layout (`voxy_pack_*.vsh`): `SceneUniform` is 176 bytes
+/// ([`crate::shader_pack::PACK_SCENE_UNIFORM_SIZE`]) and the quad arena block is `QuadArena`.
+pub fn pack_layout() -> mod_api::BindGroupLayout {
+    use mod_api::{SamplerAddress, SamplerFilter};
+    mod_api::BindGroupLayout::builder()
+        .uniform_buffer(
+            "SceneUniform",
+            crate::shader_pack::PACK_SCENE_UNIFORM_SIZE as u32,
+        )
+        .entry(storage("QuadArena", true))
+        .entry(storage("SectionBuffer", true))
+        .entry(storage("ModelBuffer", true))
+        .entry(storage("BiomeTintBuffer", true))
+        .sampler(
+            "BlockAtlas",
+            SamplerFilter::Nearest,
+            SamplerAddress::ClampToEdge,
+        )
+        .build()
+        .expect("static pack layout")
+}
+
 /// Registers the render pipelines. Called from `Hooks::register_render_pipelines`. The compute
 /// pipelines (Hi-Z, command generation) are added with the compute primitives.
 pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
@@ -105,9 +130,38 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
         .depth_write(false)
         .topology(PrimitiveTopology::Triangles)
         .cull(false)
-        .bind_group_layout(quad_layout())
-        .pack_binding(crate::shader_pack::DhPackSlot::Water.pack_binding()),
+        .bind_group_layout(quad_layout()),
     );
+    // Pack-linked pipelines: the mod's vertex stage (`voxy_pack_*.vsh`) feeds the pack's
+    // `dh_terrain` / `dh_water` / `dh_shadow` fragment. Optional: without a pack that provides
+    // the program they are unbound and the plain pipelines above draw.
+    for (slot, name, blend) in [
+        (
+            crate::shader_pack::DhPackSlot::Terrain,
+            PIPELINE_PACK_TERRAIN,
+            PipelineBlend::Opaque,
+        ),
+        (
+            crate::shader_pack::DhPackSlot::Water,
+            PIPELINE_PACK_WATER,
+            PipelineBlend::Translucent,
+        ),
+        (
+            crate::shader_pack::DhPackSlot::Shadow,
+            PIPELINE_PACK_SHADOW,
+            PipelineBlend::Opaque,
+        ),
+    ] {
+        event.register(
+            RenderPipeline::new(id(name), id(SHADER_QUADS), blend, WorldDepth::Tested)
+                .vertex_shader(id(slot.vertex_shader()))
+                .topology(PrimitiveTopology::Triangles)
+                .cull(false)
+                .bind_group_layout(pack_layout())
+                .pack_binding(slot.pack_binding())
+                .optional(),
+        );
+    }
     event.register(
         RenderPipeline::new(
             id(PIPELINE_COMPOSITE),
