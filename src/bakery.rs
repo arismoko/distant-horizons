@@ -992,7 +992,7 @@ mod tests {
         let side = &m.faces[Face::PosX as usize];
         assert_eq!(side.tint_state, 1);
         assert_eq!(side.tint_mask, 0xCCCC);
-        assert_eq!(t.meta_for(5).biome_coloured(), true);
+        assert!(t.meta_for(5).biome_coloured());
     }
 
     #[test]

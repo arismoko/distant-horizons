@@ -637,7 +637,7 @@ mod tests {
         let mut g3 = MockChunk::new();
         g3.put(2, 10, 2, DIRT);
         let g4 = [column(2, 2, 10, None, STONE)];
-        let mut run_g4 = |store: &mut OctreeIngestStore| {
+        let run_g4 = |store: &mut OctreeIngestStore| {
             ingest_distant_columns(store, &g4, WATER, &mut |b| b, &mut |_| 7)
         };
 

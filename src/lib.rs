@@ -597,9 +597,8 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
 
     let mut dirty_sections: HashSet<SectionPos> = HashSet::new();
     let collect_deltas = host.server_is_published();
-    let mut partial_deltas: HashMap<SectionPos, network::SectionColumnDelta> = HashMap::new();
     if !chunks_to_sample.is_empty() {
-        partial_deltas = sample_loaded_chunks(
+        sample_loaded_chunks(
             host,
             dim,
             &chunks_to_sample,
@@ -682,11 +681,12 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             }
         }
         for pos in to_mesh {
-            if let Some(sec) = store.sections.get_mut(&pos) {
-                if sec.dirty_mesh && sec.populated > 0 {
-                    sec.dirty_mesh = false;
-                    rt.mesher.submit(dim.to_owned(), sec.clone());
-                }
+            if let Some(sec) = store.sections.get_mut(&pos)
+                && sec.dirty_mesh
+                && sec.populated > 0
+            {
+                sec.dirty_mesh = false;
+                rt.mesher.submit(dim.to_owned(), sec.clone());
             }
         }
     }

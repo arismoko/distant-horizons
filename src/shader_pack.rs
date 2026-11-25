@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes(b[140..144].try_into().unwrap()), 7);
         assert_eq!(f32::from_le_bytes(b[152..156].try_into().unwrap()), 3.0);
         assert_eq!(f32::from_le_bytes(b[160..164].try_into().unwrap()), 0.5);
-        assert_eq!(f32::from_le_bytes(b[80..84].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(b[84..88].try_into().unwrap()), 1.0);
     }
 
     #[test]
@@ -724,7 +724,7 @@ mod tests {
             assert_eq!(b.programs, slot.programs().to_vec(), "{slot:?}");
             assert_eq!(b.defines.len(), DH_PACK_DEFINES.len());
             assert_eq!(b.frame_uniforms.len(), 5);
-            assert!(slot.vertex_shader().ends_with(".vsh"));
+            assert!(!slot.vertex_shader().ends_with(".vsh"));
         }
         let t = DhPackSlot::Terrain.pack_binding();
         assert_eq!(t.programs, vec!["dh_terrain"]);

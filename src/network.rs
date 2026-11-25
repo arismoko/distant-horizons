@@ -1786,10 +1786,10 @@ pub mod octree_sync {
                 }
                 pending.offset += chunk;
                 budget -= chunk as i64;
-                if pending.offset == pending.buffer.len() {
-                    if let Some(done) = self.queue.pop_front() {
-                        out.push(done.final_message);
-                    }
+                if pending.offset == pending.buffer.len()
+                    && let Some(done) = self.queue.pop_front()
+                {
+                    out.push(done.final_message);
                 }
             }
             out
