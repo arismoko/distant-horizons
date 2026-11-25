@@ -330,7 +330,15 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                 continue;
             }
             let top = col.solid_top_y;
-            let bot = col.solid_bottom_y.min(top.saturating_sub(edge_skirt));
+            let extra = section.extra_spans_at(gx, gz);
+            let has_overhang_gap = extra
+                .first()
+                .is_some_and(|below| col.solid_bottom_y > below.top_y);
+            let bot = if has_overhang_gap {
+                col.solid_bottom_y
+            } else {
+                col.solid_bottom_y.min(top.saturating_sub(edge_skirt))
+            };
             let x0 = gx as f32 * cell;
             let x1 = (gx + 1) as f32 * cell;
             let z0 = gz as f32 * cell;
@@ -455,10 +463,7 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
 
             // Underside ceiling face (-Y, normal 0) when this primary span is an overhang or
             // Nether ceiling above a lower span separated by an air gap.
-            let extra = section.extra_spans_at(gx, gz);
-            if let Some(below) = extra.first()
-                && col.solid_bottom_y > below.top_y
-            {
+            if has_overhang_gap {
                 let y_bot = col.solid_bottom_y as f32;
                 min_y = min_y.min(y_bot);
                 let meta = LodVertex::pack_meta_ext(
@@ -511,7 +516,11 @@ pub fn build_section_mesh(dimension: String, section: &LodSection) -> SectionMes
                 };
                 min_y = min_y.min(y0);
                 max_y = max_y.max(y1);
-                let alpha = if span.is_fluid { 196 } else { 255 };
+                let alpha = if span.is_fluid {
+                    crate::resource_colors::water_still_rgba()[3]
+                } else {
+                    255
+                };
                 let color = LodVertex::pack_rgba(span.rgba[0], span.rgba[1], span.rgba[2], alpha);
                 let sky = LodColumn::sky_light(span.rgba);
                 let blk = LodColumn::block_light(span.rgba);

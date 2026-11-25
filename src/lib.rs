@@ -633,6 +633,7 @@ fn sample_loaded_chunks(
 
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
+    let max_spans = st.config.vertical_quality.clamp(1, 8) as usize;
     let store = st.dimensions.entry(dim.to_owned()).or_default();
 
     for (ci, ([cx, cz], snap_opt)) in snapshots.iter().enumerate() {
@@ -658,11 +659,14 @@ fn sample_loaded_chunks(
                 let y_max = base_y + (LOADED_SCAN_ABOVE as i32);
 
                 let mut fluid_top: Option<i32> = None;
-                let mut solid_top: Option<(i32, &str)> = None;
+                // Contiguous vertical solid spans `(top_y, lowest_solid_y, top_block_id)` for
+                // tree canopies, overhangs, and ground underneath (DH `EDhApiVerticalQuality`).
+                let mut solid_spans: Vec<(i32, i32, &str)> = Vec::with_capacity(max_spans);
+                let mut in_solid_span = false;
                 let mut beacon_y: Option<i32> = None;
                 let mut beacon_tint: Option<[u8; 3]> = None;
 
-                // Scan top-down through the sampled band for surface + any sky-visible beacon & stained glass tint.
+                // Scan top-down through the sampled band for surface + vertical spans + beacons.
                 for y in (y_min..=y_max).rev() {
                     let block_id = match snap.block_state(lx, y, lz) {
                         Some(state) => *block_id_cache
@@ -674,19 +678,23 @@ fn sample_loaded_chunks(
                         beacon_y = Some(y);
                     }
                     if is_water_block(block_id) {
+                        in_solid_span = false;
                         if fluid_top.is_none() {
                             fluid_top = Some(y);
                         }
                         continue;
                     }
                     if is_skippable_for_lod(block_id) {
+                        in_solid_span = false;
                         continue;
                     }
-                    if solid_top.is_none() {
-                        solid_top = Some((y, block_id));
-                        if beacon_y.is_some() {
-                            break;
+                    if in_solid_span {
+                        if let Some(last) = solid_spans.last_mut() {
+                            last.1 = y;
                         }
+                    } else if solid_spans.len() < max_spans {
+                        solid_spans.push((y, y, block_id));
+                        in_solid_span = true;
                     }
                 }
 
@@ -710,10 +718,17 @@ fn sample_loaded_chunks(
                     }
                 }
 
-                let (top_y, block_id) = match solid_top {
-                    Some(v) => v,
+                let (top_y, primary_bot_y, block_id) = match solid_spans.first().copied() {
+                    Some((ty, by, id)) => {
+                        let bot = if solid_spans.len() > 1 {
+                            by - 1
+                        } else {
+                            (by - 1).min(ty - 8)
+                        };
+                        (ty, bot, id)
+                    }
                     None => match fluid_top {
-                        Some(fy) => (fy - 4, "minecraft:sand"),
+                        Some(fy) => (fy - 4, fy - 12, "minecraft:sand"),
                         None => continue,
                     },
                 };
@@ -743,7 +758,7 @@ fn sample_loaded_chunks(
                 };
                 let lod_col = LodColumn::from_solid_and_fluid(
                     top_y,
-                    top_y - 8,
+                    primary_bot_y,
                     solid_rgb,
                     fluid_top,
                     fluid_rgb,
@@ -754,10 +769,42 @@ fn sample_loaded_chunks(
                 .with_fluid_light(fluid_sky, fluid_blk)
                 .with_material(classify_dh_material(block_id));
 
+                let mut extra_spans = Vec::new();
+                for &(s_top, s_bot, s_block) in solid_spans.iter().skip(1) {
+                    let s_biome = snap
+                        .biome(lx, s_top, lz)
+                        .map(|k| k.identifier().as_str())
+                        .unwrap_or(biome_id);
+                    let s_rgb = block_color(s_block, s_biome, 0);
+                    let (s_sky, s_blk) = if snap.has_light() {
+                        snap.light(lx, s_top + 1, lz).unwrap_or((12, 0))
+                    } else {
+                        (12, 0)
+                    };
+                    let s_bot_clamped = (s_bot - 1).clamp(i16::MIN as i32 + 1, s_top - 1) as i16;
+                    extra_spans.push(crate::lod::ExtraSpan {
+                        top_y: s_top.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16,
+                        bottom_y: s_bot_clamped,
+                        rgba: [
+                            s_rgb[0],
+                            s_rgb[1],
+                            s_rgb[2],
+                            LodColumn::pack_light(s_sky, s_blk),
+                        ],
+                        is_fluid: false,
+                        material_id: classify_dh_material(s_block),
+                    });
+                }
+
                 let sec_pos = SectionPos::from_block(0, bx, bz);
                 let (cell_x, cell_z) = sec_pos.local_cell(bx, bz);
                 let sec = store.get_or_create_mut(sec_pos);
-                if sec.set_cell(cell_x, cell_z, lod_col) {
+                let changed = if extra_spans.is_empty() {
+                    sec.set_cell(cell_x, cell_z, lod_col)
+                } else {
+                    sec.set_cell_with_spans(cell_x, cell_z, lod_col, extra_spans)
+                };
+                if changed {
                     dirty_sections.insert(sec_pos);
                     if collect_deltas {
                         let entry = deltas.entry(sec_pos).or_default();
