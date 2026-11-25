@@ -17,6 +17,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
+/// Matches DH `GeneratedFullDataSourceProvider.MAX_RETRIEVAL_REQUESTS_PER_THREAD` (line 67,
+/// `getMaxRetrievalQueueCount()` line 206: `20 * numberOfThreads`).
+const MAX_RETRIEVAL_REQUESTS_PER_THREAD: usize = 20;
+
 /// Columns sampled per `sample_surface_columns` call inside a worker thread so
 /// world-exit / invalidation cancellation is observed promptly between chunks.
 const WORKER_CHUNK_COLS: usize = 256;
@@ -113,7 +117,10 @@ impl GenWorkerPool {
             }
         }
         let spawned = handles.len();
-        self.max_in_flight.store(spawned * 4, Ordering::Release);
+        self.max_in_flight.store(
+            spawned * MAX_RETRIEVAL_REQUESTS_PER_THREAD,
+            Ordering::Release,
+        );
         spawned
     }
 
