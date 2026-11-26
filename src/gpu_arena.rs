@@ -898,27 +898,34 @@ impl GpuArena {
         Ok(())
     }
 
-    /// Frees every GPU buffer (ruling point 1). Call on mod unload or re-init only; the arena
-    /// otherwise survives resource reload and world close (ruling point 2). To empty it on a
-    /// world change, `remove` each section instead.
+    /// Attempts to free every GPU buffer and returns the first refusal, if any (ruling point 1).
+    /// Call on mod unload or re-init only; the arena otherwise survives resource reload and world
+    /// close (ruling point 2). To empty it on a world change, `remove` each section instead.
     pub fn release(self, host: &mut dyn ClientHost) -> Result<(), ArenaError> {
-        self.quads.release(&*host)?;
-        self.sections.release(&*host)?;
-        self.opaque_commands.release(&*host)?;
-        self.translucent_commands.release(&*host)?;
-        self.trans_sort_meta.release(&*host)?;
-        self.trans_sort_entries.release(&*host)?;
-        self.nodes.release(&*host)?;
-        self.roots.release(&*host)?;
-        self.visibility.release(&*host)?;
-        self.queue_a.release(&*host)?;
-        self.queue_b.release(&*host)?;
-        self.dispatch_a.release(&*host)?;
-        self.dispatch_b.release(&*host)?;
-        self.models.release(&*host)?;
-        self.biome_tints.release(&*host)?;
-        self.requests.release(&*host)?;
-        Ok(())
+        let mut first_refusal = None;
+        for buffer in [
+            self.quads,
+            self.sections,
+            self.opaque_commands,
+            self.translucent_commands,
+            self.trans_sort_meta,
+            self.trans_sort_entries,
+            self.nodes,
+            self.roots,
+            self.visibility,
+            self.queue_a,
+            self.queue_b,
+            self.dispatch_a,
+            self.dispatch_b,
+            self.models,
+            self.biome_tints,
+            self.requests,
+        ] {
+            if let Err(error) = buffer.release(&*host) {
+                first_refusal.get_or_insert(error);
+            }
+        }
+        first_refusal.map_or(Ok(()), |error| Err(ArenaError::from(error)))
     }
 }
 
