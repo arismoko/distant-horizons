@@ -41,7 +41,7 @@ pub mod octree_sync {
     };
     use std::collections::{HashMap, VecDeque};
     use std::hash::Hash;
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
@@ -1499,19 +1499,44 @@ pub mod octree_sync {
         &SRC
     }
 
-    fn client_session() -> &'static Mutex<ClientSession> {
-        static SESSION: OnceLock<Mutex<ClientSession>> = OnceLock::new();
-        SESSION.get_or_init(|| Mutex::new(ClientSession::default()))
+    #[derive(Default)]
+    struct ClientIntake {
+        open: bool,
+        session: ClientSession,
+        events: Vec<ClientEvent>,
     }
 
-    /// Events decoded by the client handler, drained by the render side.
+    impl ClientIntake {
+        fn receive(
+            &mut self,
+            bytes: &[u8],
+            now: Instant,
+            epoch_live: impl FnOnce() -> bool,
+        ) -> Result<(), SyncError> {
+            // Check under the same lock as logout and rearm, before touching any protocol state.
+            if self.open && epoch_live() {
+                self.events.extend(self.session.on_message(bytes, now)?);
+            }
+            Ok(())
+        }
+
+        fn open(&mut self) -> bool {
+            !std::mem::replace(&mut self.open, true)
+        }
+
+        fn close(&mut self) {
+            *self = Self::default();
+        }
+    }
+
+    fn client_intake() -> &'static Mutex<ClientIntake> {
+        static INTAKE: OnceLock<Mutex<ClientIntake>> = OnceLock::new();
+        INTAKE.get_or_init(|| Mutex::new(ClientIntake::default()))
+    }
+
+    /// Events decoded by the network executor, drained by the render side.
     pub fn drain_client_events() -> Vec<ClientEvent> {
-        std::mem::take(&mut *client_events().lock().unwrap())
-    }
-
-    fn client_events() -> &'static Mutex<Vec<ClientEvent>> {
-        static EVENTS: OnceLock<Mutex<Vec<ClientEvent>>> = OnceLock::new();
-        EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+        std::mem::take(&mut client_intake().lock().unwrap().events)
     }
 
     /// Install the server backend; the first install wins.
@@ -1574,23 +1599,19 @@ pub mod octree_sync {
         fn handle(
             &self,
             payload: PayloadBytes,
-            _context: &mut dyn IPayloadContext,
+            context: &mut dyn IPayloadContext,
         ) -> Result<(), PayloadHandleError> {
-            let events = client_session()
+            client_intake()
                 .lock()
                 .unwrap()
-                .on_message(&payload.0, Instant::now())
-                .map_err(|e| PayloadHandleError::Failed(format!("{e:?}")))?;
-            client_events().lock().unwrap().extend(events);
-            Ok(())
+                .receive(&payload.0, Instant::now(), || context.player().is_ok())
+                .map_err(|e| PayloadHandleError::Failed(format!("{e:?}")))
         }
     }
 
-    static CONFIG_SENT: AtomicBool = AtomicBool::new(false);
-
     /// Send our session config once per connection (`ServerPlayerState.java:62-65`).
     pub fn client_send_config_once(host: &mut dyn ClientHost) {
-        if CONFIG_SENT.swap(true, Ordering::Relaxed) {
+        if !client_intake().lock().unwrap().open() {
             return;
         }
         if let Ok(bytes) = ClientSession::config_message(&SessionConfig::default()) {
@@ -1600,9 +1621,7 @@ pub mod octree_sync {
 
     /// Forget the per-connection state when the client leaves a server.
     pub fn client_reset() {
-        CONFIG_SENT.store(false, Ordering::Relaxed);
-        *client_session().lock().unwrap() = ClientSession::default();
-        client_events().lock().unwrap().clear();
+        client_intake().lock().unwrap().close();
     }
 
     /// Send one request from the client tick.
@@ -1612,10 +1631,12 @@ pub mod octree_sync {
         pos: OctreeSectionPos,
         known_timestamp: Option<i64>,
     ) -> bool {
-        let Ok(bytes) = client_session()
-            .lock()
-            .unwrap()
-            .request(level, pos, known_timestamp)
+        let Ok(bytes) =
+            client_intake()
+                .lock()
+                .unwrap()
+                .session
+                .request(level, pos, known_timestamp)
         else {
             return false;
         };
@@ -1646,6 +1667,60 @@ pub mod octree_sync {
         use super::*;
 
         const LEVEL: &str = "minecraft:overworld";
+
+        #[test]
+        fn old_connection_cannot_mutate_closed_or_rearmed_client_intake() {
+            let now = Instant::now();
+            let cfg = Message::SessionConfig(SessionConfig::default())
+                .encode()
+                .unwrap();
+            let split = Message::Split(SplitMessage {
+                buffer_id: 7,
+                is_first: true,
+                buffer: vec![1, 2, 3],
+            })
+            .encode()
+            .unwrap();
+            let pos = OctreeSectionPos::new(0, 0, 0, 0);
+            let mut intake = ClientIntake::default();
+            assert!(intake.open());
+            intake.receive(&cfg, now, || true).unwrap();
+            intake.receive(&split, now, || true).unwrap();
+            intake.session.request(LEVEL, pos, None).unwrap();
+            assert!(intake.session.config.is_some());
+            assert_eq!(intake.events.len(), 1);
+
+            intake.close();
+            // The old transport can still be live during the pre-teardown logout callback.
+            for bytes in [&cfg, &split] {
+                intake
+                    .receive(bytes, now, || {
+                        panic!("closed intake must not consult the epoch")
+                    })
+                    .unwrap();
+            }
+            assert!(intake.events.is_empty());
+            assert!(intake.session.pending.is_empty());
+            assert!(intake.session.receiver.buffers.is_empty());
+
+            assert!(intake.open());
+            intake.session.request(LEVEL, pos, None).unwrap();
+            let old = Message::Response(OctreeSectionResponse {
+                future_id: 0,
+                payload: None,
+            })
+            .encode()
+            .unwrap();
+            for bytes in [&cfg, &split, &old] {
+                intake.receive(bytes, now, || false).unwrap();
+            }
+            assert!(intake.session.config.is_none());
+            assert_eq!(intake.session.pending.get(&0).unwrap().1, pos);
+            assert!(intake.session.receiver.buffers.is_empty());
+            assert!(intake.events.is_empty());
+            intake.receive(&cfg, now, || true).unwrap();
+            assert!(intake.session.config.is_some());
+        }
 
         fn varied_section(pos: OctreeSectionPos, distinct: u32) -> OctreeSection {
             let mut s = OctreeSection::new(pos);

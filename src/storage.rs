@@ -1116,7 +1116,7 @@ impl OpenRegion {
         }))
     }
 
-    /// Raw record bytes of `slot_idx`, bounds-checked against the header limits.
+    /// Raw bytes from the slot validated when this region opened.
     fn read_slot_bytes(&mut self, slot_idx: usize) -> io::Result<Option<(Vec<u8>, u32)>> {
         let entry = self.slots[slot_idx];
         if entry.len == 0 {
@@ -1487,6 +1487,7 @@ struct IoQueueState {
     pending_octree_loads: VecDeque<(OctreeSaveKey, u64)>,
     octree_responses: Vec<OctreeLoaded>,
     in_flight: usize,
+    reset_regions: bool,
     shutdown: bool,
     responses: Vec<IoResponse>,
 }
@@ -1498,6 +1499,7 @@ impl IoQueueState {
             && self.pending_octree_saves.is_empty()
             && self.pending_octree_loads.is_empty()
             && self.in_flight == 0
+            && !self.reset_regions
     }
 }
 
@@ -1645,6 +1647,20 @@ impl LodIoWorker {
         }
     }
 
+    /// Finish accepted I/O before discarding results and closing the old world's region handles.
+    /// The lifetime owner must exclude new world work until this barrier returns.
+    pub(crate) fn reset_world(&self) {
+        let mut st = self.shared.state.lock().unwrap();
+        if self.handle.lock().unwrap().is_none() {
+            return;
+        }
+        st.reset_regions = true;
+        self.shared.wake_worker.notify_one();
+        while st.reset_regions {
+            st = self.shared.wake_flusher.wait(st).unwrap();
+        }
+    }
+
     pub fn drain_responses(&self) -> Vec<IoResponse> {
         let mut st = self.shared.state.lock().unwrap();
         std::mem::take(&mut st.responses)
@@ -1697,6 +1713,13 @@ fn run_io_worker(shared: Arc<IoShared>) {
                 if let Some((key, request)) = st.pending_octree_loads.pop_front() {
                     st.in_flight += 1;
                     break Task::OctreeLoad(key, request);
+                }
+                if st.reset_regions {
+                    cache.regions.clear();
+                    st.responses.clear();
+                    st.octree_responses.clear();
+                    st.reset_regions = false;
+                    shared.wake_flusher.notify_all();
                 }
                 if st.shutdown {
                     break Task::Exit;
@@ -1772,6 +1795,50 @@ fn run_io_worker(shared: Arc<IoShared>) {
 }
 
 #[cfg(test)]
+pub(crate) struct TestTempDir(PathBuf);
+
+#[cfg(test)]
+impl TestTempDir {
+    pub(crate) fn new(label: &str) -> Self {
+        loop {
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "dh-storage-test-{label}-{}-{seq}",
+                std::process::id()
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => return Self(dir),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create test directory {}: {e}", dir.display()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestTempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<Path> for TestTempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::lod::SOURCE_LOADED_CHUNK;
@@ -1804,18 +1871,6 @@ mod tests {
             }
         }
         section
-    }
-
-    fn fresh_tmp_dir(label: &str) -> PathBuf {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dh-storage-test-{}-{}-{seq}",
-            label,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     #[test]
@@ -1853,7 +1908,7 @@ mod tests {
 
     #[test]
     fn region_store_packs_sections_survives_torn_header_and_quarantines_corrupt_magic() {
-        let tmp_dir = fresh_tmp_dir("region");
+        let tmp_dir = TestTempDir::new("region");
 
         let mut cache = RegionCache::default();
         let positions = [
@@ -1948,8 +2003,6 @@ mod tests {
         let (mut rec, crc) = compress_section_record(&updated).unwrap();
         rec[5] ^= 0xFF;
         assert!(decompress_section_record(&rec, Some(crc)).is_none());
-
-        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -1963,16 +2016,16 @@ mod tests {
             sanitize_dimension("mymod_a:b")
         );
 
-        let tmp_dir = fresh_tmp_dir("worker");
+        let tmp_dir = TestTempDir::new("worker");
         let pos = SectionPos::new(0, 2, -3);
         let worker = LodIoWorker::spawn();
         worker.request_save(
-            tmp_dir.clone(),
+            tmp_dir.to_path_buf(),
             "minecraft:overworld".into(),
             sample_section(pos, 70),
         );
         worker.request_save(
-            tmp_dir.clone(),
+            tmp_dir.to_path_buf(),
             "minecraft:overworld".into(),
             sample_section(pos, 95),
         );
@@ -1985,7 +2038,6 @@ mod tests {
         assert_eq!(loaded.get(0, 0).solid_top_y, 95);
 
         drop(worker);
-        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     // ---- DHLOD003 octree codec ----
@@ -2185,7 +2237,7 @@ mod tests {
 
     #[test]
     fn octree_region_file_persists_and_recovers() {
-        let dir = fresh_tmp_dir("octree-region");
+        let dir = TestTempDir::new("octree-region");
         let dim = "minecraft:overworld";
         let a_pos = OctreeSectionPos::new(0, 1, 0, 2);
         let b_pos = OctreeSectionPos::new(0, 2, 1, 3);
@@ -2281,13 +2333,11 @@ mod tests {
         fs::write(&path, &raw).unwrap();
         let mut bad = RegionCache::default();
         assert!(bad.load_octree_section(&dir, dim, b_pos).unwrap().is_none());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn octree_worker_rewrites_existing_slots_with_air_without_allocating_new_ones() {
-        let dir = fresh_tmp_dir("octree-air");
+        let dir = TestTempDir::new("octree-air");
         let dim = "minecraft:overworld";
         let pos = OctreeSectionPos::new(0, 0, 0, 0);
         let neighbor = pos.neighbor(crate::octree::Face::PosX);
@@ -2299,17 +2349,22 @@ mod tests {
         clear.revision = old.revision + 1;
 
         let worker = LodIoWorker::spawn();
-        worker.save_octree_section(dir.clone(), dim.into(), old, mapping);
-        worker.save_octree_section(dir.clone(), dim.into(), other.clone(), other_mapping);
+        worker.save_octree_section(dir.to_path_buf(), dim.into(), old, mapping);
+        worker.save_octree_section(dir.to_path_buf(), dim.into(), other.clone(), other_mapping);
         worker.flush();
         for section in [
             clear.clone(),
             OctreeSection::new(missing),
             OctreeSection::new(absent_region),
         ] {
-            worker.save_octree_section(dir.clone(), dim.into(), section, OctreeMapping::default());
+            worker.save_octree_section(
+                dir.to_path_buf(),
+                dim.into(),
+                section,
+                OctreeMapping::default(),
+            );
         }
-        worker.load_octree_section(dir.clone(), dim.into(), pos, 7, false);
+        worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 7, false);
         worker.flush();
         let responses = worker.drain_octree_responses();
         assert_eq!(responses.len(), 1);
@@ -2341,12 +2396,11 @@ mod tests {
         );
         assert!(!octree_region_path(&dir, dim, absent_region).exists());
         drop(fresh);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn octree_pending_clear_supersedes_nonempty_write_before_load() {
-        let dir = fresh_tmp_dir("octree-coalesced-air");
+        let dir = TestTempDir::new("octree-coalesced-air");
         let dim = "minecraft:overworld";
         let pos = OctreeSectionPos::new(0, 0, 0, 0);
         let (old, mapping) = populated_octree(pos);
@@ -2359,10 +2413,10 @@ mod tests {
             }),
             handle: Mutex::new(None),
         };
-        worker.save_octree_section(dir.clone(), dim.into(), old, mapping);
-        worker.load_octree_section(dir.clone(), dim.into(), pos, 7, false);
+        worker.save_octree_section(dir.to_path_buf(), dim.into(), old, mapping);
+        worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 7, false);
         worker.save_octree_section(
-            dir.clone(),
+            dir.to_path_buf(),
             dim.into(),
             OctreeSection::new(pos),
             OctreeMapping::default(),
@@ -2374,12 +2428,57 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got.into_iter().next().unwrap().result.unwrap().is_none());
         assert!(!octree_region_path(&dir, dim, pos).exists());
-        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reset_closes_cached_regions_after_writes_and_reopens_a_replacement() {
+        let dir = TestTempDir::new("octree-reopen");
+        let replacement_dir = TestTempDir::new("octree-replacement");
+        let dim = "minecraft:overworld";
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let worker = LodIoWorker::spawn();
+        let first = OctreeSection::filled(pos, Voxel::new(1, 0, 12, 0));
+        worker.save_octree_section(
+            dir.to_path_buf(),
+            dim.into(),
+            first.clone(),
+            OctreeMapping::default(),
+        );
+        worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 1, false);
+        worker.reset_world();
+        assert!(worker.drain_octree_responses().is_empty());
+        let (written, _) = RegionCache::default()
+            .load_octree_section(&dir, dim, pos)
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.to_dense(), first.to_dense());
+
+        let replacement = OctreeSection::filled(pos, Voxel::new(2, 0, 10, 0));
+        RegionCache::default()
+            .save_octree_section(
+                &replacement_dir,
+                dim,
+                &replacement,
+                &OctreeMapping::default(),
+                DEFAULT_OCTREE_COMPRESSION,
+            )
+            .unwrap();
+        let path = octree_region_path(&dir, dim, pos);
+        fs::rename(&path, path.with_extension("first-open")).unwrap();
+        fs::rename(octree_region_path(&replacement_dir, dim, pos), path).unwrap();
+        worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 2, false);
+        worker.flush();
+        let result = worker.drain_octree_responses().pop().unwrap();
+        assert_eq!(result.request, 2);
+        assert_eq!(
+            result.result.unwrap().unwrap().0.to_dense(),
+            replacement.to_dense()
+        );
     }
 
     #[test]
     fn octree_worker_coalesces_saves_and_flushes_on_drop() {
-        let dir = fresh_tmp_dir("octree-worker");
+        let dir = TestTempDir::new("octree-worker");
         let dim = "minecraft:overworld";
         let pos = OctreeSectionPos::new(1, -1, 0, -1);
         let (first, mapping) = populated_octree(pos);
@@ -2387,10 +2486,15 @@ mod tests {
         second.set(4, 4, 4, Voxel::new(2, 3, 9, 9));
 
         let worker = LodIoWorker::spawn();
-        worker.save_octree_section(dir.clone(), dim.into(), first, mapping.clone());
-        worker.save_octree_section(dir.clone(), dim.into(), second.clone(), mapping.clone());
+        worker.save_octree_section(dir.to_path_buf(), dim.into(), first, mapping.clone());
+        worker.save_octree_section(
+            dir.to_path_buf(),
+            dim.into(),
+            second.clone(),
+            mapping.clone(),
+        );
         worker.flush();
-        worker.load_octree_section(dir.clone(), dim.into(), pos, 7, false);
+        worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 7, false);
         worker.flush();
         let got = worker.drain_octree_responses();
         assert_eq!(got.len(), 1);
@@ -2404,7 +2508,7 @@ mod tests {
         let other = OctreeSectionPos::new(1, -2, 0, -1);
         let (extra, extra_map) = populated_octree(other);
         worker.save_octree_section_with(
-            dir.clone(),
+            dir.to_path_buf(),
             dim.into(),
             extra.clone(),
             extra_map,
@@ -2417,7 +2521,5 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.to_dense(), extra.to_dense());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

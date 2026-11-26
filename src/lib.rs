@@ -136,6 +136,7 @@ impl Hooks for DistantHorizonsMod {
         _event: &mut mod_api::ClientResourcesReloadedEvent,
     ) {
         let _ = resource_colors::reload_from_resources(host);
+        render_bridge::invalidate_quad_mesh();
         pipeline::invalidate_models();
     }
 
@@ -183,13 +184,37 @@ impl Hooks for DistantHorizonsMod {
         st.client_loaded_chunks.clear();
     }
 
+    fn client_player_logging_in(
+        &self,
+        _host: &mut dyn ClientHost,
+        _event: &mut mod_api::ClientPlayerLoggingInEvent,
+    ) {
+        // Play login can follow configuration's world close without a logout.
+        render_bridge::invalidate_quad_mesh();
+    }
+
+    fn client_player_logging_out(
+        &self,
+        host: &mut dyn ClientHost,
+        _event: &mut mod_api::ClientPlayerLoggingOutEvent,
+    ) {
+        render_bridge::invalidate_quad_mesh();
+        let rt = runtime();
+        let owns_server = host.client_session().client_server().map_or_else(
+            || rt.inner.lock().unwrap().server_open,
+            |server| server.integrated_local,
+        );
+        if !owns_server {
+            reset_world(rt, false);
+        }
+    }
+
     fn client_level_unload(
         &self,
         _host: &mut dyn ClientHost,
         event: &mut ClientLevelUnloadEvent<'_>,
     ) {
-        let _ = render_bridge::clear_dimension(event.dimension);
-        network::octree_sync::client_reset();
+        pipeline::client_level_unload(event.dimension);
         let mut st = runtime().inner.lock().unwrap();
         st.remote_requested.remove(event.dimension);
         st.client_loaded_chunks.clear();
@@ -229,7 +254,7 @@ impl Hooks for DistantHorizonsMod {
     }
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
-        if host.on(MOD_ID) {
+        if host.on(MOD_ID) && host.client_session().client_server().is_some() {
             let dim = runtime().inner.lock().unwrap().active_dimension.clone();
             pipeline::client_tick(host, &dim);
             render_bridge::upload_pending(
@@ -355,44 +380,64 @@ impl Hooks for DistantHorizonsMod {
         }
     }
 
+    fn server_about_to_start(
+        &self,
+        _host: &mut dyn ServerHost,
+        _event: &mut mod_api::ServerAboutToStartEvent,
+    ) {
+        // Dev 2 fires this before level_load and startup chunk notifications.
+        reset_world(runtime(), true);
+    }
+
     fn server_started(&self, host: &mut dyn ServerHost, _event: &mut ServerStartedEvent) {
-        let world_dir = host.world_dir();
         let rt = runtime();
-        rt.gen_pool.shutdown_and_join();
-        pipeline::reset_server_intake();
+        let world_dir = host.world_dir();
+        rt.inner.lock().unwrap().world_dir = world_dir;
         rt.gen_pool.ensure_started();
-        let mut st = rt.inner.lock().unwrap();
-        st.world_dir = world_dir;
         pipeline::install_sync_source();
     }
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         let rt = runtime();
-        let world_dir = host
-            .world_dir()
-            .or_else(|| rt.inner.lock().unwrap().world_dir.clone());
+        let world_dir = {
+            let mut st = rt.inner.lock().unwrap();
+            st.live_levels.clear();
+            st.world_dir.clone()
+        };
         rt.gen_pool.shutdown_and_join();
         pipeline::finish_server_io(host, &rt.io, world_dir.as_deref(), None);
     }
 
+    fn server_stopped(&self, _host: &mut dyn ServerHost, _event: &mut mod_api::ServerStoppedEvent) {
+        // Also retires admissions after a failed open or a stop which skipped level_unload.
+        reset_world(runtime(), false);
+    }
+
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
         let world_dir = host.world_dir();
-        let rt = runtime();
-        rt.gen_pool.allow_dimension(event.dimension);
-        let mut st = rt.inner.lock().unwrap();
+        let mut st = runtime().inner.lock().unwrap();
         if st.world_dir.is_none() {
             st.world_dir = world_dir;
         }
-        st.dimensions.entry(event.dimension.to_owned()).or_default();
+        st.live_levels.insert(event.dimension.to_owned());
     }
 
     fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
         let rt = runtime();
-        let world_dir = host
-            .world_dir()
-            .or_else(|| rt.inner.lock().unwrap().world_dir.clone());
-        rt.gen_pool.reset_dimension(event.dimension);
-        pipeline::finish_server_io(host, &rt.io, world_dir.as_deref(), Some(event.dimension));
+        let dim = event.dimension;
+        let world_dir = {
+            let mut st = rt.inner.lock().unwrap();
+            st.live_levels.remove(dim);
+            st.dimensions.remove(dim);
+            st.pending_chunks.remove(dim);
+            st.pending_chunk_set.remove(dim);
+            st.desired_cache.retain(|(d, _), _| d != dim);
+            st.next_distant_sample.remove(dim);
+            st.server_player_round_robin.remove(dim);
+            st.world_dir.clone()
+        };
+        rt.gen_pool.reset_dimension(dim);
+        pipeline::finish_server_io(host, &rt.io, world_dir.as_deref(), Some(dim));
     }
 
     fn chunk_load(&self, host: &mut dyn ServerHost, event: &mut ChunkLoadEvent<'_>) {
@@ -421,10 +466,33 @@ impl Hooks for DistantHorizonsMod {
             return;
         }
         let dim = event.level.dimension_id();
-        if runtime().gen_pool.dimension_allowed(dim) {
+        if runtime().inner.lock().unwrap().live_levels.contains(dim) {
             tick_server_dimension(host, dim);
         }
     }
+}
+
+fn reset_world(rt: &render_bridge::DhRuntime, server_open: bool) {
+    rt.gen_pool.shutdown_and_join();
+    network::octree_sync::client_reset();
+    // Legacy submissions and I/O response adoption take this lock; do not let an old result
+    // become visible after the disk worker and pipeline cross the lifetime boundary.
+    let mut st = rt.inner.lock().unwrap();
+    pipeline::reset_world(&rt.io);
+    st.server_open = server_open;
+    st.world_dir = None;
+    st.live_levels.clear();
+    st.dimensions.clear();
+    st.pending_chunks.clear();
+    st.pending_chunk_set.clear();
+    st.desired_cache.clear();
+    st.next_distant_sample.clear();
+    st.server_player_round_robin.clear();
+    st.remote_requested.clear();
+    st.client_loaded_chunks.clear();
+    st.active_dimension.clear();
+    st.camera = None;
+    st.has_camera = false;
 }
 
 /// Client side of `octree_sync` on a remote server: send our config once, then ask for the
@@ -469,6 +537,9 @@ fn sync_client_config(host: &dyn Host) {
 fn enqueue_chunk(dimension: &str, chunk: [i32; 2]) {
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
+    if !st.live_levels.contains(dimension) {
+        return;
+    }
     let set = st
         .pending_chunk_set
         .entry(dimension.to_owned())
@@ -489,18 +560,13 @@ const SAVES_PER_TICK: usize = 32;
 
 fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     let rt = runtime();
-    let world_dir = host
-        .world_dir()
-        .or_else(|| rt.inner.lock().unwrap().world_dir.clone());
+    let world_dir = rt.inner.lock().unwrap().world_dir.clone();
     pipeline::advance_intake(host, &rt.io, world_dir.as_deref(), dim);
     let intake_ready = !pipeline::has_pending_intake(dim);
 
     // 1. Sample a small batch of newly loaded / modified chunks via `ChunkSnapshot`.
     let chunks_to_sample: Vec<[i32; 2]> = {
         let mut st = rt.inner.lock().unwrap();
-        if st.world_dir.is_none() && world_dir.is_some() {
-            st.world_dir = world_dir.clone();
-        }
         let mut batch = Vec::with_capacity(CHUNKS_PER_TICK);
         let st_ref = &mut *st;
         if intake_ready && let Some(queue) = st_ref.pending_chunks.get_mut(dim) {
@@ -1034,14 +1100,16 @@ fn sample_distant_sections(
             3 => Some(mod_api::GenerationStage::Light),
             _ => None,
         };
-        if rt.gen_pool.enqueue(
-            dim.to_owned(),
-            pos,
-            gen_handle,
-            saved_reader,
-            feature_stage,
-            cells,
-        ) {
+        if rt.inner.lock().unwrap().live_levels.contains(dim)
+            && rt.gen_pool.enqueue(
+                dim.to_owned(),
+                pos,
+                gen_handle,
+                saved_reader,
+                feature_stage,
+                cells,
+            )
+        {
             ran_any = true;
         } else {
             break;
