@@ -1,0 +1,25 @@
+id = "distantsunrises"
+name = "Distant Sunrises"
+version = "3.3.5"
+description = "Generates and renders simplified level-of-detail terrain beyond the normal view distance."
+authors = [
+    "James Seibel",
+    "Leonardo Amato",
+    "Cola",
+    "coolGi",
+    "Ran",
+    "Leetom",
+    "pshsh",
+    "Karnatour",
+    "arismoko",
+]
+license = "LGPL-3.0-or-later"
+homepage = "https://github.com/arismoko/distant-sunrises"
+issues = "https://github.com/arismoko/distant-sunrises/issues"
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+sunrise = "ba1f24e4ad41246b558230aa665539dc768b1287"
