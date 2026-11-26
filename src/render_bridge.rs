@@ -105,8 +105,10 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
 /// pipelines (Hi-Z, command generation) are added with the compute primitives.
 pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
     use mod_api::{PipelineBlend, PrimitiveTopology, RenderPipeline, WorldDepth};
-    // Opaque: depth-tested, culled by the index order of the quad mesh; translucent: sorted by the
-    // arena's bucket order, blended, no depth write.
+    // Opaque: depth-tested, culled by the index order of the quad mesh; translucent: depth-tested
+    // and depth-writing (matching Voxy `MDICSectionRenderer.renderTranslucent` and vanilla
+    // `RenderType.translucent`) so closer water surfaces reject farther/back water faces instead
+    // of double-blending.
     event.register(
         RenderPipeline::new(
             id(PIPELINE_OPAQUE),
@@ -127,7 +129,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
             WorldDepth::Tested,
         )
         .define("TRANSLUCENT")
-        .depth_write(false)
+        .depth_write(true)
         .topology(PrimitiveTopology::Triangles)
         .cull(false)
         .bind_group_layout(quad_layout()),

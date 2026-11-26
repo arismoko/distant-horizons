@@ -30,7 +30,7 @@ use std::sync::{LazyLock, Mutex};
 /// Block models baked per client tick (each bake reads sprite pixels on the CPU).
 const BAKES_PER_TICK: usize = 64;
 /// Sections meshed per client tick.
-const MESHES_PER_TICK: usize = 16;
+const MESHES_PER_TICK: usize = 32;
 
 /// Octree voxel ids: `0` is air, `n` is `states[n - 1]`; biome ids index `biomes`.
 #[derive(Default)]
@@ -178,6 +178,9 @@ struct Pipeline {
     models_dirty: bool,
     dirty: HashMap<String, VecDeque<OctreeSectionPos>>,
     queued: HashMap<String, HashSet<OctreeSectionPos>>,
+    /// Sections currently uploaded to the GPU arena (strictly leaf sections: never both parent
+    /// and child for the same volume).
+    rendered: HashMap<String, HashSet<OctreeSectionPos>>,
     /// Sections changed since their last save.
     unsaved: HashMap<String, HashSet<OctreeSectionPos>>,
     /// Sections already asked of disk or of the server, per dimension.
@@ -186,13 +189,63 @@ struct Pipeline {
 
 static PIPELINE: LazyLock<Mutex<Pipeline>> = LazyLock::new(Default::default);
 
+/// Returns `true` when `pos` is the active leaf detail level for its volume: `pos` exists and is
+/// non-empty in `store`, and none of its finer octree descendants exist and are non-empty.
+/// Ancestors stay in `store` for persistence and coarse fallback, but are never drawn alongside
+/// their children (matching Voxy's hierarchical traversal).
+pub(crate) fn is_render_leaf(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
+    let Some(section) = store.section(pos) else {
+        return false;
+    };
+    if section.is_empty() {
+        return false;
+    }
+    !has_non_empty_descendant(store, pos)
+}
+
+fn has_non_empty_descendant(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
+    let Some(kids) = pos.children() else {
+        return false;
+    };
+    for child in kids {
+        if store.section(child).is_some_and(|s| !s.is_empty()) {
+            return true;
+        }
+        if child.detail > 0 && has_non_empty_descendant(store, child) {
+            return true;
+        }
+    }
+    false
+}
+
 impl Pipeline {
     fn queue(&mut self, dim: &str, positions: impl IntoIterator<Item = OctreeSectionPos>) {
+        let rendered = self.rendered.get(dim);
         let set = self.queued.entry(dim.to_owned()).or_default();
         let queue = self.dirty.entry(dim.to_owned()).or_default();
-        for pos in positions {
+        let mut push = |pos: OctreeSectionPos| {
             if set.insert(pos) {
                 queue.push_back(pos);
+            }
+        };
+        for pos in positions {
+            push(pos);
+            // Evict any currently-rendered ancestor superseded by a finer section, and re-mesh
+            // any currently-rendered same-detail neighbour so touching border walls are culled.
+            if let Some(live) = rendered {
+                let mut anc = pos.parent();
+                while let Some(a) = anc {
+                    if live.contains(&a) {
+                        push(a);
+                    }
+                    anc = a.parent();
+                }
+                for face in Face::ALL {
+                    let nb = pos.neighbor(face);
+                    if live.contains(&nb) {
+                        push(nb);
+                    }
+                }
             }
         }
     }
@@ -252,6 +305,7 @@ pub fn clear_dimension(dim: &str) {
     p.stores.remove(dim);
     p.dirty.remove(dim);
     p.queued.remove(dim);
+    p.rendered.remove(dim);
     p.unsaved.remove(dim);
     p.requested.remove(dim);
 }
@@ -479,15 +533,34 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             continue;
         };
         let key = (dim.to_owned(), pos.detail, [pos.x, pos.y, pos.z]);
+        if !is_render_leaf(store, pos) {
+            if p.rendered
+                .get_mut(dim)
+                .is_some_and(|live| live.remove(&pos))
+            {
+                submit_built_section(key, empty_section(pos));
+            }
+            continue;
+        }
         let Some(section) = store.section(pos) else {
-            submit_built_section(key, empty_section(pos));
             continue;
         };
         let neighbors: [Option<&OctreeSection>; 6] =
             Face::ALL.map(|face| store.section(pos.neighbor(face)));
         let borders = NeighborBorders::from_neighbors(neighbors);
         let quads = mesh_octree_section(section, &borders, &p.models);
-        submit_built_section(key, built_section(&quads));
+        let built = built_section(&quads);
+        if built.is_empty() {
+            if p.rendered
+                .get_mut(dim)
+                .is_some_and(|live| live.remove(&pos))
+            {
+                submit_built_section(key, empty_section(pos));
+            }
+        } else {
+            p.rendered.entry(dim.to_owned()).or_default().insert(pos);
+            submit_built_section(key, built);
+        }
     }
 }
 
@@ -764,4 +837,35 @@ impl ServerSource<PlayerRef> for PipelineSource {
 /// Serve octree sections to connected players (call once when the server starts).
 pub fn install_sync_source() {
     crate::network::octree_sync::install_server_source(Arc::new(PipelineSource));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaf_selection_never_renders_parent_alongside_non_empty_child() {
+        let mut store = OctreeIngestStore::new();
+        let parent_pos = OctreeSectionPos::new(1, 0, 2, 0);
+        let mut parent = OctreeSection::new(parent_pos);
+        parent.set(0, 0, 0, Voxel::new(1, 0, 15, 0));
+        store.adopt_section(parent);
+        assert!(
+            is_render_leaf(&store, parent_pos),
+            "coarse section with no children is a render leaf"
+        );
+
+        let child_pos = parent_pos.children().unwrap()[0];
+        let mut child = OctreeSection::new(child_pos);
+        child.set(0, 0, 0, Voxel::new(1, 0, 15, 0));
+        store.adopt_section(child);
+        assert!(
+            is_render_leaf(&store, child_pos),
+            "finer child becomes the render leaf"
+        );
+        assert!(
+            !is_render_leaf(&store, parent_pos),
+            "parent is no longer rendered once a finer child exists"
+        );
+    }
 }

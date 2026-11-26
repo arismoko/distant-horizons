@@ -252,6 +252,15 @@ pub fn mesh_octree_section(
                     } else {
                         borders.get(face, x, y, z)
                     };
+                    if meta.fluid() {
+                        // Never emit vertical water walls or undersides into an unloaded border,
+                        // and skip coarse-LOD water undersides so distant water stays a clean sheet.
+                        if (neighbor.is_none() && face != Face::PosY)
+                            || (section.pos.detail >= 1 && face == Face::NegY)
+                        {
+                            continue;
+                        }
+                    }
                     if let Some(nv) = neighbor
                         && !nv.is_air()
                     {
@@ -691,5 +700,25 @@ mod octree_mesh_tests {
         };
         assert_eq!(sky(Face::NegX), 15);
         assert_eq!(sky(Face::PosZ), 3);
+    }
+
+    #[test]
+    fn fluid_skips_unloaded_border_side_walls_and_coarse_undersides() {
+        let mut s = OctreeSection::new(OctreeSectionPos::new(1, 0, 2, 0));
+        // Water touching the +X border (x = 31) with no neighbour loaded.
+        s.set(31, 4, 4, Voxel::new(WATER, 1, 15, 0));
+        let m = mesh_octree_section(&s, &NeighborBorders::none(), &models);
+        assert!(
+            m.translucent.iter().any(|q| q.face() == Face::PosY.id()),
+            "top water face is still emitted"
+        );
+        assert!(
+            !m.translucent.iter().any(|q| q.face() == Face::PosX.id()),
+            "unloaded border side wall is not emitted for fluids"
+        );
+        assert!(
+            !m.translucent.iter().any(|q| q.face() == Face::NegY.id()),
+            "coarse-LOD fluid underside is skipped"
+        );
     }
 }
