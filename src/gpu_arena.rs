@@ -42,7 +42,7 @@ pub const OPAQUE_SLOTS_PER_SECTION: u64 = 7;
 pub const TRANSLUCENT_SLOTS_PER_SECTION: u64 = 1;
 /// Words per baked model record.
 pub const MODEL_WORDS: u64 = 16;
-/// State ids are 20 bits and biome ids 9 bits in the packed quad (Voxy `quad_format.glsl`).
+/// Packed quads store a 20-bit model id and a 9-bit biome id (Voxy `quad_format.glsl`).
 pub const MODEL_COUNT: u64 = 1 << 20;
 pub const BIOME_COUNT: u64 = 1 << 9;
 
@@ -538,7 +538,8 @@ pub struct GpuArena {
     pub dispatch_a: StorageBufferRef,
     /// Indirect compute dispatch arguments for queue B (`indirect: true`).
     pub dispatch_b: StorageBufferRef,
-    /// Baked model table: `MODEL_WORDS` (16) `u32`s per 20-bit state id (see `voxy_quads.vsh`).
+    /// Baked model table: `MODEL_WORDS` (16) `u32`s per deduplicated model. The shaders index it
+    /// by the 20-bit model id in [`PackedQuad`].
     pub models: StorageBufferRef,
     /// Biome tint LUT: grass, foliage, water `0x00BBGGRR` per 9-bit biome id.
     pub biome_tints: StorageBufferRef,

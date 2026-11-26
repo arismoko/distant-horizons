@@ -603,11 +603,12 @@ const ATLAS_FACES: usize = (ATLAS_SIDE / TILE) * (ATLAS_SIDE / TILE);
 // Every mip level must keep whole tiles (`build_atlas_mips` never mixes neighbouring faces).
 const _: () = assert!(TILE >= 1 << (ATLAS_MIP_LEVELS - 1));
 
-/// One model as the 16 words `voxy_quads.vsh/fsh` read: `[0..6]` atlas tile origins (`x | y << 16`
-/// in atlas pixels), `[6..12]` per-face average colour, `[12]` flags (bit 0 translucent, bit 1 face
-/// shading, bit 2 cutout, bits 4..8 tint kind), `[13]` constant tint, `[14]` tile size
-/// (`w | h << 16`, 0 = flat colour), `[15]` block light emission. Faces of model `index` are
-/// painted into `atlas` (RGBA8, `ATLAS_SIDE²`) when they fit.
+/// One 16-word baked model record: `[0..6]` atlas tile origins (`x | y << 16` in atlas pixels),
+/// `[6..12]` per-face average colour, `[12]` flags, tint kind, DH material ID and per-face tint states,
+/// `[13]` reserved (stays zero), `[14]` tile size (`w | h << 16`, 0 = flat
+/// colour), `[15]` the active shader pack's `block.properties` id, passed to `mc_Entity.x` by the
+/// pack vertex shaders. Faces of model `index` are painted into `atlas` (RGBA8, `ATLAS_SIDE²`)
+/// when they fit. Fixed tint is baked into the face texels and their average colour.
 fn model_words(index: usize, m: &BakedModel, atlas: &mut [u8]) -> [u32; MODEL_WORDS as usize] {
     let mut w = [0u32; MODEL_WORDS as usize];
     let textured = (index + 1) * 6 <= ATLAS_FACES;
