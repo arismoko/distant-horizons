@@ -432,7 +432,7 @@ mod octree_mesh_tests {
     }
 
     fn pos() -> OctreeSectionPos {
-        OctreeSectionPos::new(0, 0, 0, 0)
+        OctreeSectionPos::new(0, 0, 2, 0)
     }
 
     fn area(quads: &[PackedQuad], face: Face, plane: impl Fn(&PackedQuad) -> u8, at: u8) -> u32 {
@@ -780,5 +780,19 @@ mod octree_mesh_tests {
                 .any(|q| q.x() == 16 && q.face() == Face::NegX.id()),
             "solid neighbour in covered octant still culls the internal seam wall"
         );
+    }
+
+    #[test]
+    fn y0_section_skips_unloaded_bottom_face() {
+        let s = OctreeSection::filled(
+            OctreeSectionPos::new(0, 0, 0, 0),
+            Voxel::new(STONE, 0, 15, 0),
+        );
+        let m = mesh_octree_section(&s, &NeighborBorders::none(), &models);
+        assert!(
+            !m.opaque.iter().any(|q| q.face() == Face::NegY.id()),
+            "unloaded y=0 bottom face is not emitted"
+        );
+        assert_eq!(m.opaque_count(), 20);
     }
 }
