@@ -76,8 +76,36 @@ cargo sunrise-mod check
 cargo sunrise-mod build
 ```
 
-`tools/bench_far_terrain.py` runs the like-for-like far-terrain benchmark against a baseline
-Sunrise.
+## Measuring far-terrain cost
+
+On Linux with Python 3.11+, use a trusted `target/sunrise-mod/run/app` staged by the SDK tool for
+this checkout, `sunrise-ctl` from the matching game release, and that release's verified game and
+SDK metadata. The script does not build, download, or stage source packages. For example, on a
+machine with a dedicated Xvfb display and a working graphics driver:
+
+```sh
+xvfb-run -a -s '-screen 0 1280x720x24' python3 tools/bench_far_terrain.py \
+  --app "$STAGED_APP" --ctl "$SUNRISE_CTL" \
+  --release "$SUNRISE_RELEASE_JSON" --sdk "$SDK_JSON" \
+  --resources "$PREPARED_RESOURCES" --out "$NEW_PRIVATE_RESULT_DIR" \
+  --seed 1234 --camera -525 105 64 0 18 --distance 4 --settle 15 --seconds 20
+```
+
+Both rows use the same game executable, resources, seed, fixed spectator camera, clear noon and
+near render distance. Each starts a fresh scratch save (no pre-existing chunks or LOD cache), with
+its own game, options, offline player, and XDG state. The baseline omits the native package and
+libraries; the mod row must map the selected native library and answer `/ds` in the running game.
+The supplied stage and resources are not edited. `--runs N` repeats the pair with fresh state and
+alternates the order. It does not reuse a shader or terrain cache from an earlier run.
+
+`report.json` records frame times from `sunrise-ctl bench`, integrated server-thread CPU over the
+same measurement window, `.dhoct` apparent and allocated bytes after graceful shutdown, and
+near-terrain counts and mod store counts at both boundaries. `inputs.json` records file SHA-256s;
+each row preserves the raw control results, library mapping, logs, and a same-camera screenshot.
+Inspect the screenshots side by side to confirm visible distant terrain. An active section count
+is not a count of visible geometry, and the vanilla row does not render the mod's far coverage.
+These are fixed-duration costs, not an equal-coverage speedup or a comparison with Sunrise's
+former built-in far terrain.
 
 ## License
 
