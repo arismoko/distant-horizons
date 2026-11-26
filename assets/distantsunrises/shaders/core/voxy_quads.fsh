@@ -20,6 +20,8 @@ layout(std430) readonly buffer ModelBuffer { uint models[]; };
 // 16, 8, 4, 2, 1) and a trilinear sampler (`render_bridge::atlas_sampler`, `max_lod` = 4).
 uniform sampler2D BlockAtlas;
 const float ATLAS_MAX_LOD = 4.0;
+// Depth of the furthest meshed-column box per pixel (`render_bridge::setup_bounds`).
+uniform sampler2D BoundDepth;
 
 layout(location = 0) in flat uvec4 inter;
 layout(location = 1) in vec2 uv;
@@ -54,13 +56,14 @@ void main() {
     bool cutout = (mflags & 4u) != 0u;
     uint tint_kind = (mflags >> 4) & 15u;
 
-    // Clip region: vanilla's loaded chunk area is circular around the camera's 16x16 chunk
-    // (until #5911 provides exact per-chunk AABB depth bounds); `clip_dist = 0` disables.
-    float clip_dist = depth_and_light.z;
-    if (clip_dist > 0.0) {
-        vec2 cam_in_chunk = fract(camera_sub_pos.xz / 16.0) * 16.0;
-        vec2 rel_chunk_center = rel_pos.xz + (cam_in_chunk - vec2(8.0));
-        if (length(rel_chunk_center) < clip_dist) {
+    // Footprint bound (behaviour: Voxy lod/gl46/quads.frag's bounding-buffer test): where the
+    // meshed vanilla chunk columns cover this pixel, the furthest depth of their boxes
+    // (`voxy_bounds.vsh` stores 1 - depth; 0 = no column covers the pixel) is the bound, and an
+    // LOD fragment nearer than it is vanilla's terrain to draw, not ours. Off (`flags.z = 0`)
+    // when the footprint is empty or unavailable: nothing is clipped then.
+    if (flags.z != 0u) {
+        float bound = 1.0 - texelFetch(BoundDepth, ivec2(gl_FragCoord.xy), 0).r;
+        if (gl_FragCoord.z > bound) {
             discard;
         }
     }
