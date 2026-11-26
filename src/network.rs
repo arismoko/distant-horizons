@@ -874,45 +874,49 @@ pub mod octree_sync {
     // ------------------------------------------------------------------ splitting, pacing, reassembly
 
     type SectionKey = (String, OctreeSectionPos);
-    type EncodedUpdates = HashMap<(SectionKey, u64), Option<PendingTransfer>>;
+    type EncodedUpdates = HashMap<(SectionKey, u64), Option<EncodedTransfer>>;
 
-    #[derive(Clone)]
     struct TransferRevision {
         key: SectionKey,
         revision: u64,
-        partial: bool,
     }
 
     #[derive(Clone)]
-    struct PendingTransfer {
+    struct EncodedTransfer {
         buffer_id: i32,
         buffer: Arc<[u8]>,
-        offset: usize,
         final_message: Arc<[u8]>,
+    }
+
+    struct PendingTransfer {
+        encoded: EncodedTransfer,
+        offset: usize,
         revision: Option<TransferRevision>,
+        // Full replies hold their slot even if level retirement clears the receipt revision.
+        admission: Option<Admission>,
     }
 
     impl PendingTransfer {
         fn frame(&self, budget: usize) -> Option<(Vec<u8>, usize)> {
-            let remaining = self.buffer.len() - self.offset;
+            let remaining = self.encoded.buffer.len() - self.offset;
             if remaining == 0 {
-                return Some((self.final_message.to_vec(), 0));
+                return Some((self.encoded.final_message.to_vec(), 0));
             }
             let chunk = budget.min(FULL_DATA_SPLIT_SIZE_IN_BYTES).min(remaining);
             if chunk == 0 {
                 return None;
             }
             let split = Message::Split(SplitMessage {
-                buffer_id: self.buffer_id,
-                buffer: self.buffer[self.offset..self.offset + chunk].to_vec(),
+                buffer_id: self.encoded.buffer_id,
+                buffer: self.encoded.buffer[self.offset..self.offset + chunk].to_vec(),
                 is_first: self.offset == 0,
             });
             Some((split.encode().ok()?, chunk))
         }
     }
 
-    /// `FullDataPayloadSender`: one ordered, bandwidth-paced queue per player. Only advance a
-    /// split or finish its transfer after the connection accepts that frame.
+    /// `FullDataPayloadSender`: one ordered, bandwidth-paced queue per player. Advance a split
+    /// only on local queue acceptance; retire a transfer on final acceptance or terminal refusal.
     #[derive(Default)]
     pub struct PayloadSender {
         queue: VecDeque<PendingTransfer>,
@@ -1036,8 +1040,8 @@ pub mod octree_sync {
         pub sync_on_load: RateAndConcurrencyLimiter,
     }
 
-    /// Which limiter slot an admitted request holds; give it back with
-    /// [`PlayerSyncState::release`] when the request is answered.
+    /// Which limiter slot an admitted request holds. An immediate reply releases it; a queued
+    /// full reply owns it until the transfer leaves the mod queue.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Admission {
         Generation,
@@ -1215,19 +1219,15 @@ pub mod octree_sync {
                 .player_bandwidth_limit
         }
 
-        fn partial_in_range(
-            &self,
-            key: &SectionKey,
-            location: Option<&(String, i32, i32)>,
-        ) -> bool {
-            location.is_some_and(|(level, x, z)| {
-                *level == key.0 && self.wants_partial_update(key.1, *x, *z)
+        fn partial_in_range(&self, key: &SectionKey, location: Option<&PlayerLocation>) -> bool {
+            location.is_some_and(|p| {
+                p.level == key.0 && self.wants_partial_update(key.1, p.block_x, p.block_z)
             })
         }
 
         fn prepare_transfer<K>(
             &mut self,
-            location: Option<&(String, i32, i32)>,
+            location: Option<&PlayerLocation>,
             source: &dyn ServerSource<K>,
             encoded: &mut EncodedUpdates,
             budget: usize,
@@ -1236,8 +1236,8 @@ pub mod octree_sync {
             // the transfer even if the player moves, rather than strand a receive buffer.
             if let Some(front) = self.sender.queue.front()
                 && front.offset == 0
+                && front.admission.is_none()
                 && let Some(rev) = &front.revision
-                && rev.partial
             {
                 if !self.partial_in_range(&rev.key, location) {
                     self.deferred.remove(&rev.key);
@@ -1267,20 +1267,19 @@ pub mod octree_sync {
                         })
                         .encode()
                         .ok()?;
-                        Some(PendingTransfer {
+                        Some(EncodedTransfer {
                             buffer_id,
                             buffer: buffer.into(),
-                            offset: 0,
                             final_message: final_message.into(),
-                            revision: Some(TransferRevision {
-                                key: key.clone(),
-                                revision,
-                                partial: true,
-                            }),
                         })
                     });
                     if let Some(transfer) = transfer {
-                        self.sender.queue.push_back(transfer.clone());
+                        self.sender.queue.push_back(PendingTransfer {
+                            encoded: transfer.clone(),
+                            offset: 0,
+                            revision: Some(TransferRevision { key, revision }),
+                            admission: None,
+                        });
                         break;
                     }
                 }
@@ -1289,12 +1288,11 @@ pub mod octree_sync {
         }
 
         fn finish_transfer(&mut self, transfer: PendingTransfer, accepted: bool) {
-            let Some(TransferRevision {
-                key,
-                revision,
-                partial,
-            }) = transfer.revision
-            else {
+            let partial = transfer.admission.is_none();
+            if let Some(admission) = transfer.admission {
+                self.release(admission);
+            }
+            let Some(TransferRevision { key, revision }) = transfer.revision else {
                 return;
             };
             let receipt = self.receipts.get_mut(&key).unwrap();
@@ -1327,7 +1325,24 @@ pub mod octree_sync {
         fn player_block_xz(&self, player: K) -> Option<(i32, i32)>;
     }
 
-    pub(crate) type PlayerLocations<K> = HashMap<K, (String, i32, i32)>;
+    pub(crate) struct PlayerLocation {
+        level: String,
+        block_x: i32,
+        block_z: i32,
+    }
+
+    impl PlayerLocation {
+        pub(crate) fn new(level: String, pose: [f64; 3]) -> Self {
+            // Match EntityRef::block_position without resolving the already known pose again.
+            Self {
+                level,
+                block_x: pose[0].floor() as i32,
+                block_z: pose[2].floor() as i32,
+            }
+        }
+    }
+
+    pub(crate) type PlayerLocations<K> = HashMap<K, PlayerLocation>;
 
     /// All players' sync state on the server.
     pub struct ServerSyncRegistry<K> {
@@ -1382,11 +1397,11 @@ pub mod octree_sync {
                     if let Some(rev) = &transfer.revision
                         && rev.key.0 == level
                     {
-                        if rev.partial {
+                        if transfer.admission.is_none() {
                             return false;
                         }
-                        // Keep the admitted request's response, but it cannot reestablish a
-                        // receipt for the retired level.
+                        // Keep the response and its admission, but do not reestablish a receipt
+                        // for the retired level.
                         transfer.revision = None;
                     }
                     true
@@ -1419,49 +1434,40 @@ pub mod octree_sync {
                         Ok(a) => a,
                         Err(e) => return vec![Message::Exception(e)],
                     };
-                    let not_modified = Message::Response(OctreeSectionResponse {
+                    let timestamp = source.section_timestamp(&req.level, req.pos);
+                    if !is_up_to_date(timestamp, req.client_timestamp)
+                        && let Some(dto) = source.section_dto(&req.level, req.pos)
+                        && let Ok((payload, buffer)) = OctreePayload::new(&dto, Vec::new())
+                    {
+                        let buffer_id = payload.buffer_id;
+                        let response = Message::Response(OctreeSectionResponse {
+                            future_id: req.future_id,
+                            payload: Some(payload),
+                        });
+                        if let Ok(final_message) = response.encode() {
+                            let key = (req.level, req.pos);
+                            state.receipts.entry(key.clone()).or_default().queued_full += 1;
+                            state.sender.queue.push_back(PendingTransfer {
+                                encoded: EncodedTransfer {
+                                    buffer_id,
+                                    buffer: buffer.into(),
+                                    final_message: final_message.into(),
+                                },
+                                offset: 0,
+                                revision: Some(TransferRevision {
+                                    key,
+                                    revision: dto.last_modified as u64,
+                                }),
+                                admission: Some(admission),
+                            });
+                            return Vec::new();
+                        }
+                    }
+                    state.release(admission);
+                    vec![Message::Response(OctreeSectionResponse {
                         future_id: req.future_id,
                         payload: None,
-                    });
-                    let timestamp = source.section_timestamp(&req.level, req.pos);
-                    let dto = if is_up_to_date(timestamp, req.client_timestamp) {
-                        None
-                    } else {
-                        source.section_dto(&req.level, req.pos)
-                    };
-                    state.release(admission);
-                    let Some(dto) = dto else {
-                        return vec![not_modified];
-                    };
-                    match OctreePayload::new(&dto, Vec::new()) {
-                        Ok((payload, buffer)) => {
-                            let buffer_id = payload.buffer_id;
-                            let response = Message::Response(OctreeSectionResponse {
-                                future_id: req.future_id,
-                                payload: Some(payload),
-                            });
-                            match response.encode() {
-                                Ok(final_message) => {
-                                    let key = (req.level, req.pos);
-                                    state.receipts.entry(key.clone()).or_default().queued_full += 1;
-                                    state.sender.queue.push_back(PendingTransfer {
-                                        buffer_id,
-                                        buffer: buffer.into(),
-                                        offset: 0,
-                                        final_message: final_message.into(),
-                                        revision: Some(TransferRevision {
-                                            key,
-                                            revision: dto.last_modified as u64,
-                                            partial: false,
-                                        }),
-                                    });
-                                    Vec::new()
-                                }
-                                Err(_) => vec![not_modified],
-                            }
-                        }
-                        Err(_) => vec![not_modified],
-                    }
+                    })]
                 }
                 _ => Vec::new(),
             }
@@ -1477,10 +1483,9 @@ pub mod octree_sync {
         ) {
             for (pos, revision) in changes {
                 let key = (level.to_owned(), pos);
-                for (&player, (dimension, x, z)) in players {
-                    if dimension == level
-                        && let Some(state) = self.players.get_mut(&player)
-                        && state.wants_partial_update(pos, *x, *z)
+                for (&player, location) in players {
+                    if let Some(state) = self.players.get_mut(&player)
+                        && state.partial_in_range(&key, Some(location))
                         && let Some(receipt) = state.receipts.get(&key)
                         && receipt.sent.is_none_or(|sent| revision > sent)
                     {
@@ -1528,7 +1533,7 @@ pub mod octree_sync {
                         let Some((bytes, chunk)) = front.frame(budget) else {
                             break;
                         };
-                        (front.buffer_id, bytes, chunk)
+                        (front.encoded.buffer_id, bytes, chunk)
                     };
                     let result = send(player, bytes);
                     let accepted = result.is_ok();
@@ -1546,7 +1551,7 @@ pub mod octree_sync {
                         break;
                     };
                     if let Some(front) = state.sender.queue.front_mut()
-                        && front.buffer_id == id
+                        && front.encoded.buffer_id == id
                     {
                         if accepted && chunk != 0 {
                             front.offset += chunk;
@@ -1876,7 +1881,7 @@ pub mod octree_sync {
             .is_ok()
     }
 
-    /// Drain every player's budget for this server tick (20 Hz).
+    /// Drain each player's per-tick budget on an eligible published server's Overworld post-tick.
     pub(crate) fn server_tick(
         host: &mut dyn ServerHost,
         locations: &PlayerLocations<PlayerRef>,
@@ -1902,6 +1907,7 @@ pub mod octree_sync {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::atomic::AtomicUsize;
 
         const LEVEL: &str = "minecraft:overworld";
 
@@ -2028,12 +2034,18 @@ pub mod octree_sync {
 
         struct Fake {
             dto: OctreeSectionDto,
+            dto_reads: AtomicUsize,
         }
         impl Fake {
-            fn of(section: &OctreeSection, mode: DhV2CompressionMode) -> Self {
+            fn new(dto: OctreeSectionDto) -> Self {
                 Self {
-                    dto: OctreeSectionDto::from_section(section, &[], mode, 0).unwrap(),
+                    dto,
+                    dto_reads: AtomicUsize::new(0),
                 }
+            }
+
+            fn of(section: &OctreeSection, mode: DhV2CompressionMode) -> Self {
+                Self::new(OctreeSectionDto::from_section(section, &[], mode, 0).unwrap())
             }
         }
 
@@ -2042,6 +2054,7 @@ pub mod octree_sync {
                 Some(self.dto.last_modified)
             }
             fn section_dto(&self, _: &str, _: OctreeSectionPos) -> Option<OctreeSectionDto> {
+                self.dto_reads.fetch_add(1, Ordering::Relaxed);
                 Some(self.dto.clone())
             }
             fn player_block_xz(&self, _: u32) -> Option<(i32, i32)> {
@@ -2124,7 +2137,7 @@ pub mod octree_sync {
                     dto
                 );
 
-                let source = Fake { dto };
+                let source = Fake::new(dto);
                 let mut registry = ServerSyncRegistry::<u32>::new(SessionConfig::default());
                 let mut client = ClientSession::default();
                 let now = Instant::now();
@@ -2176,22 +2189,28 @@ pub mod octree_sync {
                 0,
             )
             .unwrap();
-            let source = Fake { dto };
-            let mut registry = ServerSyncRegistry::<u32>::new(SessionConfig::default());
+            let source = Fake::new(dto);
+            let cfg = SessionConfig {
+                sync_on_load_rate_limit: 1,
+                ..SessionConfig::default()
+            };
+            let mut registry = ServerSyncRegistry::<u32>::new(cfg);
             let mut client = ClientSession::default();
             let now = Instant::now();
-            registry.handle(
-                1,
-                Message::SessionConfig(SessionConfig::default()),
-                now,
-                &source,
-            );
+            registry.handle(1, Message::SessionConfig(cfg), now, &source);
             let req = client.request(LEVEL, pos, Some(77)).unwrap();
             let replies = registry.handle(1, Message::decode(&req).unwrap(), now, &source);
             let events = client
                 .on_message(&replies[0].encode().unwrap(), now)
                 .unwrap();
             assert!(matches!(events.as_slice(), [ClientEvent::UpToDate { .. }]));
+            assert_eq!(source.dto_reads.load(Ordering::Relaxed), 0);
+            let req = Message::decode(&client.request(LEVEL, pos, Some(0)).unwrap()).unwrap();
+            assert!(
+                registry
+                    .handle(1, req, now + Duration::from_secs(1), &source)
+                    .is_empty()
+            );
         }
 
         #[test]
@@ -2233,11 +2252,14 @@ pub mod octree_sync {
             let mut registry = ServerSyncRegistry::new(cfg);
             let mut state = PlayerSyncState::new(cfg);
             state.sender.queue.push_back(PendingTransfer {
-                buffer_id: 9,
-                buffer: buffer.clone().into(),
+                encoded: EncodedTransfer {
+                    buffer_id: 9,
+                    buffer: buffer.clone().into(),
+                    final_message: vec![0xAA].into(),
+                },
                 offset: 0,
-                final_message: vec![0xAA].into(),
                 revision: None,
+                admission: None,
             });
             registry.players.insert(1, state);
             let source = Fake::of(
@@ -2277,7 +2299,7 @@ pub mod octree_sync {
                     .unwrap();
             let buffer_len = dto.encode().unwrap().len();
             assert!(buffer_len > 380_000);
-            let source = Fake { dto };
+            let source = Fake::new(dto);
             let mut registry = ServerSyncRegistry::<u32>::new(SessionConfig::default());
             let mut client = ClientSession::default();
             let t0 = Instant::now();
@@ -2313,7 +2335,7 @@ pub mod octree_sync {
             let dto =
                 OctreeSectionDto::from_section(&section, &[], DhV2CompressionMode::Uncompressed, 0)
                     .unwrap();
-            let source = Fake { dto };
+            let source = Fake::new(dto);
             let mut registry = ServerSyncRegistry::<u32>::new(SessionConfig::default());
             let mut client = ClientSession::default();
             let now = Instant::now();
@@ -2346,7 +2368,7 @@ pub mod octree_sync {
 
         #[test]
         fn partial_update_roundtrips_and_respects_real_time_settings() {
-            let pos = OctreeSectionPos::new(0, 10, 0, 0);
+            let pos = OctreeSectionPos::new(0, 128, 0, 0); // starts at block x=4096
             let mut section = varied_section(pos, 40);
             let mut source = Fake::of(&section, DEFAULT_COMPRESSION);
             let beams = vec![BeaconBeam {
@@ -2400,18 +2422,20 @@ pub mod octree_sync {
                     assert!(replies.is_empty());
                 }
             }
-            // All real replies have cleared the sender. Only 1 qualifies below (2 is far,
-            // 3 unnegotiated, 4 in another dimension, 5 opted out, 6 unserved, 7 unchanged,
-            // and 8 received the same position in a different level).
+            // Only 1 qualifies. For 2, flooring x=-15.5 to -16 puts the section 257 chunks
+            // away; a truncating cast would put it inside the 256-chunk radius. 3 is
+            // unnegotiated, 4 in another dimension, 5 opted out, 6 unserved, 7 unchanged,
+            // and 8 received the same position in a different level.
+            let near = [4100.25, 64.0, 1.25];
             let locations = HashMap::from([
-                (1, (LEVEL.into(), 330, 0)),
-                (2, (LEVEL.into(), 100_000, 0)),
-                (3, (LEVEL.into(), 330, 0)),
-                (4, (NETHER.into(), 330, 0)),
-                (5, (LEVEL.into(), 330, 0)),
-                (6, (LEVEL.into(), 330, 0)),
-                (7, (LEVEL.into(), 330, 0)),
-                (8, (LEVEL.into(), 330, 0)),
+                (1, PlayerLocation::new(LEVEL.into(), near)),
+                (2, PlayerLocation::new(LEVEL.into(), [-15.5, 64.0, 1.25])),
+                (3, PlayerLocation::new(LEVEL.into(), near)),
+                (4, PlayerLocation::new(NETHER.into(), near)),
+                (5, PlayerLocation::new(LEVEL.into(), near)),
+                (6, PlayerLocation::new(LEVEL.into(), near)),
+                (7, PlayerLocation::new(LEVEL.into(), near)),
+                (8, PlayerLocation::new(LEVEL.into(), near)),
             ]);
             let initial = wire_tick(&mut registry, &locations, &source)
                 .remove(&1)
@@ -2476,7 +2500,7 @@ pub mod octree_sync {
             let mode = DhV2CompressionMode::Uncompressed;
             let mut source = Fake::of(&section, mode);
             let mut state = ServerSyncRegistry::<u32>::new(cfg);
-            let locations = HashMap::from([(1, (LEVEL.into(), 0, 0))]);
+            let locations = HashMap::from([(1, PlayerLocation::new(LEVEL.into(), [0.0; 3]))]);
             let mut client = ClientSession::default();
             let now = Instant::now();
             state.handle(1, Message::SessionConfig(cfg), now, &source);
@@ -2503,10 +2527,8 @@ pub mod octree_sync {
                             .queue
                             .front()
                             .unwrap()
-                            .revision
-                            .as_ref()
-                            .unwrap()
-                            .partial
+                            .admission
+                            .is_none()
                     {
                         // This partial has not started. An off-thread request appends a full
                         // reply while the registry lock is released around the refused send.
@@ -2588,11 +2610,187 @@ pub mod octree_sync {
         }
 
         #[test]
+        fn pressured_full_replies_keep_both_admission_limits_until_the_final_frame() {
+            let now = Instant::now();
+            let pos = OctreeSectionPos::new(0, 0, 0, 0);
+            let source = Fake::of(&varied_section(pos, 4), DhV2CompressionMode::Uncompressed);
+            let cfg = SessionConfig {
+                generation_request_rate_limit: 2,
+                sync_on_load_rate_limit: 3,
+                ..SessionConfig::default()
+            };
+            let mut state = ServerSyncRegistry::new(cfg);
+            state.set_open(true);
+            state.handle(1, Message::SessionConfig(cfg), now, &source);
+            let registry = Mutex::new(state);
+            let locations = PlayerLocations::new();
+            let mut client = ClientSession::default();
+            let mut submit = |known, second| {
+                let bytes = client.request(LEVEL, pos, known).unwrap();
+                let message = Message::decode(&bytes).unwrap();
+                let Message::Request(req) = &message else {
+                    panic!("{message:?}");
+                };
+                let future_id = req.future_id;
+                let replies = registry
+                    .lock()
+                    .unwrap()
+                    .receive(
+                        || Ok(1),
+                        message,
+                        now + Duration::from_secs(second),
+                        &source,
+                    )
+                    .unwrap();
+                (future_id, replies)
+            };
+            let assert_denied = |(id, replies): (i32, Vec<Message>)| {
+                assert!(matches!(
+                    replies.as_slice(),
+                    [Message::Exception(ExceptionMessage {
+                        future_id,
+                        kind: ExceptionKind::RateLimited,
+                        ..
+                    })] if *future_id == id
+                ));
+            };
+            let footprint = || {
+                let state = registry.lock().unwrap();
+                let queue = &state.players[&1].sender.queue;
+                (
+                    queue.len(),
+                    queue
+                        .iter()
+                        .map(|t| t.encoded.buffer.len() + t.encoded.final_message.len())
+                        .sum::<usize>(),
+                )
+            };
+
+            // Two generation and three sync-on-load admissions, mixed in one FIFO. Give each
+            // request fresh tokens so this exercises concurrency rather than the rate check.
+            let mut admitted = Vec::new();
+            for (second, known) in [None, Some(0), None, Some(0), Some(0)]
+                .into_iter()
+                .enumerate()
+            {
+                let (id, replies) = submit(known, second as u64);
+                assert!(replies.is_empty());
+                admitted.push(id);
+            }
+            let full = footprint();
+            assert_eq!(full.0, 5);
+            assert!(full.1 > 0);
+            assert_eq!(source.dto_reads.load(Ordering::Relaxed), full.0);
+            let mut stalled_frame = None;
+            for second in 5..=9 {
+                let mut attempted = None;
+                assert_eq!(
+                    ServerSyncRegistry::tick(&registry, &locations, &source, |_, frame| {
+                        assert!(attempted.replace(frame).is_none());
+                        Err(PayloadSendError::Backpressure)
+                    }),
+                    0
+                );
+                let frame = attempted.unwrap();
+                if let Some(stalled) = &stalled_frame {
+                    assert_eq!(stalled, &frame);
+                } else {
+                    stalled_frame = Some(frame);
+                }
+                assert_denied(submit(None, second));
+                assert_denied(submit(Some(0), second));
+                assert_eq!(footprint(), full);
+                assert_eq!(source.dto_reads.load(Ordering::Relaxed), full.0);
+            }
+
+            let mut wire = Vec::new();
+            let mut final_refused = None;
+            ServerSyncRegistry::tick(&registry, &locations, &source, |_, frame| {
+                match Message::decode(&frame).unwrap() {
+                    Message::Split(_) => wire.push(frame),
+                    Message::Response(response) => {
+                        assert_eq!(response.future_id, admitted[0]);
+                        final_refused = Some(frame);
+                        return Err(PayloadSendError::Backpressure);
+                    }
+                    other => panic!("{other:?}"),
+                }
+                Ok(())
+            });
+            assert!(!wire.is_empty());
+            let final_refused = final_refused.unwrap();
+            assert_denied(submit(None, 10));
+            assert_denied(submit(Some(0), 10));
+            assert_eq!(footprint(), full);
+            assert_eq!(source.dto_reads.load(Ordering::Relaxed), full.0);
+
+            // Accept only the first final marker. That opens one slot and only in its limiter.
+            assert_eq!(
+                ServerSyncRegistry::tick(&registry, &locations, &source, |_, frame| {
+                    if frame == final_refused {
+                        wire.push(frame);
+                        Ok(())
+                    } else {
+                        assert!(matches!(
+                            Message::decode(&frame).unwrap(),
+                            Message::Split(_)
+                        ));
+                        Err(PayloadSendError::Backpressure)
+                    }
+                }),
+                1
+            );
+            let (id, replies) = submit(None, 11);
+            assert!(replies.is_empty());
+            admitted.push(id);
+            assert_denied(submit(None, 11));
+            assert_denied(submit(Some(0), 11));
+            assert_eq!(footprint(), full);
+
+            // The remaining transfers fit in one tick at the ordinary bandwidth budget.
+            ServerSyncRegistry::tick(&registry, &locations, &source, |_, frame| {
+                wire.push(frame);
+                Ok(())
+            });
+            assert_eq!(footprint(), (0, 0));
+            for known in [None, Some(0)] {
+                let (id, replies) = submit(known, 12);
+                assert!(replies.is_empty());
+                admitted.push(id);
+            }
+            ServerSyncRegistry::tick(&registry, &locations, &source, |_, frame| {
+                wire.push(frame);
+                Ok(())
+            });
+            assert_eq!(footprint(), (0, 0));
+            assert_eq!(source.dto_reads.load(Ordering::Relaxed), admitted.len());
+            let order: Vec<_> = wire
+                .iter()
+                .filter_map(|frame| match Message::decode(frame).unwrap() {
+                    Message::Response(response) => Some(response.future_id),
+                    Message::Split(_) => None,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(order, admitted);
+            let events = deliver(&mut client, wire, now + Duration::from_secs(12));
+            assert_eq!(events.len(), admitted.len());
+            assert!(events.iter().all(|e| matches!(
+                e,
+                ClientEvent::Section { level, section, .. }
+                    if level == LEVEL && section.pos == pos && section.revision == 77
+            )));
+        }
+
+        #[test]
         fn refused_full_and_retired_player_do_not_receive_updates() {
             let now = Instant::now();
             let pos = OctreeSectionPos::new(0, 0, 0, 0);
             let source = Fake::of(&varied_section(pos, 4), DEFAULT_COMPRESSION);
-            let cfg = SessionConfig::default();
+            let cfg = SessionConfig {
+                generation_request_rate_limit: 1,
+                ..SessionConfig::default()
+            };
             let mut state = ServerSyncRegistry::new(cfg);
             state.set_open(true);
             for player in [1, 2] {
@@ -2617,7 +2815,10 @@ pub mod octree_sync {
                         .is_empty()
                 );
             }
-            let locations = HashMap::from([(1, (LEVEL.into(), 0, 0)), (2, (LEVEL.into(), 0, 0))]);
+            let locations = HashMap::from([
+                (1, PlayerLocation::new(LEVEL.into(), [0.0; 3])),
+                (2, PlayerLocation::new(LEVEL.into(), [0.0; 3])),
+            ]);
             state.queue_partial_update(LEVEL, [(pos, 78)], &locations);
             let registry = Mutex::new(state);
             ServerSyncRegistry::tick(&registry, &locations, &source, |player, _| {
@@ -2632,6 +2833,60 @@ pub mod octree_sync {
             assert!(state.players[&1].deferred.is_empty());
             assert!(state.players[&1].sender.is_idle());
             assert!(!state.players[&2].deferred.is_empty());
+
+            let request = |future_id| {
+                Message::Request(OctreeSectionRequest {
+                    future_id,
+                    level: LEVEL.into(),
+                    pos,
+                    client_timestamp: None,
+                })
+            };
+            let later = now + Duration::from_secs(1);
+            // Terminal refusal frees player 1's reservation; level retirement must not free
+            // player 2's, because their original full reply is still queued.
+            state.remove_level(LEVEL);
+            assert!(state.handle(1, request(1), later, &source).is_empty());
+            assert!(matches!(
+                state.handle(2, request(1), later, &source).as_slice(),
+                [Message::Exception(ExceptionMessage {
+                    future_id: 1,
+                    kind: ExceptionKind::RateLimited,
+                    ..
+                })]
+            ));
+            let registry = Mutex::new(state);
+            let mut final_ids = Vec::new();
+            ServerSyncRegistry::tick(&registry, &locations, &source, |player, bytes| {
+                if player == 1 {
+                    // Leave an admitted response in state for the server-stop check.
+                    return Err(PayloadSendError::Backpressure);
+                }
+                if let Message::Response(response) = Message::decode(&bytes).unwrap() {
+                    final_ids.push(response.future_id);
+                }
+                Ok(())
+            });
+            assert_eq!(final_ids, [0]);
+            let mut state = registry.into_inner().unwrap();
+            let mut edit = varied_section(pos, 4);
+            edit.revision = 78;
+            let edited = Fake::of(&edit, DEFAULT_COMPRESSION);
+            state.queue_partial_update(LEVEL, [(pos, edit.revision)], &locations);
+            let registry = Mutex::new(state);
+            assert_eq!(
+                ServerSyncRegistry::tick(&registry, &locations, &edited, |player, _| {
+                    assert_eq!(player, 1, "the retired reply must not resubscribe player 2");
+                    Err(PayloadSendError::Backpressure)
+                }),
+                0
+            );
+            let mut state = registry.into_inner().unwrap();
+            assert!(
+                state
+                    .handle(2, request(2), later + Duration::from_secs(1), &edited)
+                    .is_empty()
+            );
             state.remove_player(2);
             assert!(state.player(2).is_none());
             assert!(
@@ -2746,7 +3001,7 @@ pub mod octree_sync {
                 0,
             )
             .unwrap();
-            let source = Fake { dto };
+            let source = Fake::new(dto);
             for p in [1, 2] {
                 registry.handle(
                     p,
