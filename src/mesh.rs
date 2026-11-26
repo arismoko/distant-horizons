@@ -990,7 +990,8 @@ pub fn mesh_octree_section(
                             continue;
                         }
                     }
-                    let light = neighbor.map_or(v.light(), |n| n.light());
+                    // No neighbour loaded beyond a section border: open sky, not the solid voxel's own 0.
+                    let light = neighbor.map_or(0x0F, |n| n.light());
                     let biome = if meta.biome_coloured() {
                         v.biome_id()
                     } else {
