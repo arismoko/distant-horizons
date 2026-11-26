@@ -20,6 +20,11 @@ layout(std430) readonly buffer ModelBuffer { uint models[]; };
 // 16, 8, 4, 2, 1) and a trilinear sampler (`render_bridge::atlas_sampler`, `max_lod` = 4).
 uniform sampler2D BlockAtlas;
 const float ATLAS_MAX_LOD = 4.0;
+// Depth (near / w) of the furthest meshed-column box face per pixel, cleared to 1.0 where no box
+// covers the pixel (`render_bridge::setup_bounds`), and the stamp whose serial says that this
+// submission's bounds pass ran (`voxy_bounds_stamp.csh`).
+uniform sampler2D BoundDepth;
+layout(std430) readonly buffer BoundsStamp { uvec2 bounds_published; };
 
 layout(location = 0) in flat uvec4 inter;
 layout(location = 1) in vec2 uv;
@@ -54,13 +59,18 @@ void main() {
     bool cutout = (mflags & 4u) != 0u;
     uint tint_kind = (mflags >> 4) & 15u;
 
-    // Clip region: vanilla's loaded chunk area is circular around the camera's 16x16 chunk
-    // (until #5911 provides exact per-chunk AABB depth bounds); `clip_dist = 0` disables.
-    float clip_dist = depth_and_light.z;
-    if (clip_dist > 0.0) {
-        vec2 cam_in_chunk = fract(camera_sub_pos.xz / 16.0) * 16.0;
-        vec2 rel_chunk_center = rel_pos.xz + (cam_in_chunk - vec2(8.0));
-        if (length(rel_chunk_center) < clip_dist) {
+    // Footprint bound (behaviour: Voxy lod/gl46/quads.frag's bounding-buffer test): where the
+    // meshed vanilla chunk columns cover this pixel, the furthest depth of their boxes is the
+    // bound, and an LOD fragment nearer than it lies inside that terrain, vanilla's to draw. Both
+    // depths are the world's reversed-Z near / w (larger = nearer), so the test is strict: a
+    // fragment on the far face, or a pixel no box covers (cleared to 1.0, the near plane), is
+    // never cut. The texture is read only when the stamp holds the serial this draw was recorded
+    // with; `flags.zw == 0` (no bound recorded) or any other stamp clips nothing.
+    uvec2 bounds_expected = flags.zw;
+    if ((bounds_expected.x | bounds_expected.y) != 0u
+        && all(equal(bounds_published, bounds_expected))) {
+        float bound = texelFetch(BoundDepth, ivec2(gl_FragCoord.xy), 0).r;
+        if (gl_FragCoord.z > bound) {
             discard;
         }
     }

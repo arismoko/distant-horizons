@@ -112,7 +112,7 @@ impl Hooks for DistantHorizonsMod {
             return;
         }
         let camera = stage3_camera::CameraMatrices::from_camera(event.view.camera);
-        render_bridge::setup_compute(host, &camera, event.graph);
+        render_bridge::setup_compute(host, &camera, &event.view.camera.dimension, event.graph);
     }
 
     fn render_level_stage(

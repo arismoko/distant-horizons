@@ -44,10 +44,14 @@ pub const SHADER_TRANS_PREFIX: &str = "distantsunrises:voxy_trans_prefix";
 pub const SHADER_TRANS_SCATTER: &str = "distantsunrises:voxy_trans_scatter";
 pub const SHADER_SSAO: &str = "distantsunrises:voxy_ssao";
 pub const SHADER_SSAO_APPLY: &str = "distantsunrises:core/voxy_ssao_apply";
+pub const SHADER_BOUNDS: &str = "distantsunrises:core/voxy_bounds";
+pub const SHADER_BOUNDS_STAMP: &str = "distantsunrises:voxy_bounds_stamp";
 
 pub const PIPELINE_OPAQUE: &str = "distantsunrises:voxy_opaque";
 pub const PIPELINE_TRANSLUCENT: &str = "distantsunrises:voxy_translucent";
 pub const PIPELINE_SSAO_APPLY: &str = "distantsunrises:voxy_ssao_apply";
+pub const PIPELINE_BOUNDS: &str = "distantsunrises:voxy_bounds";
+pub const PIPELINE_BOUNDS_STAMP: &str = "distantsunrises:voxy_bounds_stamp";
 pub const PIPELINE_PACK_TERRAIN: &str = "distantsunrises:voxy_pack_terrain";
 pub const PIPELINE_PACK_WATER: &str = "distantsunrises:voxy_pack_water";
 pub const PIPELINE_PACK_SHADOW: &str = "distantsunrises:voxy_pack_shadow";
@@ -93,8 +97,26 @@ pub fn quad_layout() -> mod_api::BindGroupLayout {
         .entry(storage("ModelBuffer", true, 64))
         .entry(storage("BiomeTintBuffer", true, 4))
         .sampler("BlockAtlas", atlas_sampler())
+        .sampler(
+            "BoundDepth",
+            mod_api::Sampler::new(
+                mod_api::SamplerFilter::Nearest,
+                mod_api::SamplerAddress::ClampToEdge,
+            ),
+        )
+        .entry(storage("BoundsStamp", true, STAMP_BYTES as u32))
         .build()
         .expect("static quad layout")
+}
+
+/// The footprint-bounds pipeline's set-1 layout (`voxy_bounds.vsh`): one `ivec2` chunk column per
+/// instance.
+pub fn bounds_layout() -> mod_api::BindGroupLayout {
+    mod_api::BindGroupLayout::builder()
+        .uniform_buffer("BoundsParams", BOUNDS_PARAMS_BYTES as u32)
+        .entry(storage("Columns", true, 8))
+        .build()
+        .expect("static bounds layout")
 }
 
 /// The pack-linked pipelines' set-1 layout (`voxy_pack_*.vsh`): `SceneUniform` is 176 bytes
@@ -147,6 +169,27 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
         .topology(PrimitiveTopology::Triangles)
         .cull(false)
         .bind_group_layout(quad_layout()),
+    );
+    // Footprint bounds: one box per meshed vanilla chunk column rasterized into a depth-only
+    // offscreen target. The depth is the world's own reversed-Z `near / w` (`voxy_bounds.vsh`),
+    // cleared to 1.0 (the near plane, which no fragment is nearer than), and `Less` keeps the
+    // smallest value per pixel: the furthest face. The offscreen build keeps the compare as
+    // given (`standard_z: false` in sunrise's `ensure_offscreen_pipeline`). There is no colour
+    // output, so the write mask is empty: the world-target variant built at registration then
+    // needs no fragment output, and the depth-only offscreen target has no colour target.
+    event.register(
+        RenderPipeline::new(
+            id(PIPELINE_BOUNDS),
+            id(SHADER_BOUNDS),
+            PipelineBlend::Opaque,
+            WorldDepth::Tested,
+        )
+        .depth_compare(mod_api::DepthCompare::Less)
+        .depth_write(true)
+        .color_write(mod_api::ColorWrite::NONE)
+        .topology(PrimitiveTopology::Triangles)
+        .cull(false)
+        .bind_group_layout(bounds_layout()),
     );
     // Pack-linked pipelines: the mod's vertex stage (`voxy_pack_*.vsh`) feeds the pack's
     // `dh_terrain` / `dh_water` / `dh_shadow` fragment. Optional: without a pack that provides
@@ -320,6 +363,17 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
         .build(),
     );
     event.compute_pipeline(
+        ComputePipeline::builder(id(PIPELINE_BOUNDS_STAMP), id(SHADER_BOUNDS_STAMP))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .uniform_buffer("BoundsStampParams", 16)
+                    .entry(storage("BoundsStamp", false, STAMP_BYTES as u32))
+                    .build()
+                    .expect("static bounds stamp layout"),
+            )
+            .build(),
+    );
+    event.compute_pipeline(
         ComputePipeline::builder(id("distantsunrises:voxy_ssao"), id(SHADER_SSAO))
             .bind_group_layout(
                 BindGroupLayout::builder()
@@ -378,7 +432,9 @@ impl Std140 {
     }
 }
 
-/// `QuadParams` (160 bytes), shared by `voxy_quads.vsh` / `.fsh`.
+/// `QuadParams` (160 bytes), shared by `voxy_quads.vsh` / `.fsh`. `bound_serial` (`flags.zw`) is
+/// the serial of the footprint bound this draw may read (`[0, 0]`: none; the shader then never
+/// reads `BoundDepth`).
 #[allow(
     clippy::too_many_arguments,
     reason = "mirrors the 160-byte QuadParams block field by field"
@@ -388,22 +444,27 @@ pub fn quad_params_bytes(
     camera: [f64; 3],
     near_dh: f32,
     far_dh: f32,
-    clip_dist: f32,
     sun: f32,
     fog: [f32; 4],
     fog_color: [f32; 4],
     is_hdr: bool,
     shading: bool,
+    bound_serial: [u32; 2],
 ) -> Vec<u8> {
     let (base, sub) = camera_split(camera);
     Std140(Vec::with_capacity(160))
         .f32s(&view_proj)
         .i32s(&[base[0], base[1], base[2], 0])
         .f32s(&[sub[0], sub[1], sub[2], 0.0])
-        .f32s(&[near_dh, far_dh, clip_dist, sun])
+        .f32s(&[near_dh, far_dh, 0.0, sun])
         .f32s(&fog)
         .f32s(&fog_color)
-        .u32s(&[u32::from(is_hdr), u32::from(shading), 0, 0])
+        .u32s(&[
+            u32::from(is_hdr),
+            u32::from(shading),
+            bound_serial[0],
+            bound_serial[1],
+        ])
         .0
 }
 
@@ -599,7 +660,286 @@ fn ensure_ssao(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<SsaoTar
     Some(made)
 }
 
-/// Consistent circular vanilla clip distance shared between opaque LODs and compute SSAO.
+/// Size of `BoundsParams` in `voxy_bounds.vsh`.
+const BOUNDS_PARAMS_BYTES: usize = 112;
+/// Triangle indices of a unit box over corner ids `x | y << 1 | z << 2` (both windings are drawn).
+const BOX_INDICES: [u32; 36] = [
+    0, 2, 6, 0, 6, 4, 1, 5, 7, 1, 7, 3, 0, 4, 5, 0, 5, 1, 2, 3, 7, 2, 7, 6, 0, 1, 3, 0, 3, 2, 4, 6,
+    7, 4, 7, 5,
+];
+
+/// `BoundsParams` (112 bytes) of `voxy_bounds.vsh`: the camera-relative view-projection and the
+/// camera split exactly as `QuadParams` carries it ([`camera_split`]: the camera's 32-block
+/// section and the remainder, `w` = camera near), so a box corner and an LOD vertex at the same
+/// block land on the same camera-relative position and the same depth; and the level's block Y
+/// range (`min_y`, `min_y + height`).
+fn bounds_params_bytes(
+    view_proj: [f32; 16],
+    camera: [f64; 3],
+    near: f32,
+    y_range: [i32; 2],
+) -> Vec<u8> {
+    let (base, sub) = camera_split(camera);
+    Std140(Vec::with_capacity(BOUNDS_PARAMS_BYTES))
+        .f32s(&view_proj)
+        .i32s(&[base[0], base[1], base[2], 0])
+        .f32s(&[sub[0], sub[1], sub[2], near])
+        .i32s(&[y_range[0], y_range[1], 0, 0])
+        .0
+}
+
+/// The chunk columns the level renderer has queued for meshing, sorted: the exact footprint,
+/// whatever order the walk visits them in. An empty list is an empty footprint (no level shown
+/// yet, a standby or switching level, or none queued): nothing is clipped then.
+fn collect_footprint(
+    walk: impl FnOnce(
+        &mut dyn FnMut([i32; 2]) -> std::ops::ControlFlow<()>,
+    ) -> std::ops::ControlFlow<()>,
+) -> Vec<[i32; 2]> {
+    let mut columns = Vec::new();
+    let _ = walk(&mut |column| {
+        columns.push(column);
+        std::ops::ControlFlow::Continue(())
+    });
+    columns.sort_unstable();
+    columns
+}
+
+/// The mod-owned resources of the footprint bound; handles survive across frames.
+struct BoundsResources {
+    /// `Depth32Float`, no colour, viewport sized; holds `near / w` of the furthest bound face,
+    /// cleared to 1.0 (no bound) by every submission's bounds pass.
+    depth: Option<(mod_api::RenderTargetRef, [u32; 2])>,
+    /// A 1x1 depth target bound where no bound is expected; the shader never reads it then.
+    unused: Option<mod_api::RenderTargetRef>,
+    /// The stamp `voxy_bounds_stamp.csh` publishes to; serials are never reused, so it outlives
+    /// resizes of `depth`.
+    stamp: Option<mod_api::StorageBufferRef>,
+    /// `ivec2` chunk columns and the buffer's capacity in bytes.
+    columns: Option<(mod_api::StorageBufferRef, u64)>,
+    cube: Option<mod_api::MeshRef>,
+    /// The exact footprint last written to `columns`.
+    uploaded: Option<Vec<[i32; 2]>>,
+}
+
+static BOUNDS: Mutex<BoundsResources> = Mutex::new(BoundsResources {
+    depth: None,
+    unused: None,
+    stamp: None,
+    columns: None,
+    cube: None,
+    uploaded: None,
+});
+
+/// What this submission's bounds nodes publish: the depth target and stamp, and the serial the
+/// stamp holds once `voxy_bounds_stamp` has run after the bounds pass. Like [`SSAO_PENDING`] it
+/// records admission only; `voxy_quads.fsh` clips only where the stamp holds the serial, so a
+/// graph dropped after `prepare_draws` (the target then keeps an older submission's depth)
+/// clips nothing. `prepare_draws` takes it.
+static BOUNDS_PENDING: Mutex<
+    Option<(
+        mod_api::RenderTargetRef,
+        mod_api::StorageBufferRef,
+        [u32; 2],
+    )>,
+> = Mutex::new(None);
+
+fn depth_only_target(
+    host: &dyn mod_api::ClientHost,
+    size: [u32; 2],
+) -> Option<mod_api::RenderTargetRef> {
+    let desc =
+        mod_api::RenderTargetDescriptor::new(size).depth(mod_api::RenderTargetDepth::Depth32Float);
+    report("create bounds target", host.create_render_target(&desc))
+}
+
+/// Records the footprint-bounds nodes: the meshed columns of the shown level as boxes over that
+/// level's full build height, rasterized into a depth target that keeps the furthest face per
+/// pixel (Voxy's bounding buffer, behaviour only), then a one-thread compute node that publishes
+/// the submission's serial after it. Every early return leaves [`BOUNDS_PENDING`] empty, so the
+/// quads are not clipped: an empty footprint, an unknown level height or a refused resource never
+/// falls back to a radius. Not recorded at all when both quad stages draw through a shader
+/// pack's pipelines, which never read the bound.
+fn setup_bounds(
+    host: &dyn mod_api::ClientHost,
+    dimension: &str,
+    camera: &CameraMatrices,
+    graph: &mut dyn mod_api::FrameGraphContext,
+    size: [u32; 2],
+) {
+    use mod_api::{ComputePassDescriptor, DrawBindings, FrameTarget, MeshDraw};
+    *BOUNDS_PENDING.lock().unwrap() = None;
+    let assets = host.render_assets();
+    let pack_bound = |name: &str| {
+        assets
+            .render_pipeline(&id(name))
+            .is_ok_and(|p| assets.pipeline_pack_bound(p))
+    };
+    if pack_bound(PIPELINE_PACK_TERRAIN) && pack_bound(PIPELINE_PACK_WATER) {
+        return;
+    }
+    let columns = collect_footprint(|visit| host.visit_rendered_chunk_columns(visit));
+    if columns.is_empty() {
+        return;
+    }
+    let Some(y_range) = host
+        .level(dimension)
+        .and_then(|level| level.dimension_type(host))
+        .map(|ty| [ty.min_y, ty.min_y + ty.height])
+    else {
+        return;
+    };
+    let (Ok(pipeline), Ok(stamp_pipeline)) = (
+        assets.render_pipeline(&id(PIPELINE_BOUNDS)),
+        assets.compute_pipeline(&id(PIPELINE_BOUNDS_STAMP)),
+    ) else {
+        return;
+    };
+    let mut res = BOUNDS.lock().unwrap();
+    if res.cube.is_none() {
+        use mod_api::{IndexFormat, MeshBufferInit, MeshDescriptor, MeshIndexInit};
+        let indices: Vec<u8> = BOX_INDICES.iter().flat_map(|i| i.to_le_bytes()).collect();
+        // The vertex stage pulls its corner from the index; the binding is never read.
+        let dummy = [0u8; 24 * 8];
+        let vertex = [MeshBufferInit::from_bytes(24, &dummy)];
+        let desc = MeshDescriptor::new(&vertex)
+            .with_indices(MeshIndexInit::from_bytes(IndexFormat::Uint32, &indices));
+        res.cube = report("create bounds box mesh", host.create_mesh(&desc));
+    }
+    let Some(cube) = res.cube else { return };
+    if !res.depth.is_some_and(|(_, s)| s == size) {
+        if let Some((old, _)) = res.depth.take() {
+            report("release bounds target", old.release(host));
+        }
+        res.depth = depth_only_target(host, size).map(|t| (t, size));
+    }
+    let Some((depth, _)) = res.depth else { return };
+    if res.stamp.is_none() {
+        res.stamp = create_stamp_buffer(host);
+    }
+    let Some(stamp) = res.stamp else { return };
+    let needed = columns.len() as u64 * 8;
+    if res.columns.is_none_or(|(_, capacity)| capacity < needed) {
+        if let Some((old, _)) = res.columns.take() {
+            report("release bounds columns", old.release(host));
+        }
+        res.uploaded = None;
+        let capacity = (columns.len().max(1024).next_power_of_two() as u64) * 8;
+        res.columns = report(
+            "create bounds columns",
+            host.create_storage_buffer(&mod_api::StorageBufferDescriptor::new(capacity)),
+        )
+        .map(|buffer| (buffer, capacity));
+    }
+    let Some((buffer, _)) = res.columns else {
+        return;
+    };
+    // The whole footprint is compared, so a changed membership (a hole or corner appearing, or a
+    // column swapped for another) always rewrites the buffer.
+    if res.uploaded.as_ref() != Some(&columns) {
+        let bytes: Vec<u8> = columns
+            .iter()
+            .flat_map(|c| c.iter().flat_map(|v| v.to_le_bytes()))
+            .collect();
+        if report("write bounds columns", buffer.write_range(host, 0, &bytes)).is_none() {
+            res.uploaded = None;
+            return;
+        }
+        res.uploaded = Some(columns.clone());
+    }
+    drop(res);
+    let params = bounds_params_bytes(
+        camera.view_projection(),
+        camera.position,
+        camera.near,
+        y_range,
+    );
+    let slice = buffer.slice(0, needed);
+    let instances = columns.len() as u32;
+    let serial = next_serial();
+    let stamp_params = Std140(Vec::with_capacity(16))
+        .u32s(&[serial[0], serial[1], 0, 0])
+        .0;
+    // The pass clears the depth to 1.0 (no bound) when it runs, so a draw the device refuses
+    // leaves no bound rather than an older one.
+    let desc = mod_api::FramePassDescriptor::new(
+        "distantsunrises:footprint_bounds",
+        FrameTarget::Mod(depth),
+    )
+    .clear_depth(1.0);
+    let added = graph.add_pass(desc, &mut |ctx| {
+        let bindings = DrawBindings::new()
+            .inline_uniform("BoundsParams", &params)
+            .storage_buffer("Columns", slice);
+        report(
+            "bounds draw",
+            ctx.draw_mesh(
+                pipeline,
+                cube,
+                MeshDraw::indexed(0..BOX_INDICES.len() as u32, 0).with_instances(0..instances),
+                &bindings,
+            ),
+        );
+    });
+    let Some(bounds_pass) = report("add_bounds_pass", added) else {
+        return;
+    };
+    // Runs after the bounds pass and before the first quad draw: only a submission that got this
+    // far on the GPU holds its serial in the stamp.
+    let stamp_desc = ComputePassDescriptor::new("distantsunrises:footprint_bounds_stamp")
+        .after_pass(bounds_pass)
+        .before_stage(OPAQUE_STAGE);
+    let added_stamp = graph.add_compute_pass(stamp_desc, &mut |ctx| {
+        let bindings = DrawBindings::new()
+            .inline_uniform("BoundsStampParams", &stamp_params)
+            .storage_buffer("BoundsStamp", stamp.slice(0, STAMP_BYTES));
+        report(
+            "bounds stamp dispatch",
+            ctx.dispatch(stamp_pipeline, &bindings, [1, 1, 1]),
+        );
+    });
+    if report("add_bounds_stamp_pass", added_stamp).is_some() {
+        *BOUNDS_PENDING.lock().unwrap() = Some((depth, stamp, serial));
+    }
+}
+
+/// The `BoundDepth` texture, `BoundsStamp` range and serial of this submission's quad draws: the
+/// recorded bound, else an untouched 1x1 target, the stamp and serial `[0, 0]` (the shader reads
+/// neither then). `None` when the placeholder resources cannot be created.
+fn bound_inputs(
+    host: &dyn mod_api::ClientHost,
+    pending: Option<(
+        mod_api::RenderTargetRef,
+        mod_api::StorageBufferRef,
+        [u32; 2],
+    )>,
+) -> Option<(
+    mod_api::TextureSource<'static>,
+    mod_api::StorageBufferSlice,
+    [u32; 2],
+)> {
+    if let Some((depth, stamp, serial)) = pending {
+        return Some((
+            mod_api::TextureSource::RenderTargetDepth(depth),
+            stamp.slice(0, STAMP_BYTES),
+            serial,
+        ));
+    }
+    let mut res = BOUNDS.lock().unwrap();
+    if res.unused.is_none() {
+        res.unused = depth_only_target(host, [1, 1]);
+    }
+    if res.stamp.is_none() {
+        res.stamp = create_stamp_buffer(host);
+    }
+    Some((
+        mod_api::TextureSource::RenderTargetDepth(res.unused?),
+        res.stamp?.slice(0, STAMP_BYTES),
+        [0, 0],
+    ))
+}
+
+/// Circular vanilla clip distance of the compute SSAO (which leaves vanilla foreground alone).
 fn vanilla_clip_dist(frame: &RenderFrameParams) -> f32 {
     if frame.config.overdraw_prevention > 0.0 {
         (frame.vanilla_far_blocks * frame.config.overdraw_prevention - 2.0).max(0.0)
@@ -847,6 +1187,7 @@ pub fn begin_frame(camera: [f64; 3]) {
 pub fn setup_compute(
     host: &dyn mod_api::ClientHost,
     camera: &CameraMatrices,
+    dimension: &str,
     graph: &mut dyn mod_api::FrameGraphContext,
 ) {
     use mod_api::{
@@ -855,6 +1196,7 @@ pub fn setup_compute(
     // Every early return below leaves no SSAO publication to expect: `prepare_draws` of this
     // submission then draws no `ssao_apply`.
     *SSAO_PENDING.lock().unwrap() = None;
+    *BOUNDS_PENDING.lock().unwrap() = None;
     let Some(frame) = FRAME.lock().unwrap().clone() else {
         return;
     };
@@ -868,6 +1210,10 @@ pub fn setup_compute(
     let Some([w, h]) = host.window_size() else {
         return;
     };
+    // The footprint bound is independent of the compute node below: a refused Hi-Z or command
+    // generation setup draws nothing, and without a published bound the quads are not clipped.
+    // `dimension` is the shown view's, not the previous frame's `frame.active_dimension`.
+    setup_bounds(host, dimension, camera, graph, [w, h]);
     let assets = host.render_assets();
     let ids = [
         "voxy_hiz_copy",
@@ -1148,6 +1494,7 @@ pub fn prepare_draws(
     use mod_api::{DrawBindings, IndirectDraw, TextureSource};
     // Taken before any early return: a submission's expectation is never carried to the next.
     let ssao_expected = SSAO_PENDING.lock().unwrap().take();
+    let bound_expected = BOUNDS_PENDING.lock().unwrap().take();
     let Some(frame) = FRAME.lock().unwrap().clone() else {
         return;
     };
@@ -1164,7 +1511,6 @@ pub fn prepare_draws(
     let rd_blocks = frame.config.render_distance_blocks().max(256.0);
     let far_dh = (rd_blocks * 1.4).max(1024.0);
     let atlas_id = id(ATLAS_TEXTURE);
-    let clip_dist = vanilla_clip_dist(&frame);
     // Keep mid-ground hills crisp like Voxy (`NormalRenderPipeline.java`), respecting
     // `fog_enabled`, `fog_falloff`, and `fog_spherical`.
     let (fog_start, fog_end) = if frame.config.fog_enabled {
@@ -1173,12 +1519,12 @@ pub fn prepare_draws(
     } else {
         (far_dh * 4.0, far_dh * 8.0)
     };
+    let bound = bound_inputs(host, bound_expected);
     let quad_params = quad_params_bytes(
         view_proj,
         camera.position,
         camera.near,
         far_dh,
-        clip_dist,
         frame.sun_brightness,
         [
             fog_start,
@@ -1189,6 +1535,7 @@ pub fn prepare_draws(
         frame.fog_color,
         false, // frames store vanilla gamma; no sRGB decode in the shader
         frame.config.shading_enabled,
+        bound.map_or([0, 0], |(_, _, serial)| serial),
     );
     let (base, sub) = camera_split(camera.position);
     let pack_params = |depth_remap: [f32; 2]| {
@@ -1275,6 +1622,9 @@ pub fn prepare_draws(
             let Ok(p) = assets.render_pipeline(&id(plain)) else {
                 continue;
             };
+            let Some((bound_texture, bound_stamp, _)) = bound else {
+                continue;
+            };
             pipeline = p;
             DrawBindings::new()
                 .inline_uniform("QuadParams", &quad_params)
@@ -1283,6 +1633,8 @@ pub fn prepare_draws(
                 .storage_buffer("ModelBuffer", s.models)
                 .storage_buffer("BiomeTintBuffer", s.biome_tints)
                 .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
+                .texture("BoundDepth", bound_texture)
+                .storage_buffer("BoundsStamp", bound_stamp)
         };
         let mut draw =
             IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(state.quad_mesh);
@@ -1631,6 +1983,119 @@ mod tests {
         assert_eq!(params(true).len(), 112);
         assert_eq!(w(&params(true)), 1.0);
         assert_eq!(w(&params(false)), 0.0);
+    }
+
+    fn walk_of(
+        columns: &'static [[i32; 2]],
+    ) -> impl FnOnce(&mut dyn FnMut([i32; 2]) -> std::ops::ControlFlow<()>) -> std::ops::ControlFlow<()>
+    {
+        move |visit| columns.iter().try_for_each(|&c| visit(c))
+    }
+
+    #[test]
+    fn footprint_is_exactly_the_walked_columns_and_empty_when_none() {
+        assert!(collect_footprint(walk_of(&[])).is_empty());
+        // A hole at (1, 1), a missing corner and the walk's own order: the footprint keeps the
+        // membership and nothing is filled in by a radius or a rounding.
+        const RING: [[i32; 2]; 7] = [[2, 1], [1, 0], [0, 0], [0, 1], [2, 0], [1, 2], [0, 2]];
+        assert_eq!(
+            collect_footprint(walk_of(&RING)),
+            [[0, 0], [0, 1], [0, 2], [1, 0], [1, 2], [2, 0], [2, 1]]
+        );
+    }
+
+    #[test]
+    fn box_indices_are_twelve_triangles_over_the_eight_corners() {
+        assert!(BOX_INDICES.iter().all(|&i| i < 8));
+        assert!(
+            BOX_INDICES
+                .chunks(3)
+                .all(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
+        );
+        // Each of the six faces (a fixed axis bit) holds two triangles.
+        for bit in 0..3 {
+            for value in 0..2 {
+                let on_face = BOX_INDICES
+                    .chunks(3)
+                    .filter(|t| t.iter().all(|&c| (c >> bit) & 1 == value))
+                    .count();
+                assert_eq!(on_face, 2, "axis {bit} side {value}");
+            }
+        }
+    }
+
+    /// A fragment just inside the far face of the footprint is cut, which the removed one-block
+    /// pull of the box corners let through; one on the far face and a pixel no box covers are kept.
+    /// The camera sits far from the origin and off the block grid, inside the column at (6, -190).
+    #[test]
+    fn bound_cuts_a_fragment_inside_the_far_face_but_not_on_it() {
+        let identity = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        // Reversed-Z, infinite far: only the clip w (the view-space distance) matters here.
+        let mut projection = identity;
+        projection[10] = 0.0;
+        projection[11] = -1.0;
+        projection[15] = 0.0;
+        let near = 0.05;
+        let position = [100.5, 64.25, -3030.75];
+        let camera = CameraMatrices {
+            position,
+            yaw: 0.0,
+            pitch: 0.0,
+            fov_degrees: 70.0,
+            near,
+            far: 1.0e4,
+            view: identity,
+            projection,
+        };
+        let view_proj = camera.view_projection();
+        let bounds = bounds_params_bytes(view_proj, position, near, [-64, 320]);
+        let quads = quad_params_bytes(
+            view_proj,
+            position,
+            near,
+            1024.0,
+            1.0,
+            [0.0; 4],
+            [0.0; 4],
+            false,
+            false,
+            [0, 0],
+        );
+        assert_eq!(bounds.len(), BOUNDS_PARAMS_BYTES);
+        // The bounds and the LOD vertices share the matrix and the camera split to the bit.
+        assert_eq!(bounds[..96], quads[..96]);
+        let f = |bytes: &[u8], at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let i = |bytes: &[u8], at: usize| i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let base = [i(&bounds, 64), i(&bounds, 68), i(&bounds, 72)];
+        let sub = [f(&bounds, 80), f(&bounds, 84), f(&bounds, 88)];
+        // `voxy_bounds.vsh` / `voxy_quads.vsh`: whole blocks minus the section, minus the remainder.
+        let relative = |block: [i32; 3]| -> [f32; 3] {
+            std::array::from_fn(|a| (block[a] - (base[a] << 5)) as f32 - sub[a])
+        };
+        // `near / w` of the world's reversed-Z projection (the shaders write `clip.z = near`).
+        let depth = |rel: [f32; 3]| {
+            let w = f(&bounds, 12) * rel[0]
+                + f(&bounds, 28) * rel[1]
+                + f(&bounds, 44) * rel[2]
+                + f(&bounds, 60);
+            f(&bounds, 92) / w
+        };
+        // Looking down -Z from inside the column; its far wall is the block-Z plane -190 * 16.
+        let far_face = depth(relative([100, 64, -190 * 16]));
+        // The camera's own ray: the same x and y, a hair under half a block inside the far face.
+        let inside = depth([0.0, 0.0, relative([100, 64, -190 * 16])[2] + 0.4375]);
+        let on_face = far_face;
+        assert!(inside > far_face, "nearer fragments have the larger depth");
+        let cut = |fragment: f32, bound: f32| fragment > bound;
+        assert!(cut(inside, far_face));
+        assert!(!cut(on_face, far_face));
+        // The removed pull moved the far face a whole block toward the camera.
+        let pulled = depth([0.0, 0.0, relative([100, 64, -190 * 16])[2] + 1.0]);
+        assert!(!cut(inside, pulled));
+        // A pixel no box covers holds the clear value, the near plane: no fragment is nearer.
+        assert!(!cut(inside, 1.0) && !cut(1.0, 1.0));
     }
 
     #[test]

@@ -13,10 +13,10 @@ layout(std140) uniform QuadParams {
     mat4 view_proj;        // camera-relative, jittered (world.jittered)
     ivec4 base_section;    // xyz = camera block >> 5
     vec4 camera_sub_pos;   // xyz = camera - base_section*32
-    vec4 depth_and_light;  // x = camera near (depth = near / w), y = far_dh, z = clip_dist (blocks, 0 = off), w = sun brightness
+    vec4 depth_and_light;  // x = camera near (depth = near / w), y = far_dh, z = unused, w = sun brightness
     vec4 fog;              // x = start, y = end, z = falloff mode, w = spherical (0/1)
     vec4 fog_color;        // sRGB
-    uvec4 flags;           // x = is_hdr, y = shading, z = debug mode, w = unused
+    uvec4 flags;           // x = is_hdr, y = shading, zw = serial of the footprint bound this draw may read (0 = none; voxy_quads.fsh)
 };
 
 layout(std430) readonly buffer QuadBuffer { uvec2 quads[]; };
