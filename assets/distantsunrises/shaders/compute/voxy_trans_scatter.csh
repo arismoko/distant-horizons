@@ -20,7 +20,7 @@ layout(std430) readonly buffer SectionBuffer { SectionMeta sections[]; };
 layout(std430) buffer TranslucentCommands { DrawCommand translucent_cmds[]; };
 layout(std430) buffer TransSortMeta {
     uint visible_count;
-    uint pad0;
+    uint opaque_count;
     uint bucket_counts[256];
     uint bucket_offsets[256];
 };

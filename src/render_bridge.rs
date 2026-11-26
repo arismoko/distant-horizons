@@ -28,7 +28,9 @@ use std::time::Instant;
 //      pack-linked pipelines (`voxy_pack_*.vsh`) instead of `voxy_quads`.
 // ---------------------------------------------------------------------------------------------
 
-use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
+use crate::gpu_arena::{
+    ArenaConfig, BuiltSection, GpuArena, OPAQUE_COUNT_OFFSET, TRANSLUCENT_COUNT_OFFSET,
+};
 
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
 pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
@@ -402,7 +404,8 @@ pub fn quad_params_bytes(
         .0
 }
 
-/// `CmdgenParams` (112 bytes).
+/// `CmdgenParams` (112 bytes). `compact_opaque` (`camera_sub_pos.w`) makes cmdgen compact the
+/// opaque commands behind the GPU count in `TransSortMeta` instead of writing fixed slots.
 pub fn cmdgen_params_bytes(
     view_proj: [f32; 16],
     camera: [f64; 3],
@@ -410,12 +413,13 @@ pub fn cmdgen_params_bytes(
     hiz_size: [u32; 2],
     hiz_mips: u32,
     hiz_enabled: bool,
+    compact_opaque: bool,
 ) -> Vec<u8> {
     let (base, sub) = camera_split(camera);
     Std140(Vec::with_capacity(112))
         .f32s(&view_proj)
         .i32s(&[base[0], base[1], base[2], section_count as i32])
-        .f32s(&[sub[0], sub[1], sub[2], 0.0])
+        .f32s(&[sub[0], sub[1], sub[2], f32::from(u8::from(compact_opaque))])
         .i32s(&[
             hiz_size[0] as i32,
             hiz_size[1] as i32,
@@ -845,6 +849,7 @@ pub fn setup_compute(
     };
     let mips = hiz.mips;
     let view_proj = camera.view_projection();
+    let use_count_buf = host.render_capabilities().multi_draw_indirect_count;
     let desc = ComputePassDescriptor::new("distantsunrises:hiz_cmdgen")
         .reads(FrameTarget::MainDepth)
         .writes(FrameTarget::Mod(hiz.target))
@@ -977,7 +982,15 @@ pub fn setup_compute(
             "trans_clear dispatch",
             ctx.dispatch(trans_clear, &clear_bindings, [1, 1, 1]),
         );
-        let params = cmdgen_params_bytes(view_proj, camera.position, sections, [w, h], mips, true);
+        let params = cmdgen_params_bytes(
+            view_proj,
+            camera.position,
+            sections,
+            [w, h],
+            mips,
+            true,
+            use_count_buf,
+        );
         let bindings = DrawBindings::new()
             .inline_uniform("CmdgenParams", &params)
             .storage_buffer("SectionBuffer", slices.sections)
@@ -1156,13 +1169,15 @@ pub fn prepare_draws(
             PREPARED.lock().unwrap().push((TRANSLUCENT_STAGE, batch));
         }
     }
-    for (stage, plain, pack, cmds, count) in [
+    let use_count_buf = host.render_capabilities().multi_draw_indirect_count;
+    for (stage, plain, pack, cmds, count, count_offset) in [
         (
             OPAQUE_STAGE,
             PIPELINE_OPAQUE,
             PIPELINE_PACK_TERRAIN,
             arena.opaque_commands,
             arena.opaque_command_count(),
+            OPAQUE_COUNT_OFFSET,
         ),
         (
             TRANSLUCENT_STAGE,
@@ -1170,6 +1185,7 @@ pub fn prepare_draws(
             PIPELINE_PACK_WATER,
             arena.translucent_commands,
             arena.translucent_command_count(),
+            TRANSLUCENT_COUNT_OFFSET,
         ),
     ] {
         let packed = assets
@@ -1200,7 +1216,11 @@ pub fn prepare_draws(
                 .storage_buffer("BiomeTintBuffer", s.biome_tints)
                 .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
         };
-        let draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(state.quad_mesh);
+        let mut draw =
+            IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(state.quad_mesh);
+        if use_count_buf {
+            draw = draw.with_count_buffer(arena.trans_sort_meta, count_offset);
+        }
         if let Some(batch) = report("draw_indirect", context.draw_indirect(stage, &draw)) {
             PREPARED.lock().unwrap().push((stage, batch));
         }
@@ -1232,13 +1252,16 @@ pub fn prepare_draws(
             .storage_buffer("ModelBuffer", s.models)
             .storage_buffer("BiomeTintBuffer", s.biome_tints)
             .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id));
-        let draw = IndirectDraw::new(
+        let mut draw = IndirectDraw::new(
             p,
             arena.opaque_commands,
             arena.opaque_command_count(),
             &bindings,
         )
         .with_mesh(state.quad_mesh);
+        if use_count_buf {
+            draw = draw.with_count_buffer(arena.trans_sort_meta, OPAQUE_COUNT_OFFSET);
+        }
         if let Some(batch) = report(
             "shadow draw_indirect",
             context.draw_indirect(OPAQUE_STAGE, &draw),
@@ -1531,6 +1554,16 @@ fn report<T, E: std::fmt::Debug>(what: &'static str, result: Result<T, E>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmdgen_params_carry_compact_opaque_in_camera_sub_pos_w() {
+        let params =
+            |compact| cmdgen_params_bytes([0.0; 16], [0.0; 3], 4, [8, 8], 4, true, compact);
+        let w = |bytes: &[u8]| f32::from_le_bytes(bytes[92..96].try_into().unwrap());
+        assert_eq!(params(true).len(), 112);
+        assert_eq!(w(&params(true)), 1.0);
+        assert_eq!(w(&params(false)), 0.0);
+    }
 
     #[test]
     fn report_limit_is_per_call_site() {
