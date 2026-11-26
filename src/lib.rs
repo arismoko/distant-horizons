@@ -367,14 +367,18 @@ impl Hooks for DistantHorizonsMod {
     }
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
-        let world_dir = host.world_dir();
-        runtime().gen_pool.shutdown_and_join();
-        flush_dirty_sections(host, world_dir);
+        let rt = runtime();
+        let world_dir = host
+            .world_dir()
+            .or_else(|| rt.inner.lock().unwrap().world_dir.clone());
+        rt.gen_pool.shutdown_and_join();
+        pipeline::finish_server_io(host, &rt.io, world_dir.as_deref(), None);
     }
 
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
         let world_dir = host.world_dir();
         let rt = runtime();
+        rt.gen_pool.allow_dimension(event.dimension);
         let mut st = rt.inner.lock().unwrap();
         if st.world_dir.is_none() {
             st.world_dir = world_dir;
@@ -388,12 +392,7 @@ impl Hooks for DistantHorizonsMod {
             .world_dir()
             .or_else(|| rt.inner.lock().unwrap().world_dir.clone());
         rt.gen_pool.reset_dimension(event.dimension);
-        // Resolve accepted reads while this level still has a usable mapper/world context.
-        if let Some(dir) = world_dir.as_deref() {
-            pipeline::finish_intake(host, &rt.io, dir);
-        }
-        pipeline::clear_dimension(event.dimension);
-        flush_dirty_sections(host, world_dir);
+        pipeline::finish_server_io(host, &rt.io, world_dir.as_deref(), Some(event.dimension));
     }
 
     fn chunk_load(&self, host: &mut dyn ServerHost, event: &mut ChunkLoadEvent<'_>) {
@@ -422,7 +421,9 @@ impl Hooks for DistantHorizonsMod {
             return;
         }
         let dim = event.level.dimension_id();
-        tick_server_dimension(host, dim);
+        if runtime().gen_pool.dimension_allowed(dim) {
+            tick_server_dimension(host, dim);
+        }
     }
 }
 
@@ -1183,14 +1184,4 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
             std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
         );
     }
-}
-
-fn flush_dirty_sections(host: &dyn ServerHost, world_dir: Option<std::path::PathBuf>) {
-    let rt = runtime();
-    let Some(dir) = world_dir.or_else(|| rt.inner.lock().unwrap().world_dir.clone()) else {
-        return;
-    };
-    pipeline::finish_intake(host, &rt.io, &dir);
-    while pipeline::flush_saves(&rt.io, &dir, usize::MAX) > 0 {}
-    rt.io.flush();
 }
