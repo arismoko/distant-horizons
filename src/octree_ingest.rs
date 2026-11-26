@@ -262,6 +262,27 @@ impl OctreeIngestStore {
             );
             touched.insert(pos);
         };
+        let mut fill_span = |store: &mut Self, vx: i32, vz: i32, y0: i32, y1: i32, voxel: Voxel| {
+            if y0 >= y1 {
+                return;
+            }
+            let (sx, sz) = (vx.div_euclid(edge), vz.div_euclid(edge));
+            let (lx, lz) = (vx.rem_euclid(edge) as usize, vz.rem_euclid(edge) as usize);
+            let sy0 = y0.div_euclid(edge);
+            let sy1 = (y1 - 1).div_euclid(edge);
+            for sy in sy0..=sy1 {
+                let pos = OctreeSectionPos::new(level, sx, sy, sz);
+                let sec_y0 = sy * edge;
+                let ly0 = (y0 - sec_y0).max(0) as usize;
+                let ly1 = (y1 - sec_y0).min(edge) as usize;
+                let section = store
+                    .sections
+                    .entry(pos)
+                    .or_insert_with(|| OctreeSection::new(pos));
+                section.fill_column(lx, lz, ly0, ly1, voxel);
+                touched.insert(pos);
+            }
+        };
         for col in columns {
             if self
                 .chunk_sources
@@ -285,10 +306,22 @@ impl OctreeIngestStore {
             let bottom = height.min(DISTANT_SOLID_FLOOR >> level);
             let water_top = col.water.map(|w| w >> level).filter(|&w| w > height);
             let top = water_top.unwrap_or(height);
-            for y in bottom..height {
-                set(self, vx, y, vz, Voxel::new(sub_id, biome, 15, 0));
-            }
-            set(self, vx, height, vz, Voxel::new(id, biome, 15, 0));
+            fill_span(
+                self,
+                vx,
+                vz,
+                bottom,
+                height,
+                Voxel::new(sub_id, biome, 15, 0),
+            );
+            fill_span(
+                self,
+                vx,
+                vz,
+                height,
+                height + 1,
+                Voxel::new(id, biome, 15, 0),
+            );
             if let Some(w) = water_top {
                 for y in (height + 1)..=w {
                     let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
@@ -296,9 +329,14 @@ impl OctreeIngestStore {
                 }
             }
             // Open sky above the surface (see `ingest_distant_columns`).
-            for y in top + 1..=top + SECTION_EDGE as i32 {
-                set(self, vx, y, vz, Voxel::air_with_light(15, 0));
-            }
+            fill_span(
+                self,
+                vx,
+                vz,
+                top + 1,
+                top + edge + 1,
+                Voxel::air_with_light(15, 0),
+            );
         }
         touched.into_iter().collect()
     }
@@ -501,10 +539,21 @@ pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
         let bottom = col.height.min(DISTANT_SOLID_FLOOR);
         let water_top = col.water.filter(|&w| w > col.height);
         let top = water_top.unwrap_or(col.height);
-        for y in bottom..col.height {
-            store.set_voxel(col.x, y, col.z, Voxel::new(sub_id, biome, 15, 0));
-        }
-        store.set_voxel(col.x, col.height, col.z, Voxel::new(id, biome, 15, 0));
+        let mut fill_d0 = |y0: i32, y1: i32, voxel: Voxel| {
+            if y0 >= y1 {
+                return;
+            }
+            for sy in y0.div_euclid(edge)..=(y1 - 1).div_euclid(edge) {
+                let sec_y0 = sy * edge;
+                let ly0 = (y0 - sec_y0).max(0) as usize;
+                let ly1 = (y1 - sec_y0).min(edge) as usize;
+                store.write(OctreeSectionPos::new(0, sx, sy, sz), |s| {
+                    s.fill_column(lx, lz, ly0, ly1, voxel);
+                });
+            }
+        };
+        fill_d0(bottom, col.height, Voxel::new(sub_id, biome, 15, 0));
+        fill_d0(col.height, col.height + 1, Voxel::new(id, biome, 15, 0));
         if let Some(w) = water_top {
             for y in (col.height + 1)..=w {
                 let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
@@ -514,9 +563,7 @@ pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
         // Open sky above the surface: coarser levels average the air's light, so one lit voxel
         // would leave distant ground dark.
         let sky_top = top + edge;
-        for y in top + 1..=sky_top {
-            store.set_voxel(col.x, y, col.z, Voxel::air_with_light(15, 0));
-        }
+        fill_d0(top + 1, sky_top + 1, Voxel::air_with_light(15, 0));
 
         let ys = store.distant_column_ys.entry((col.x, col.z)).or_default();
         for y in bottom..=sky_top {

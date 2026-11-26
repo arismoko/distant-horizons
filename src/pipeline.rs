@@ -29,8 +29,10 @@ use std::sync::{LazyLock, Mutex};
 
 /// Block models baked per client tick (each bake reads sprite pixels on the CPU).
 const BAKES_PER_TICK: usize = 64;
-/// Sections meshed per client tick.
-const MESHES_PER_TICK: usize = 32;
+/// Maximum sections meshed per client tick (further bounded by [`MESH_TICK_BUDGET`]).
+const MESHES_PER_TICK: usize = 8;
+/// Hard wall-clock cap for synchronous client-tick meshing so the render thread never stalls.
+const MESH_TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Octree voxel ids: `0` is air, `n` is `states[n - 1]`; biome ids index `biomes`.
 #[derive(Default)]
@@ -500,7 +502,11 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
 /// Client tick: bake pending block models, upload the model and biome tables when they grew, then
 /// mesh dirty sections of `dim` into the GPU arena queue.
 pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
-    let mut guard = PIPELINE.lock().unwrap();
+    // Non-blocking lock: if the server thread is ingesting a distant batch, skip this tick rather
+    // than stalling the main render thread.
+    let Ok(mut guard) = PIPELINE.try_lock() else {
+        return;
+    };
     let p = &mut *guard;
 
     let sprites = AtlasSprites { host };
@@ -532,7 +538,11 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         return;
     }
 
+    let mesh_start = std::time::Instant::now();
     for _ in 0..MESHES_PER_TICK {
+        if mesh_start.elapsed() >= MESH_TICK_BUDGET {
+            break;
+        }
         let Some(pos) = p.dirty.get_mut(dim).and_then(VecDeque::pop_front) else {
             break;
         };

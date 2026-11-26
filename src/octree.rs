@@ -385,10 +385,41 @@ impl OctreeSection {
         true
     }
 
-    /// Fill the vertical span `y0..y1` (local, clamped to the section) of column `(x, z)`.
+    /// Fill the vertical span `y0..y1` (local, clamped to the section) of column `(x, z)` with one
+    /// palette lookup instead of per-voxel `set` overhead.
     pub fn fill_column(&mut self, x: usize, z: usize, y0: usize, y1: usize, voxel: Voxel) {
-        for y in y0..y1.min(SECTION_EDGE) {
-            self.set(x, y, z, voxel);
+        let end = y1.min(SECTION_EDGE);
+        if x >= SECTION_EDGE || z >= SECTION_EDGE || y0 >= end {
+            return;
+        }
+        if self.indices.is_none() && self.palette[0] == voxel {
+            return;
+        }
+        let pi = match self.lookup.get(&voxel) {
+            Some(&p) => p,
+            None => {
+                if self.palette.len() > SECTION_VOLUME {
+                    self.compact();
+                }
+                let p = self.palette.len() as u16;
+                self.palette.push(voxel);
+                self.lookup.insert(voxel, p);
+                p
+            }
+        };
+        let ix = self
+            .indices
+            .get_or_insert_with(|| vec![0u16; SECTION_VOLUME]);
+        let mut changed = false;
+        for y in y0..end {
+            let idx = voxel_index(x, y, z);
+            if ix[idx] != pi {
+                ix[idx] = pi;
+                changed = true;
+            }
+        }
+        if changed {
+            self.revision += 1;
         }
     }
 
