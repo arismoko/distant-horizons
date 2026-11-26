@@ -159,7 +159,7 @@ impl Hooks for DistantHorizonsMod {
                 |_host, lines| {
                     let s = stats();
                     lines.push(format!(
-                        "DH: sec={} last prepared section slot span={} last prepared resident sections={} gen={} saved={}",
+                        "DH: sec={} slots={} resident={} (last prepared frame) gen={} saved={}",
                         s.active_sections,
                         s.section_high_water,
                         s.resident_sections,
