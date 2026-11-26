@@ -1569,6 +1569,38 @@ struct OctreeSaveJob {
     mode: DhV2CompressionMode,
 }
 
+/// A drained batch had failed cache writes. Retains one contextual error and the total count.
+#[derive(Debug)]
+pub struct SaveFailure {
+    section: String,
+    cause: io::Error,
+    count: usize,
+}
+
+impl std::fmt::Display for SaveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {} ({} failed cache operations)",
+            self.section, self.cause, self.count
+        )
+    }
+}
+
+impl std::error::Error for SaveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+impl SaveFailure {
+    pub(crate) fn report(self) {
+        if !RegionWriteRefused::matches(&self.cause) {
+            eprintln!("DH: {self}");
+        }
+    }
+}
+
 #[derive(Default)]
 struct IoQueueState {
     /// Coalesced pending saves (newest revision per `(world_dir, dimension, pos)` wins).
@@ -1581,12 +1613,30 @@ struct IoQueueState {
     pending_octree_loads: VecDeque<(OctreeSaveKey, u64)>,
     octree_responses: Vec<OctreeLoaded>,
     in_flight: usize,
+    save_failure: Option<SaveFailure>,
     reset_regions: bool,
     shutdown: bool,
     responses: Vec<IoResponse>,
 }
 
 impl IoQueueState {
+    fn record_failed_save(&mut self, section: std::fmt::Arguments<'_>, cause: io::Error) {
+        let mut count = 1;
+        if let Some(first) = &mut self.save_failure {
+            first.count = first.count.saturating_add(1);
+            // If the only retained error is already logged, prefer the first unlogged one.
+            if !RegionWriteRefused::matches(&first.cause) || RegionWriteRefused::matches(&cause) {
+                return;
+            }
+            count = first.count;
+        }
+        self.save_failure = Some(SaveFailure {
+            section: section.to_string(),
+            cause,
+            count,
+        });
+    }
+
     fn idle(&self) -> bool {
         self.pending_saves.is_empty()
             && self.pending_loads.is_empty()
@@ -1616,19 +1666,26 @@ impl LodIoWorker {
     }
 
     fn spawn_with_cache(cache: RegionCache) -> Self {
+        Self::spawn_with(|shared| {
+            thread::Builder::new()
+                .name("dh-lod-io".into())
+                .spawn(move || run_io_worker(shared, cache))
+        })
+    }
+
+    fn spawn_with(spawn: impl FnOnce(Arc<IoShared>) -> io::Result<JoinHandle<()>>) -> Self {
         let shared = Arc::new(IoShared {
             state: Mutex::new(IoQueueState::default()),
             wake_worker: Condvar::new(),
             wake_flusher: Condvar::new(),
         });
-        let worker_shared = Arc::clone(&shared);
-        let handle = match thread::Builder::new()
-            .name("dh-lod-io".into())
-            .spawn(move || run_io_worker(worker_shared, cache))
-        {
+        let handle = match spawn(Arc::clone(&shared)) {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!("DH: failed to spawn dh-lod-io worker thread: {e}");
+                // Nothing can serve work: refuse every request, as after shutdown, so no
+                // barrier waits on or reports operations that were never accepted.
+                shared.state.lock().unwrap().shutdown = true;
                 None
             }
         };
@@ -1746,15 +1803,13 @@ impl LodIoWorker {
         std::mem::take(&mut st.octree_responses)
     }
 
-    /// Block until all currently queued saves and loads have finished and synced to disk.
-    pub fn flush(&self) {
+    /// Drain queued I/O. A successful return means no write since the previous barrier failed.
+    pub fn flush(&self) -> Result<(), SaveFailure> {
         let mut st = self.shared.state.lock().unwrap();
-        if self.handle.lock().unwrap().is_none() {
-            return;
-        }
         while !st.idle() {
             st = self.shared.wake_flusher.wait(st).unwrap();
         }
+        st.save_failure.take().map_or(Ok(()), Err)
     }
 
     /// Finish accepted I/O before discarding results and closing the old world's region handles.
@@ -1762,12 +1817,18 @@ impl LodIoWorker {
     pub(crate) fn reset_world(&self) {
         let mut st = self.shared.state.lock().unwrap();
         if self.handle.lock().unwrap().is_none() {
+            // No worker accepted anything, so there is nothing to finish or clear.
             return;
         }
         st.reset_regions = true;
         self.shared.wake_worker.notify_one();
         while st.reset_regions {
             st = self.shared.wake_flusher.wait(st).unwrap();
+        }
+        let failure = st.save_failure.take();
+        drop(st);
+        if let Some(failure) = failure {
+            failure.report();
         }
     }
 
@@ -1786,6 +1847,9 @@ impl Drop for LodIoWorker {
         }
         if let Some(handle) = self.handle.lock().unwrap().take() {
             let _ = handle.join();
+        }
+        if let Some(failure) = self.shared.state.lock().unwrap().save_failure.take() {
+            failure.report();
         }
     }
 }
@@ -1846,13 +1910,17 @@ fn run_io_worker(shared: Arc<IoShared>, mut cache: RegionCache) {
                 let res = cache.write_octree(&world_dir, &dimension, pos, untouched_air, || {
                     encode_octree_record(&job.section, &job.mapping, job.mode)
                 });
-                if let Err(ref e) = res
-                    && !RegionWriteRefused::matches(e)
-                {
-                    eprintln!("DH: failed to save octree section {pos:?} in {dimension}: {e}");
-                }
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
+                if let Err(cause) = res {
+                    st.record_failed_save(
+                        format_args!(
+                            "failed to save octree section {pos:?} in {dimension} ({})",
+                            world_dir.display()
+                        ),
+                        cause,
+                    );
+                }
                 if st.idle() {
                     shared.wake_flusher.notify_all();
                 }
@@ -1874,18 +1942,18 @@ fn run_io_worker(shared: Arc<IoShared>, mut cache: RegionCache) {
             }
             Task::Save(world_dir, dimension, section) => {
                 let res = cache.save_section(&world_dir, &dimension, &section);
-                if let Err(ref e) = res
-                    && !RegionWriteRefused::matches(e)
-                {
-                    eprintln!(
-                        "DH: failed to save section {:?} in {}: {e}",
-                        section.pos, dimension
-                    );
-                }
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
-                if res.is_ok() {
-                    st.responses.push(IoResponse::Saved);
+                match res {
+                    Ok(()) => st.responses.push(IoResponse::Saved),
+                    Err(cause) => st.record_failed_save(
+                        format_args!(
+                            "failed to save section {:?} in {dimension} ({})",
+                            section.pos,
+                            world_dir.display()
+                        ),
+                        cause,
+                    ),
                 }
                 if st.idle() {
                     shared.wake_flusher.notify_all();
@@ -2141,7 +2209,7 @@ mod tests {
             "minecraft:overworld".into(),
             sample_section(pos, 95),
         );
-        worker.flush();
+        worker.flush().unwrap();
 
         let mut reader = RegionCache::default();
         let loaded = reader
@@ -2585,7 +2653,7 @@ mod tests {
         let read_misses = |column, octree| {
             worker.request_load(dir.to_path_buf(), dim.into(), column);
             worker.load_octree_section(dir.to_path_buf(), dim.into(), octree, 1, false);
-            worker.flush();
+            worker.flush().unwrap();
             assert!(worker.drain_responses().is_empty());
             let probes = worker.drain_octree_responses();
             assert_eq!(probes.len(), 1);
@@ -2604,14 +2672,14 @@ mod tests {
             (column, octree)
         };
         let assert_saved = |column: LodSection, octree: OctreeSection| {
-            worker.flush();
+            worker.flush().unwrap();
             assert!(matches!(
                 worker.drain_responses().as_slice(),
                 [IoResponse::Saved]
             ));
             worker.request_load(dir.to_path_buf(), dim.into(), column.pos);
             worker.load_octree_section(dir.to_path_buf(), dim.into(), octree.pos, 2, false);
-            worker.flush();
+            worker.flush().unwrap();
             assert!(matches!(
                 worker.drain_responses().as_slice(),
                 [IoResponse::Loaded { dimension, section }]
@@ -2640,7 +2708,9 @@ mod tests {
             assert_eq!(&fs::read(path).unwrap(), bytes);
         }
         queue_saves(column, octree);
-        worker.flush();
+        let failure = worker.flush().unwrap_err();
+        assert_eq!(failure.count, 2);
+        assert!(RegionWriteRefused::matches(&failure.cause));
         assert!(worker.drain_responses().is_empty(), "no Saved on refusal");
         assert_first_failures_preserved();
         read_misses(column, octree);
@@ -2656,7 +2726,7 @@ mod tests {
             fs::write(octree_region_path(&dir, dim, pos), &empty_region).unwrap();
             worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 3, false);
         }
-        worker.flush();
+        worker.flush().unwrap();
         let probes = worker.drain_octree_responses();
         assert_eq!(probes.len(), MAX_CACHED_REGIONS + 1);
         assert!(
@@ -2669,7 +2739,9 @@ mod tests {
         let octree_neighbor = OctreeSectionPos::new(0, 1, 0, 0);
         queue_saves(column, octree);
         queue_saves(column_neighbor, octree_neighbor);
-        worker.flush();
+        let failure = worker.flush().unwrap_err();
+        assert_eq!(failure.count, 4);
+        assert!(RegionWriteRefused::matches(&failure.cause));
         assert!(worker.drain_responses().is_empty(), "no Saved on retries");
         read_misses(column_neighbor, octree_neighbor);
         assert_first_failures_preserved();
@@ -2707,6 +2779,86 @@ mod tests {
             );
             assert_eq!(&fs::read(quarantined).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn worker_flush_reports_both_formats_without_losing_unrelated_writes() {
+        let dir = TestTempDir::new("flush-save-failure");
+        let dim = "minecraft:overworld";
+        let column_bad = SectionPos::new(0, 0, 0);
+        let column_good = SectionPos::new(0, REGION_SIZE as i32, 0);
+        let octree_bad = OctreeSectionPos::new(0, 0, 0, 0);
+        let octree_good = OctreeSectionPos::new(0, 1 << OCT_REGION_SHIFT_X, 0, 0);
+        let worker = LodIoWorker::spawn();
+        // Neither directory can be opened as a writable region file.
+        fs::create_dir_all(region_path(&dir, dim, column_bad)).unwrap();
+        fs::create_dir_all(octree_region_path(&dir, dim, octree_bad)).unwrap();
+        for pos in [column_bad, column_good] {
+            worker.request_save(dir.to_path_buf(), dim.into(), sample_section(pos, 95));
+        }
+        let failure = worker.flush().unwrap_err();
+        assert_eq!(failure.count, 1);
+        assert!(
+            failure
+                .section
+                .contains(&format!("section {column_bad:?} in {dim}"))
+        );
+        assert!(matches!(
+            worker.drain_responses().as_slice(),
+            [IoResponse::Saved]
+        ));
+
+        let (bad, bad_mapping) = populated_octree(octree_bad);
+        let (good, good_mapping) = populated_octree(octree_good);
+        worker.save_octree_section(dir.to_path_buf(), dim.into(), bad, bad_mapping);
+        worker.save_octree_section(dir.to_path_buf(), dim.into(), good.clone(), good_mapping);
+        let failure = worker.flush().unwrap_err();
+        assert_eq!(failure.count, 1);
+        assert!(
+            failure
+                .section
+                .contains(&format!("octree section {octree_bad:?} in {dim}"))
+        );
+        worker.flush().unwrap();
+        drop(worker);
+
+        let mut cold = RegionCache::default();
+        let column = cold.load_section(&dir, dim, column_good).unwrap();
+        assert_eq!(column.get(0, 0).solid_top_y, 95);
+        let (octree, _) = cold
+            .load_octree_section(&dir, dim, octree_good)
+            .unwrap()
+            .unwrap();
+        assert_eq!(octree.to_dense(), good.to_dense());
+    }
+
+    #[test]
+    fn worker_that_failed_to_spawn_refuses_work_without_repeated_failures() {
+        let dir = TestTempDir::new("no-worker");
+        let dim = "minecraft:overworld";
+        let column = SectionPos::new(0, 0, 0);
+        let octree = OctreeSectionPos::new(0, 0, 0, 0);
+        let worker = LodIoWorker::spawn_with(|_| Err(io::Error::other("spawn refused")));
+        for _ in 0..2 {
+            // The same backlog is offered at every barrier; none of it can be served.
+            worker.request_save(dir.to_path_buf(), dim.into(), sample_section(column, 95));
+            worker.request_load(dir.to_path_buf(), dim.into(), column);
+            let (section, mapping) = populated_octree(octree);
+            worker.save_octree_section(dir.to_path_buf(), dim.into(), section, mapping);
+            worker.load_octree_section(dir.to_path_buf(), dim.into(), octree, 1, true);
+            worker.flush().unwrap();
+            worker.reset_world();
+            worker.flush().unwrap();
+        }
+        {
+            let st = worker.shared.state.lock().unwrap();
+            assert!(st.idle() && st.save_order.is_empty() && st.octree_save_order.is_empty());
+            assert!(st.save_failure.is_none());
+        }
+        assert!(worker.drain_responses().is_empty(), "no fabricated Saved");
+        assert!(worker.drain_octree_responses().is_empty());
+        assert!(!region_path(&dir, dim, column).exists());
+        assert!(!octree_region_path(&dir, dim, octree).exists());
     }
 
     #[test]
@@ -2805,7 +2957,7 @@ mod tests {
         let worker = LodIoWorker::spawn();
         worker.save_octree_section(dir.to_path_buf(), dim.into(), old, mapping);
         worker.save_octree_section(dir.to_path_buf(), dim.into(), other.clone(), other_mapping);
-        worker.flush();
+        worker.flush().unwrap();
         for section in [
             clear.clone(),
             OctreeSection::new(missing),
@@ -2819,7 +2971,7 @@ mod tests {
             );
         }
         worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 7, false);
-        worker.flush();
+        worker.flush().unwrap();
         let responses = worker.drain_octree_responses();
         assert_eq!(responses.len(), 1);
         let (reloaded, _) = responses
@@ -2922,7 +3074,7 @@ mod tests {
         fs::rename(&path, path.with_extension("first-open")).unwrap();
         fs::rename(octree_region_path(&replacement_dir, dim, pos), path).unwrap();
         worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 2, false);
-        worker.flush();
+        worker.flush().unwrap();
         let result = worker.drain_octree_responses().pop().unwrap();
         assert_eq!(result.request, 2);
         assert_eq!(
@@ -2948,9 +3100,9 @@ mod tests {
             second.clone(),
             mapping.clone(),
         );
-        worker.flush();
+        worker.flush().unwrap();
         worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 7, false);
-        worker.flush();
+        worker.flush().unwrap();
         let got = worker.drain_octree_responses();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].dimension, dim);
