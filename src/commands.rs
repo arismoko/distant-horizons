@@ -625,22 +625,34 @@ fn send_status(host: &mut dyn ClientHost) {
     ));
 }
 
-/// Refresh only live octree terrain; leave provider data and disk state alone.
+/// Refresh only live octree terrain; leave provider data and disk state alone. The legacy
+/// `dimensions` and `remote_requested` runtime fields are deliberately untouched: they still
+/// have active readers and writers (see the #47 commit body).
+/// Local sessions report only the queued remesh count; remote sessions report evicted server
+/// copies and the retained sections queued for remeshing.
 fn clear_active_dimension_cache(host: &dyn ClientHost) -> Text {
-    let (rebuild, dropped) = host
-        .client_session()
-        .client_server()
-        .map_or((0, 0), |server| {
-            let dim = runtime().inner.lock().unwrap().active_dimension.clone();
-            crate::pipeline::clear_client_cache(&dim, !server.integrated_local)
-        });
-    Text::translate(
-        "distantsunrises.command.cleared",
-        vec![
-            Text::literal(rebuild.to_string()),
-            Text::literal(dropped.to_string()),
-        ],
-    )
+    let Some(server) = host.client_session().client_server() else {
+        return Text::translate(
+            "distantsunrises.command.cleared_local",
+            vec![Text::literal("0")],
+        );
+    };
+    let dim = runtime().inner.lock().unwrap().active_dimension.clone();
+    let (rebuild, dropped) = crate::pipeline::clear_client_cache(&dim, !server.integrated_local);
+    if server.integrated_local {
+        Text::translate(
+            "distantsunrises.command.cleared_local",
+            vec![Text::literal(rebuild.to_string())],
+        )
+    } else {
+        Text::translate(
+            "distantsunrises.command.cleared_remote",
+            vec![
+                Text::literal(dropped.to_string()),
+                Text::literal(rebuild.to_string()),
+            ],
+        )
+    }
 }
 
 #[cfg(test)]
