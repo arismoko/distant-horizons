@@ -1281,17 +1281,14 @@ impl Pipeline {
             for dim in &dims {
                 self.advance_intake(io, dir, dim, false);
             }
-            if let Err(failure) = io.flush() {
-                failure.report();
-            }
+            // The worker logged each failed write when it happened.
+            let _ = io.flush();
             self.accept_probes(io, dir, remap);
             for dim in &dims {
                 self.advance_intake(io, dir, dim, true);
             }
             self.flush_saves(io, dir, usize::MAX);
-            if let Err(failure) = io.flush() {
-                failure.report();
-            }
+            let _ = io.flush();
         } else {
             for dim in dims {
                 let disk = self.disk.get_mut(&dim).unwrap();

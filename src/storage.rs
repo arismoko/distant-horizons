@@ -1565,7 +1565,9 @@ struct OctreeSaveJob {
     mode: DhV2CompressionMode,
 }
 
-/// A drained batch had failed cache writes. Retains one contextual error and the total count.
+/// Accepted writes that failed since the previous barrier: the first contextual error and the
+/// total count. Each write is logged by the worker when it fails, so barriers return this to
+/// their caller without logging it again.
 #[derive(Debug)]
 pub struct SaveFailure {
     section: String,
@@ -1590,9 +1592,16 @@ impl std::error::Error for SaveFailure {
 }
 
 impl SaveFailure {
-    pub(crate) fn report(self) {
-        if !RegionWriteRefused::matches(&self.cause) {
-            eprintln!("DH: {self}");
+    /// One failed accepted write, logged now. A quarantine refusal was already logged at the
+    /// failed rename.
+    fn logged(section: String, cause: io::Error) -> Self {
+        if !RegionWriteRefused::matches(&cause) {
+            eprintln!("DH: {section}: {cause}");
+        }
+        Self {
+            section,
+            cause,
+            count: 1,
         }
     }
 }
@@ -1616,21 +1625,11 @@ struct IoQueueState {
 }
 
 impl IoQueueState {
-    fn record_failed_save(&mut self, section: std::fmt::Arguments<'_>, cause: io::Error) {
-        let mut count = 1;
-        if let Some(first) = &mut self.save_failure {
-            first.count = first.count.saturating_add(1);
-            // If the only retained error is already logged, prefer the first unlogged one.
-            if !RegionWriteRefused::matches(&first.cause) || RegionWriteRefused::matches(&cause) {
-                return;
-            }
-            count = first.count;
+    fn record_failed_save(&mut self, failure: SaveFailure) {
+        match &mut self.save_failure {
+            Some(first) => first.count = first.count.saturating_add(1),
+            None => self.save_failure = Some(failure),
         }
-        self.save_failure = Some(SaveFailure {
-            section: section.to_string(),
-            cause,
-            count,
-        });
     }
 
     fn idle(&self) -> bool {
@@ -1852,11 +1851,8 @@ impl LodIoWorker {
         while st.reset_regions {
             st = self.shared.wake_flusher.wait(st).unwrap();
         }
-        let failure = st.save_failure.take();
-        drop(st);
-        if let Some(failure) = failure {
-            failure.report();
-        }
+        // Failed writes were logged when they happened; a reset only discards the count.
+        st.save_failure = None;
     }
 
     pub fn drain_responses(&self) -> Vec<IoResponse> {
@@ -1874,9 +1870,6 @@ impl Drop for LodIoWorker {
         }
         if let Some(handle) = self.handle.lock().unwrap().take() {
             let _ = handle.join();
-        }
-        if let Some(failure) = self.shared.state.lock().unwrap().save_failure.take() {
-            failure.report();
         }
     }
 }
@@ -1932,23 +1925,22 @@ fn run_io_worker(shared: Arc<IoShared>, mut cache: RegionCache) {
         match task {
             Task::Exit => break,
             Task::OctreeSave((world_dir, dimension, pos), job) => {
-                let res = cache.write_octree(
-                    &world_dir,
-                    &dimension,
-                    &job.section,
-                    &job.mapping,
-                    job.mode,
-                );
+                let failure = cache
+                    .write_octree(&world_dir, &dimension, &job.section, &job.mapping, job.mode)
+                    .err()
+                    .map(|cause| {
+                        SaveFailure::logged(
+                            format!(
+                                "failed to save octree section {pos:?} in {dimension} ({})",
+                                world_dir.display()
+                            ),
+                            cause,
+                        )
+                    });
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
-                if let Err(cause) = res {
-                    st.record_failed_save(
-                        format_args!(
-                            "failed to save octree section {pos:?} in {dimension} ({})",
-                            world_dir.display()
-                        ),
-                        cause,
-                    );
+                if let Some(failure) = failure {
+                    st.record_failed_save(failure);
                 }
                 if st.idle() {
                     shared.wake_flusher.notify_all();
@@ -1970,19 +1962,24 @@ fn run_io_worker(shared: Arc<IoShared>, mut cache: RegionCache) {
                 }
             }
             Task::Save(world_dir, dimension, section) => {
-                let res = cache.save_section(&world_dir, &dimension, &section);
+                let failure = cache
+                    .save_section(&world_dir, &dimension, &section)
+                    .err()
+                    .map(|cause| {
+                        SaveFailure::logged(
+                            format!(
+                                "failed to save section {:?} in {dimension} ({})",
+                                section.pos,
+                                world_dir.display()
+                            ),
+                            cause,
+                        )
+                    });
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
-                match res {
-                    Ok(()) => st.responses.push(IoResponse::Saved),
-                    Err(cause) => st.record_failed_save(
-                        format_args!(
-                            "failed to save section {:?} in {dimension} ({})",
-                            section.pos,
-                            world_dir.display()
-                        ),
-                        cause,
-                    ),
+                match failure {
+                    None => st.responses.push(IoResponse::Saved),
+                    Some(failure) => st.record_failed_save(failure),
                 }
                 if st.idle() {
                     shared.wake_flusher.notify_all();
@@ -2822,11 +2819,13 @@ mod tests {
         // Neither directory can be opened as a writable region file.
         fs::create_dir_all(region_path(&dir, dim, column_bad)).unwrap();
         fs::create_dir_all(octree_region_path(&dir, dim, octree_bad)).unwrap();
-        for pos in [column_bad, column_good] {
+        // A second write into the unopenable region still reports as a barrier count.
+        let column_bad_neighbor = SectionPos::new(0, 1, 0);
+        for pos in [column_bad, column_bad_neighbor, column_good] {
             worker.request_save(dir.to_path_buf(), dim.into(), sample_section(pos, 95));
         }
         let failure = worker.flush().unwrap_err();
-        assert_eq!(failure.count, 1);
+        assert_eq!(failure.count, 2);
         assert!(
             failure
                 .section
