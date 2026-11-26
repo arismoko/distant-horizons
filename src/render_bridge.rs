@@ -126,6 +126,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
             PipelineBlend::Opaque,
             WorldDepth::Tested,
         )
+        .depth_write(true)
         .topology(PrimitiveTopology::Triangles)
         .cull(false)
         .bind_group_layout(quad_layout())
@@ -171,6 +172,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
                 blend,
                 WorldDepth::Tested,
             )
+            .depth_write(true)
             .topology(PrimitiveTopology::Triangles)
             .cull(false)
             .bind_group_layout(pack_layout())
