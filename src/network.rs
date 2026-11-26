@@ -36,7 +36,7 @@ pub mod octree_sync {
         MAX_OCTREE_DETAIL, OctreeSection, OctreeSectionPos, RleSection, Run, SECTION_VOLUME, Voxel,
     };
     use mod_api::{
-        ClientHost, HandlerThread, IPayloadContext, IPayloadHandler, PayloadBytes,
+        ClientHost, HandlerThread, IPayloadContext, IPayloadHandler, PayloadAccepted, PayloadBytes,
         PayloadHandleError, PayloadId, PayloadSendError, PlayerRef, Registrar, ServerHost,
     };
     use std::collections::{HashMap, VecDeque};
@@ -1748,11 +1748,20 @@ pub mod octree_sync {
             Ok(())
         }
 
-        fn config_to_send(&mut self) -> Option<Vec<u8>> {
-            if std::mem::replace(&mut self.open, true) {
-                return None;
+        fn configure(
+            &mut self,
+            send: impl FnOnce(PayloadBytes) -> Result<PayloadAccepted, PayloadSendError>,
+        ) -> bool {
+            if self.open {
+                return true;
             }
-            ClientSession::config_message(&SessionConfig::default()).ok()
+            let Ok(bytes) = ClientSession::config_message(&SessionConfig::default()) else {
+                return false;
+            };
+            if matches!(send(PayloadBytes(bytes)), Ok(PayloadAccepted::Queued)) {
+                self.open = true;
+            }
+            self.open
         }
 
         fn close(&mut self) {
@@ -1857,11 +1866,34 @@ pub mod octree_sync {
         }
     }
 
-    /// Send our session config once per play world (`ServerPlayerState.java:62-65`).
-    pub fn client_send_config_once(host: &mut dyn ClientHost) {
-        let bytes = client_intake().lock().unwrap().config_to_send();
-        if let Some(bytes) = bytes {
-            let _ = host.send_payload_to_server(&octree_sync_channel_id(), PayloadBytes(bytes));
+    /// Run `demand` only once the current play world has locally queued its initial session
+    /// config (`ServerPlayerState.java:62-65`). A refused send leaves intake closed and demands
+    /// nothing; the next eligible tick tries the same config again.
+    pub fn client_demand_after_config<H: ClientHost + ?Sized>(
+        host: &mut H,
+        demand: impl FnOnce(&mut H),
+    ) {
+        let channel = octree_sync_channel_id();
+        demand_after_config(
+            client_intake(),
+            host,
+            |host, bytes| host.send_payload_to_server(&channel, bytes),
+            demand,
+        );
+    }
+
+    fn demand_after_config<H: ?Sized>(
+        intake: &Mutex<ClientIntake>,
+        host: &mut H,
+        send: impl FnOnce(&mut H, PayloadBytes) -> Result<PayloadAccepted, PayloadSendError>,
+        demand: impl FnOnce(&mut H),
+    ) {
+        // The host send is nonblocking and cannot call the raw handler inline. Hold the same
+        // guard as receive so a fast reply cannot arrive before intake is opened, and release
+        // it before demand, which takes the intake lock again.
+        let configured = intake.lock().unwrap().configure(|bytes| send(host, bytes));
+        if configured {
+            demand(host);
         }
     }
 
@@ -1937,12 +1969,120 @@ pub mod octree_sync {
                 state.lock().unwrap().active_dimension,
                 "minecraft:the_nether"
             );
-            let config = intake.config_to_send().unwrap();
-            assert!(matches!(
-                Message::decode(&config),
-                Ok(Message::SessionConfig(_))
-            ));
-            assert!(intake.config_to_send().is_none());
+            assert!(intake.configure(|bytes| {
+                assert!(matches!(
+                    Message::decode(&bytes.0),
+                    Ok(Message::SessionConfig(_))
+                ));
+                Ok(PayloadAccepted::Queued)
+            }));
+            assert!(intake.configure(|_| panic!("already configured")));
+        }
+
+        #[test]
+        fn section_demand_waits_for_the_config_gate_to_accept() {
+            #[derive(Default)]
+            struct Link {
+                accept: bool,
+                sent: Vec<Vec<u8>>,
+                demanded: usize,
+            }
+            let pos = OctreeSectionPos::new(0, 0, 0, 0);
+            let intake = Mutex::new(ClientIntake::default());
+            let tick = |link: &mut Link| {
+                demand_after_config(
+                    &intake,
+                    link,
+                    |link, bytes| {
+                        link.sent.push(bytes.0);
+                        if link.accept {
+                            Ok(PayloadAccepted::Queued)
+                        } else {
+                            Err(PayloadSendError::Backpressure)
+                        }
+                    },
+                    |link| {
+                        link.demanded += 1;
+                        intake
+                            .lock()
+                            .unwrap()
+                            .session
+                            .request(LEVEL, pos, None)
+                            .unwrap();
+                    },
+                );
+            };
+            let mut link = Link::default();
+            for refused in 1..=2 {
+                tick(&mut link);
+                assert_eq!(link.sent.len(), refused);
+                assert_eq!(link.demanded, 0, "refused config must not demand sections");
+                let closed = intake.lock().unwrap();
+                assert!(!closed.open && closed.session.pending.is_empty());
+            }
+            assert_eq!(link.sent[0], link.sent[1]);
+
+            link.accept = true;
+            tick(&mut link);
+            assert_eq!(link.sent.len(), 3);
+            assert_eq!(link.sent[2], link.sent[0]);
+            assert_eq!(link.demanded, 1);
+            assert!(intake.lock().unwrap().open);
+            tick(&mut link);
+            assert_eq!(
+                link.sent.len(),
+                3,
+                "an open play world never resends config"
+            );
+            assert_eq!(link.demanded, 2);
+            assert_eq!(intake.lock().unwrap().session.pending.len(), 2);
+        }
+
+        #[test]
+        fn refused_config_keeps_intake_closed_until_the_same_config_is_queued() {
+            let now = Instant::now();
+            let pos = OctreeSectionPos::new(0, 0, 0, 0);
+            let source = Fake::of(&varied_section(pos, 1), DhV2CompressionMode::Uncompressed);
+            let mut registry = ServerSyncRegistry::new(SessionConfig::default());
+            registry.set_open(true);
+            let mut intake = ClientIntake::default();
+            let mut refused = Vec::new();
+            assert!(!intake.configure(|bytes| {
+                refused = bytes.0;
+                Err(PayloadSendError::Backpressure)
+            }));
+            assert!(!intake.open);
+            assert!(intake.session.pending.is_empty());
+            assert!(registry.player(1).is_none());
+
+            let mut replies = Vec::new();
+            assert!(intake.configure(|bytes| {
+                assert_eq!(bytes.0, refused);
+                let config = Message::decode(&bytes.0).unwrap();
+                assert!(matches!(config, Message::SessionConfig(_)));
+                replies = registry.receive(|| Ok(1), config, now, &source).unwrap();
+                Ok(PayloadAccepted::Queued)
+            }));
+            assert!(
+                intake.session.config.is_none(),
+                "requests need not wait for the reply"
+            );
+            let request = intake.session.request(LEVEL, pos, None).unwrap();
+            assert!(
+                registry
+                    .receive(|| Ok(1), Message::decode(&request).unwrap(), now, &source)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!registry.player(1).unwrap().sender.is_idle());
+            let [reply] = replies.as_slice() else {
+                panic!("expected one config reply")
+            };
+            intake
+                .receive(&reply.encode().unwrap(), now, || true)
+                .unwrap();
+            assert!(intake.session.config.is_some());
+            assert!(intake.configure(|_| panic!("already configured")));
         }
 
         #[test]
@@ -1969,8 +2109,11 @@ pub mod octree_sync {
             .unwrap();
             let pos = OctreeSectionPos::new(0, 0, 0, 0);
             let mut intake = ClientIntake::default();
-            assert_eq!(intake.config_to_send().as_ref(), Some(&cfg));
-            assert!(intake.config_to_send().is_none());
+            assert!(intake.configure(|bytes| {
+                assert_eq!(bytes.0, cfg);
+                Ok(PayloadAccepted::Queued)
+            }));
+            assert!(intake.configure(|_| panic!("already configured")));
             intake.receive(&cfg, now, || true).unwrap();
             intake.receive(&split, now, || true).unwrap();
             intake.session.request(LEVEL, pos, None).unwrap();
@@ -1996,9 +2139,16 @@ pub mod octree_sync {
             assert!(intake.events.is_empty());
             assert!(intake.session.pending.is_empty());
             assert!(intake.session.receiver.buffers.is_empty());
+            assert!(!intake.configure(|_| Err(PayloadSendError::Backpressure)));
+            intake
+                .receive(&cfg, now, || panic!("refused config opened intake"))
+                .unwrap();
 
-            assert_eq!(intake.config_to_send().as_ref(), Some(&cfg));
-            assert!(intake.config_to_send().is_none());
+            assert!(intake.configure(|bytes| {
+                assert_eq!(bytes.0, cfg);
+                Ok(PayloadAccepted::Queued)
+            }));
+            assert!(intake.configure(|_| panic!("already configured")));
             intake.session.request(LEVEL, pos, None).unwrap();
             let old = Message::Response(OctreeSectionResponse {
                 future_id: 0,
