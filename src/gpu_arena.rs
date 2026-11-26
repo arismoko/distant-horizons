@@ -349,6 +349,11 @@ impl From<BufferError> for ArenaError {
     }
 }
 
+/// Size in bytes of `TransSortMeta` (`visible_count`, `pad0`, 256 counts, 256 offsets).
+pub const TRANS_SORT_META_BYTES: u64 = (2 + 256 * 2) * 4;
+/// Size in bytes of one `TransSortEntries` element (`uvec2(section_id, bucket)`).
+pub const TRANS_SORT_ENTRY_BYTES: u64 = 8;
+
 /// Whole-buffer [`StorageBufferSlice`]s of the arena's bound buffers.
 #[derive(Clone, Copy)]
 pub struct ArenaSlices {
@@ -356,6 +361,8 @@ pub struct ArenaSlices {
     pub sections: StorageBufferSlice,
     pub opaque_commands: StorageBufferSlice,
     pub translucent_commands: StorageBufferSlice,
+    pub trans_sort_meta: StorageBufferSlice,
+    pub trans_sort_entries: StorageBufferSlice,
     pub models: StorageBufferSlice,
     pub biome_tints: StorageBufferSlice,
 }
@@ -366,8 +373,12 @@ pub struct GpuArena {
     pub sections: StorageBufferRef,
     /// `max_sections * 7` commands, `indirect: true`, written by `voxy_cmdgen.csh`.
     pub opaque_commands: StorageBufferRef,
-    /// `max_sections` commands, `indirect: true`.
+    /// `max_sections` commands, `indirect: true`, sorted back-to-front by `voxy_trans_scatter.csh`.
     pub translucent_commands: StorageBufferRef,
+    /// 256-bucket Manhattan-distance sort histogram & prefix-summed offsets (`voxy_trans_*.csh`).
+    pub trans_sort_meta: StorageBufferRef,
+    /// Visible translucent `(section_id, bucket)` pairs written by `voxy_cmdgen.csh`.
+    pub trans_sort_entries: StorageBufferRef,
     /// Baked model table: `MODEL_WORDS` (16) `u32`s per 20-bit state id (see `voxy_quads.vsh`).
     pub models: StorageBufferRef,
     /// Biome tint LUT: grass, foliage, water `0x00BBGGRR` per 9-bit biome id.
@@ -441,6 +452,14 @@ impl GpuArena {
             )
             .indirect(true),
         )?;
+        let trans_sort_meta = make(
+            host,
+            StorageBufferDescriptor::new(TRANS_SORT_META_BYTES).indirect(true),
+        )?;
+        let trans_sort_entries = make(
+            host,
+            StorageBufferDescriptor::new(n * TRANS_SORT_ENTRY_BYTES),
+        )?;
         let models = make(
             host,
             StorageBufferDescriptor::new(MODEL_COUNT * MODEL_WORDS * 4),
@@ -448,6 +467,7 @@ impl GpuArena {
         let biome_tints = make(host, StorageBufferDescriptor::new(BIOME_COUNT * 3 * 4))?;
         let cmd_bytes = n * OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
         let tcmd_bytes = n * TRANSLUCENT_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
+        let tsort_entry_bytes = n * TRANS_SORT_ENTRY_BYTES;
         let model_bytes = MODEL_COUNT * MODEL_WORDS * 4;
         let biome_bytes = BIOME_COUNT * 3 * 4;
         let slices = ArenaSlices {
@@ -455,6 +475,8 @@ impl GpuArena {
             sections: sections.slice(0, n * SECTION_METADATA_BYTES),
             opaque_commands: opaque_commands.slice(0, cmd_bytes),
             translucent_commands: translucent_commands.slice(0, tcmd_bytes),
+            trans_sort_meta: trans_sort_meta.slice(0, TRANS_SORT_META_BYTES),
+            trans_sort_entries: trans_sort_entries.slice(0, tsort_entry_bytes),
             models: models.slice(0, model_bytes),
             biome_tints: biome_tints.slice(0, biome_bytes),
         };
@@ -466,6 +488,8 @@ impl GpuArena {
             sections,
             opaque_commands,
             translucent_commands,
+            trans_sort_meta,
+            trans_sort_entries,
             max_sections,
             quad_alloc: FreeList::new(geometry_bytes / QUAD_BYTES),
             ids: IdAllocator::new(max_sections),
@@ -620,6 +644,8 @@ impl GpuArena {
         self.sections.release(&*host)?;
         self.opaque_commands.release(&*host)?;
         self.translucent_commands.release(&*host)?;
+        self.trans_sort_meta.release(&*host)?;
+        self.trans_sort_entries.release(&*host)?;
         self.models.release(&*host)?;
         self.biome_tints.release(&*host)?;
         Ok(())

@@ -32,6 +32,13 @@ layout(std140) uniform CmdgenParams {
 layout(std430) readonly buffer SectionBuffer { SectionMeta sections[]; };
 layout(std430) buffer OpaqueCommands { DrawCommand opaque_cmds[]; };
 layout(std430) buffer TranslucentCommands { DrawCommand translucent_cmds[]; };
+layout(std430) buffer TransSortMeta {
+    uint visible_count;
+    uint pad0;
+    uint bucket_counts[256];
+    uint bucket_offsets[256];
+};
+layout(std430) buffer TransSortEntries { uvec2 trans_entries[]; };
 uniform sampler2D HizPyramid;
 
 ivec3 section_pos(uvec2 p) {
@@ -151,7 +158,17 @@ void main() {
     uint s_west = s_south + c_south;
     uint s_east = s_west + c_west;
 
-    translucent_cmds[id] = make(s_trans, c_trans, id, visible && c_trans != 0u);
+    // Clear this translucent slot; visible translucent sections are compacted and sorted
+    // back-to-front by Manhattan distance into translucent_cmds[0..visible_count] by
+    // voxy_trans_prefix.csh + voxy_trans_scatter.csh.
+    translucent_cmds[id] = make(0u, 0u, 0u, false);
+    if (visible && c_trans != 0u) {
+        uint dist = min(uint(abs(rel.x) + abs(rel.y) + abs(rel.z)), 255u);
+        uint bucket = 255u - dist;
+        uint slot = atomicAdd(visible_count, 1u);
+        atomicAdd(bucket_counts[bucket], 1u);
+        trans_entries[slot] = uvec2(id, bucket);
+    }
     uint o = id * 7u;
     opaque_cmds[o + 0u] = make(s_dbl, c_dbl, id, visible && c_dbl != 0u);
     opaque_cmds[o + 1u] = make(s_down, c_down, id, visible && c_down != 0u && rel.y > -1);

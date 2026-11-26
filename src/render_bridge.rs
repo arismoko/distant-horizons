@@ -34,6 +34,9 @@ use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
 pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
 pub const SHADER_HIZ: &str = "distantsunrises:voxy_hiz";
 pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
+pub const SHADER_TRANS_CLEAR: &str = "distantsunrises:voxy_trans_clear";
+pub const SHADER_TRANS_PREFIX: &str = "distantsunrises:voxy_trans_prefix";
+pub const SHADER_TRANS_SCATTER: &str = "distantsunrises:voxy_trans_scatter";
 
 pub const PIPELINE_OPAQUE: &str = "distantsunrises:voxy_opaque";
 pub const PIPELINE_TRANSLUCENT: &str = "distantsunrises:voxy_translucent";
@@ -205,6 +208,19 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
             .build(),
     );
     event.compute_pipeline(
+        ComputePipeline::builder(
+            id("distantsunrises:voxy_trans_clear"),
+            id(SHADER_TRANS_CLEAR),
+        )
+        .bind_group_layout(
+            BindGroupLayout::builder()
+                .entry(storage("TransSortMeta", false, 2056))
+                .build()
+                .expect("static trans_clear layout"),
+        )
+        .build(),
+    );
+    event.compute_pipeline(
         ComputePipeline::builder(id("distantsunrises:voxy_cmdgen"), id(SHADER_CMDGEN))
             .bind_group_layout(
                 BindGroupLayout::builder()
@@ -212,6 +228,8 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     .entry(storage("SectionBuffer", true, 32))
                     .entry(storage("OpaqueCommands", false, 20))
                     .entry(storage("TranslucentCommands", false, 20))
+                    .entry(storage("TransSortMeta", false, 2056))
+                    .entry(storage("TransSortEntries", false, 8))
                     .sampler(
                         "HizPyramid",
                         SamplerFilter::Nearest,
@@ -221,6 +239,35 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     .expect("static cmdgen layout"),
             )
             .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(
+            id("distantsunrises:voxy_trans_prefix"),
+            id(SHADER_TRANS_PREFIX),
+        )
+        .bind_group_layout(
+            BindGroupLayout::builder()
+                .entry(storage("TransSortMeta", false, 2056))
+                .build()
+                .expect("static trans_prefix layout"),
+        )
+        .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(
+            id("distantsunrises:voxy_trans_scatter"),
+            id(SHADER_TRANS_SCATTER),
+        )
+        .bind_group_layout(
+            BindGroupLayout::builder()
+                .entry(storage("SectionBuffer", true, 32))
+                .entry(storage("TranslucentCommands", false, 20))
+                .entry(storage("TransSortMeta", false, 2056))
+                .entry(storage("TransSortEntries", true, 8))
+                .build()
+                .expect("static trans_scatter layout"),
+        )
+        .build(),
     );
 }
 
@@ -563,9 +610,24 @@ pub fn setup_compute(
         return;
     };
     let assets = host.render_assets();
-    let ids = ["voxy_hiz_copy", "voxy_hiz_reduce", "voxy_cmdgen"]
-        .map(|n| assets.compute_pipeline(&id(&format!("distantsunrises:{n}"))));
-    let [Ok(copy), Ok(reduce), Ok(cmdgen)] = ids else {
+    let ids = [
+        "voxy_hiz_copy",
+        "voxy_hiz_reduce",
+        "voxy_trans_clear",
+        "voxy_cmdgen",
+        "voxy_trans_prefix",
+        "voxy_trans_scatter",
+    ]
+    .map(|n| assets.compute_pipeline(&id(&format!("distantsunrises:{n}"))));
+    let [
+        Ok(copy),
+        Ok(reduce),
+        Ok(trans_clear),
+        Ok(cmdgen),
+        Ok(trans_prefix),
+        Ok(trans_scatter),
+    ] = ids
+    else {
         return;
     };
     let Some((hiz, _)) = ensure_hiz(host, [w, h]) else {
@@ -610,18 +672,45 @@ pub fn setup_compute(
             );
             (sw, sh) = (dw, dh);
         }
+        let clear_bindings =
+            DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
+        report(
+            "trans_clear dispatch",
+            ctx.dispatch(trans_clear, &clear_bindings, [1, 1, 1]),
+        );
         let params = cmdgen_params_bytes(view_proj, camera.position, sections, [w, h], mips, true);
         let bindings = DrawBindings::new()
             .inline_uniform("CmdgenParams", &params)
             .storage_buffer("SectionBuffer", slices.sections)
             .storage_buffer("OpaqueCommands", slices.opaque_commands)
             .storage_buffer("TranslucentCommands", slices.translucent_commands)
+            .storage_buffer("TransSortMeta", slices.trans_sort_meta)
+            .storage_buffer("TransSortEntries", slices.trans_sort_entries)
             .texture("HizPyramid", hiz.all_mips());
         report(
             "cmdgen dispatch",
             ctx.dispatch(
                 cmdgen,
                 &bindings,
+                [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
+            ),
+        );
+        let prefix_bindings =
+            DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
+        report(
+            "trans_prefix dispatch",
+            ctx.dispatch(trans_prefix, &prefix_bindings, [1, 1, 1]),
+        );
+        let scatter_bindings = DrawBindings::new()
+            .storage_buffer("SectionBuffer", slices.sections)
+            .storage_buffer("TranslucentCommands", slices.translucent_commands)
+            .storage_buffer("TransSortMeta", slices.trans_sort_meta)
+            .storage_buffer("TransSortEntries", slices.trans_sort_entries);
+        report(
+            "trans_scatter dispatch",
+            ctx.dispatch(
+                trans_scatter,
+                &scatter_bindings,
                 [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
             ),
         );
