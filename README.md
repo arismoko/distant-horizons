@@ -30,8 +30,11 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
   the pack-linked pipelines draw instead (`src/shader_pack.rs`).
 - **Storage.** Octree sections are stored as `DHLOD003` records (DH-exact palette and run layout with a
   CRC32) in crash-safe `.dhoct` region files under `<world_dir>/distant_sunrises/<dimension>/`
-  (`src/storage.rs`), written and loaded on a background IO worker. `src/dh_v2.rs` decodes Distant
-  Horizons' `FullDataSourceV2` payloads (LZ4, Zstd, LZMA2) for the public API.
+  (`src/storage.rs`), written and loaded on a background IO worker. Older v3 record slots are
+  cache misses and are replaced on the next save for that slot; generation can rebuild terrain,
+  but externally supplied terrain needs to be provided again by its producer.
+  `src/dh_v2.rs` decodes Distant Horizons' `FullDataSourceV2` payloads (LZ4, Zstd, LZMA2) for the
+  public API.
 - **Multiplayer: `octree_sync`.** `src/network.rs` (`octree_sync`) streams octree sections from a
   published server to remote clients over one raw, optional play channel
   (`distantsunrises:octree_sync`) in Distant Horizons' wire layout: session-config negotiation,
