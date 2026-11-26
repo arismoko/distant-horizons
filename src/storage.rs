@@ -1566,8 +1566,9 @@ struct OctreeSaveJob {
 }
 
 /// Accepted writes that failed since the previous barrier: the first contextual error and the
-/// total count. Each write is logged by the worker when it fails, so a barrier's caller reports
-/// only the count.
+/// total count. The worker logs each write when it fails, except an attempt refused by a
+/// quarantine fence: it counts here but is not logged again, because the original failed rename
+/// logged the fence. A barrier's caller therefore reports only the count.
 #[derive(Debug)]
 pub struct SaveFailure {
     section: String,
@@ -1597,8 +1598,8 @@ impl SaveFailure {
         self.count
     }
 
-    /// One failed accepted write, logged now. A quarantine refusal was already logged at the
-    /// failed rename.
+    /// One failed accepted write, logged now unless it is a quarantine-fenced attempt, which
+    /// still counts but was already logged once at the failed rename.
     fn logged(section: String, cause: io::Error) -> Self {
         if !RegionWriteRefused::matches(&cause) {
             eprintln!("DH: {section}: {cause}");
@@ -1856,7 +1857,8 @@ impl LodIoWorker {
         while st.reset_regions {
             st = self.shared.wake_flusher.wait(st).unwrap();
         }
-        // Failed writes were logged when they happened; a reset only discards the count.
+        // Failed writes were logged when they happened, except quarantine-fenced attempts
+        // (their fence was logged at the failed rename); a reset only discards the count.
         st.save_failure = None;
     }
 

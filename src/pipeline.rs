@@ -1126,8 +1126,9 @@ pub fn ingest_distant(
 /// or shut down) the flush stops and keeps that section and the rest unsaved. The first refusal
 /// and the first subsequent acceptance are logged. Nothing is retried within the flush.
 ///
-/// Accepted is not durable: a later disk failure is logged by the I/O worker and does not
-/// re-mark the section unsaved.
+/// Accepted is not durable: a later disk failure does not re-mark the section unsaved. The I/O
+/// worker logs it, except a write refused by a quarantine fence: that attempt counts as failed
+/// but is not logged again, since the original failed rename logged the fence.
 pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
     PIPELINE.lock().unwrap().flush_saves(io, world_dir, limit)
 }
@@ -1313,7 +1314,9 @@ impl Pipeline {
             })
             .map(|(dim, _)| dim.clone())
             .collect();
-        // The worker logged each failed write when it happened; only the count is summed here.
+        // The worker logged each failed write when it happened, except quarantine-fenced
+        // attempts, which count but were logged once at the failed rename; only the count is
+        // summed here.
         let mut failed = 0usize;
         if let Some(dir) = dir {
             for dim in &dims {
