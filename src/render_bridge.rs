@@ -787,7 +787,8 @@ impl TerrainGpu for dyn mod_api::ClientHost + '_ {
 
 /// Creates the arena on first use (ruling 2: it then survives reloads and world close),
 /// uploads pending sections and flushes metadata. Call from `client_tick_pre`. Errors are logged
-/// through [`report`]; the frame goes on without them.
+/// through [`report`]; the frame goes on without them. A retained arena whose buffers are
+/// unavailable is skipped quietly before any state or upload is touched.
 pub fn upload_pending(host: &mut dyn mod_api::ClientHost, config: ArenaConfig) {
     report("arena upload", try_upload_pending(host, config));
 }
@@ -825,7 +826,12 @@ fn try_upload_pending(
     config: ArenaConfig,
 ) -> Result<(), crate::gpu_arena::ArenaError> {
     let mut guard = ARENA.lock().unwrap();
-    if ArenaState::discard_if_retired(&mut guard, host)? {
+    let retained = ArenaState::discard_if_retired(&mut guard, host)?;
+    if retained == Retained::Unavailable {
+        // The host exists without mod GPU resources (#6138); nothing can be uploaded or mutated.
+        return Ok(());
+    }
+    if retained == Retained::Retired {
         // These storage, target, mesh and ticket handles were retired together by Sunrise.
         // Drop their mod-side state without reading or releasing the dead handles.
         PENDING_SECTIONS.lock().unwrap().clear();
@@ -964,20 +970,34 @@ pub(crate) fn invalidate_quad_mesh() {
     ArenaState::invalidate_quad_mesh(&mut ARENA.lock().unwrap());
 }
 
+/// What the retained-buffer probe found out about the arena slot.
+#[derive(Debug, PartialEq, Eq)]
+enum Retained {
+    /// No arena yet, or its request buffer answered.
+    Live,
+    /// Typed staleness: the arena was dropped from the slot.
+    Retired,
+    /// The host has no mod GPU resources right now; the arena is left untouched.
+    Unavailable,
+}
+
 impl<Arena, Mesh> ArenaState<Arena, Mesh> {
     fn discard_if_retired(
         slot: &mut Option<Self>,
         gpu: &(impl TerrainGpu<Arena = Arena> + ?Sized),
-    ) -> Result<bool, ArenaError> {
-        let Some(state) = slot else { return Ok(false) };
+    ) -> Result<Retained, ArenaError> {
+        let Some(state) = slot else {
+            return Ok(Retained::Live);
+        };
         // Unlike a generic unavailable context, Stale proves this retained generation is gone.
         // Storage survives ordinary reload, resize and world close on the renderer contract.
         match gpu.request_buffer_size(&state.arena) {
-            Ok(_) => Ok(false),
+            Ok(_) => Ok(Retained::Live),
             Err(mod_api::BufferError::Stale) => {
                 *slot = None;
-                Ok(true)
+                Ok(Retained::Retired)
             }
+            Err(mod_api::BufferError::Unavailable) => Ok(Retained::Unavailable),
             Err(error) => Err(error.into()),
         }
     }
@@ -1948,12 +1968,15 @@ mod tests {
         let old_arena = live.arena;
         let key = ("minecraft:overworld".into(), 0, [2, 0, -2]);
         live.ids.insert(key, 3);
-        assert!(!ArenaState::discard_if_retired(&mut slot, &host).unwrap());
+        assert_eq!(
+            ArenaState::discard_if_retired(&mut slot, &host).unwrap(),
+            Retained::Live
+        );
         host.available = false;
-        assert!(matches!(
-            ArenaState::discard_if_retired(&mut slot, &host),
-            Err(ArenaError::Buffer(BufferError::Unavailable))
-        ));
+        assert_eq!(
+            ArenaState::discard_if_retired(&mut slot, &host).unwrap(),
+            Retained::Unavailable
+        );
         assert_eq!(slot.as_ref().unwrap().ids.len(), 1);
 
         host.available = true;
@@ -1964,7 +1987,10 @@ mod tests {
         requests.service(&host, &old_arena);
         assert!(host.polled.borrow().is_empty());
         assert!(host.released.borrow().is_empty());
-        assert!(ArenaState::discard_if_retired(&mut slot, &host).unwrap());
+        assert_eq!(
+            ArenaState::discard_if_retired(&mut slot, &host).unwrap(),
+            Retained::Retired
+        );
         assert!(slot.is_none());
         let new = ensure_arena(&mut slot, &mut host, config).unwrap();
         assert_ne!(new.arena, old_arena);
