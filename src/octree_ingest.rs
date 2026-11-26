@@ -33,9 +33,8 @@ use std::hash::Hash;
 const VANILLA_SECTION: usize = 16;
 /// Vanilla biome storage is a 4×4×4 quart grid per section.
 const QUART: usize = 4;
-/// World-Y floor down to which G4 surface columns fill solid subsurface rock so steep mountains
-/// never leave hollow sky gaps underneath and coarse LODs never hang stalactites below `y = 0`
-/// (`vy = 0` at every octree detail level; greedy meshing culls all interior faces).
+/// World-Y floor for subsurface fill in surface estimates. For detached snapshots outside
+/// the Nether, intake skips only whole sections below this floor; it does not fill caves.
 pub const DISTANT_SOLID_FLOOR: i32 = 0;
 
 /// Where a chunk's voxels came from. The derived order is the priority order: `Loaded` wins.
@@ -68,10 +67,10 @@ pub trait ChunkVoxelSource {
     fn light(&self, lx: usize, y: i32, lz: usize) -> (u8, u8);
 }
 
-// NOTE: the section accessors used here (`section_count`, `section`, `SectionSnapshot::is_empty`
-// and `uniform_block`) follow the names in the G1 task brief; the SDK source was not available
-// in the authoring box, so they are unverified. Per-voxel access uses the signatures already used
-// in `lib.rs::sample_loaded_chunks`.
+// `min_y` and `section_count` give the snapshot's vertical extent. `section` and
+// `SectionSnapshot::uniform_block` read uniform states without scanning voxels. `block_state`,
+// `biome` and `light` use chunk-local X/Z and world Y. The adapter checks `has_light` and
+// falls back to `(15, 0)` when no light sample is available.
 impl ChunkVoxelSource for mod_api::ChunkSnapshot {
     type Block = mod_api::BlockState;
 
