@@ -1315,8 +1315,8 @@ pub fn prepare_draws(
         return;
     };
     let arena = &state.arena;
-    let sections = arena.section_high_water();
-    if !frame.enabled || sections == 0 {
+    let section_high_water = arena.section_high_water();
+    if !frame.enabled || section_high_water == 0 {
         return;
     }
     let assets = host.render_assets();
@@ -1497,7 +1497,7 @@ pub fn prepare_draws(
             PREPARED.lock().unwrap().push((OPAQUE_STAGE, batch));
         }
     }
-    record_frame_stats(sections as u64, arena.live_sections() as u64);
+    record_frame_stats(u64::from(section_high_water), arena.live_sections() as u64);
 }
 
 /// Issues the draws prepared for `stage`. Called from `Hooks::render_level_stage`.
@@ -1526,12 +1526,14 @@ pub struct RenderFrameParams {
     pub sun_brightness: f32,
 }
 
-/// Telemetry counters surfaced on the F3 debug screen (`RegisterDebugEntriesEvent`).
+/// Telemetry counters surfaced in F3 and `/ds status`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DhStats {
     pub active_sections: usize,
-    pub rendered_sections: u64,
-    pub rendered_quads: u64,
+    /// One past the highest occupied GPU section slot; includes holes.
+    pub section_high_water: u64,
+    /// Sections resident in the GPU arena, independent of draw visibility.
+    pub resident_sections: u64,
     pub generated_columns: u64,
     pub saved_sections: u64,
     pub frames_drawn: u64,
@@ -1540,8 +1542,8 @@ pub struct DhStats {
 /// Shared runtime state accessible from `Hooks` and the stage renderer.
 pub struct DhRuntime {
     pub enabled_flag: AtomicBool,
-    pub rendered_sections: AtomicU64,
-    pub rendered_quads: AtomicU64,
+    pub section_high_water: AtomicU64,
+    pub resident_sections: AtomicU64,
     pub saved_sections: AtomicU64,
     pub frames_drawn: AtomicU64,
     pub io: LodIoWorker,
@@ -1640,8 +1642,8 @@ pub fn runtime() -> &'static Arc<DhRuntime> {
     RUNTIME.get_or_init(|| {
         Arc::new(DhRuntime {
             enabled_flag: AtomicBool::new(true),
-            rendered_sections: AtomicU64::new(0),
-            rendered_quads: AtomicU64::new(0),
+            section_high_water: AtomicU64::new(0),
+            resident_sections: AtomicU64::new(0),
             saved_sections: AtomicU64::new(0),
             frames_drawn: AtomicU64::new(0),
             io: LodIoWorker::spawn(),
@@ -1690,16 +1692,17 @@ pub fn begin_render_frame(camera: [f64; 3]) -> RenderFrameParams {
     }
 }
 
-/// Called by `record_stage` at the end of a frame.
-pub fn record_frame_stats(rendered_sections: u64, rendered_quads: u64) {
+/// Record arena occupancy during draw preparation, before any draw is issued.
+pub fn record_frame_stats(section_high_water: u64, resident_sections: u64) {
     let rt = runtime();
-    rt.rendered_sections
-        .store(rendered_sections, Ordering::Relaxed);
-    rt.rendered_quads.store(rendered_quads, Ordering::Relaxed);
+    rt.section_high_water
+        .store(section_high_water, Ordering::Relaxed);
+    rt.resident_sections
+        .store(resident_sections, Ordering::Relaxed);
     rt.frames_drawn.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Snapshot stats for the F3 debug screen.
+/// Snapshot stats for F3 and `/ds status`.
 pub fn stats() -> DhStats {
     let rt = runtime();
     let st = rt.inner.lock().unwrap();
@@ -1716,8 +1719,8 @@ pub fn stats() -> DhStats {
         .unwrap_or(0);
     DhStats {
         active_sections,
-        rendered_sections: rt.rendered_sections.load(Ordering::Relaxed),
-        rendered_quads: rt.rendered_quads.load(Ordering::Relaxed),
+        section_high_water: rt.section_high_water.load(Ordering::Relaxed),
+        resident_sections: rt.resident_sections.load(Ordering::Relaxed),
         generated_columns,
         saved_sections: rt.saved_sections.load(Ordering::Relaxed),
         frames_drawn: rt.frames_drawn.load(Ordering::Relaxed),
