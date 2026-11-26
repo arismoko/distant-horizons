@@ -37,7 +37,7 @@ pub mod octree_sync {
     };
     use mod_api::{
         ClientHost, HandlerThread, IPayloadContext, IPayloadHandler, PayloadBytes,
-        PayloadHandleError, PayloadId, PlayerRef, Registrar, ServerHost,
+        PayloadHandleError, PayloadId, PayloadSendError, PlayerRef, Registrar, ServerHost,
     };
     use std::collections::{HashMap, VecDeque};
     use std::hash::Hash;
@@ -873,72 +873,64 @@ pub mod octree_sync {
 
     // ------------------------------------------------------------------ splitting, pacing, reassembly
 
-    struct PendingTransfer {
-        buffer_id: i32,
-        buffer: Vec<u8>,
-        offset: usize,
-        final_message: Vec<u8>,
+    type SectionKey = (String, OctreeSectionPos);
+    type EncodedUpdates = HashMap<(SectionKey, u64), Option<PendingTransfer>>;
+
+    #[derive(Clone)]
+    struct TransferRevision {
+        key: SectionKey,
+        revision: u64,
+        partial: bool,
     }
 
-    /// `FullDataPayloadSender`: a per-player queue that drains at the player's bandwidth limit
-    /// once per tick (`FullDataPayloadSender.java:54-95`).
+    #[derive(Clone)]
+    struct PendingTransfer {
+        buffer_id: i32,
+        buffer: Arc<[u8]>,
+        offset: usize,
+        final_message: Arc<[u8]>,
+        revision: Option<TransferRevision>,
+    }
+
+    impl PendingTransfer {
+        fn frame(&self, budget: usize) -> Option<(Vec<u8>, usize)> {
+            let remaining = self.buffer.len() - self.offset;
+            if remaining == 0 {
+                return Some((self.final_message.to_vec(), 0));
+            }
+            let chunk = budget.min(FULL_DATA_SPLIT_SIZE_IN_BYTES).min(remaining);
+            if chunk == 0 {
+                return None;
+            }
+            let split = Message::Split(SplitMessage {
+                buffer_id: self.buffer_id,
+                buffer: self.buffer[self.offset..self.offset + chunk].to_vec(),
+                is_first: self.offset == 0,
+            });
+            Some((split.encode().ok()?, chunk))
+        }
+    }
+
+    /// `FullDataPayloadSender`: one ordered, bandwidth-paced queue per player. Only advance a
+    /// split or finish its transfer after the connection accepts that frame.
     #[derive(Default)]
     pub struct PayloadSender {
         queue: VecDeque<PendingTransfer>,
     }
 
     impl PayloadSender {
-        /// Queue `buffer` for chunked sending; `final_message` (the encoded response or partial
-        /// update) is emitted right after its last chunk (`sendInChunks`, `:49-52`).
-        pub fn send_in_chunks(&mut self, buffer_id: i32, buffer: Vec<u8>, final_message: Vec<u8>) {
-            self.queue.push_back(PendingTransfer {
-                buffer_id,
-                buffer,
-                offset: 0,
-                final_message,
-            });
-        }
-
         pub fn is_idle(&self) -> bool {
             self.queue.is_empty()
         }
 
-        /// One 20 Hz tick. `max_kbps` is the effective `playerBandwidthLimit` (0 = unlimited).
-        /// Returns the encoded messages to send now, in order. Per tick the budget is
-        /// `kbps * 1000 / 20 + 1` bytes (`:60-62`) and each chunk is
-        /// `min(budget, 1_048_000, remaining)` (`:74`).
-        pub fn tick(&mut self, max_kbps: i32) -> Vec<Vec<u8>> {
-            let mut out = Vec::new();
-            let mut budget: i64 = if max_kbps > 0 {
-                i64::from(max_kbps) * 1000 / TICK_RATE + 1
+        /// Effective `playerBandwidthLimit` (0 = unlimited), per 20 Hz tick
+        /// (`FullDataPayloadSender.java:60-74`). Only split bytes count toward the budget.
+        fn budget(max_kbps: i32) -> usize {
+            if max_kbps > 0 {
+                (i64::from(max_kbps) * 1000 / TICK_RATE + 1) as usize
             } else {
-                i64::from(i32::MAX)
-            };
-            while budget > 0 {
-                let Some(pending) = self.queue.front_mut() else {
-                    break;
-                };
-                let remaining = pending.buffer.len() - pending.offset;
-                let chunk = (budget as usize)
-                    .min(FULL_DATA_SPLIT_SIZE_IN_BYTES)
-                    .min(remaining);
-                let split = Message::Split(SplitMessage {
-                    buffer_id: pending.buffer_id,
-                    buffer: pending.buffer[pending.offset..pending.offset + chunk].to_vec(),
-                    is_first: pending.offset == 0,
-                });
-                if let Ok(bytes) = split.encode() {
-                    out.push(bytes);
-                }
-                pending.offset += chunk;
-                budget -= chunk as i64;
-                if pending.offset == pending.buffer.len()
-                    && let Some(done) = self.queue.pop_front()
-                {
-                    out.push(done.final_message);
-                }
+                i32::MAX as usize
             }
-            out
         }
     }
 
@@ -1070,12 +1062,20 @@ pub mod octree_sync {
         axis(block_x, ox).max(axis(block_z, oz)) / 16
     }
 
-    /// `ServerPlayerState`: negotiated session config, limiters, and the chunked sender.
+    #[derive(Default)]
+    struct Receipt {
+        sent: Option<u64>,
+        queued_full: usize,
+    }
+
+    /// `ServerPlayerState`: negotiated config, limiters, and revisions eligible for live updates.
     pub struct PlayerSyncState {
         server_config: SessionConfig,
         effective: Option<SessionConfig>,
         limiters: LimiterSet,
         pub sender: PayloadSender,
+        receipts: HashMap<SectionKey, Receipt>,
+        deferred: HashMap<SectionKey, u64>,
     }
 
     impl PlayerSyncState {
@@ -1085,6 +1085,8 @@ pub mod octree_sync {
                 effective: None,
                 limiters: LimiterSet::default(),
                 sender: PayloadSender::default(),
+                receipts: HashMap::new(),
+                deferred: HashMap::new(),
             }
         }
 
@@ -1212,6 +1214,108 @@ pub mod octree_sync {
                 .unwrap_or(self.server_config)
                 .player_bandwidth_limit
         }
+
+        fn partial_in_range(
+            &self,
+            key: &SectionKey,
+            location: Option<&(String, i32, i32)>,
+        ) -> bool {
+            location.is_some_and(|(level, x, z)| {
+                *level == key.0 && self.wants_partial_update(key.1, *x, *z)
+            })
+        }
+
+        fn prepare_transfer<K>(
+            &mut self,
+            location: Option<&(String, i32, i32)>,
+            source: &dyn ServerSource<K>,
+            encoded: &mut EncodedUpdates,
+            budget: usize,
+        ) {
+            // Recheck eligibility at the start. Once the receiver has any split bytes, finish
+            // the transfer even if the player moves, rather than strand a receive buffer.
+            if let Some(front) = self.sender.queue.front()
+                && front.offset == 0
+                && let Some(rev) = &front.revision
+                && rev.partial
+            {
+                if !self.partial_in_range(&rev.key, location) {
+                    self.deferred.remove(&rev.key);
+                    self.sender.queue.pop_front();
+                } else if self.sender.queue.len() > 1
+                    || self.deferred.get(&rev.key) != Some(&rev.revision)
+                {
+                    self.sender.queue.pop_front();
+                }
+            }
+            if budget == 0 || !self.sender.is_idle() {
+                return;
+            }
+            while let Some((key, &revision)) = self.deferred.iter().next() {
+                let key = key.clone();
+                if self.partial_in_range(&key, location) {
+                    let transfer = encoded.entry((key.clone(), revision)).or_insert_with(|| {
+                        let dto = source.section_dto(&key.0, key.1)?;
+                        if dto.last_modified as u64 != revision {
+                            return None;
+                        }
+                        let (payload, buffer) = OctreePayload::new(&dto, Vec::new()).ok()?;
+                        let buffer_id = payload.buffer_id;
+                        let final_message = Message::PartialUpdate(OctreePartialUpdate {
+                            level: key.0.clone(),
+                            payload,
+                        })
+                        .encode()
+                        .ok()?;
+                        Some(PendingTransfer {
+                            buffer_id,
+                            buffer: buffer.into(),
+                            offset: 0,
+                            final_message: final_message.into(),
+                            revision: Some(TransferRevision {
+                                key: key.clone(),
+                                revision,
+                                partial: true,
+                            }),
+                        })
+                    });
+                    if let Some(transfer) = transfer {
+                        self.sender.queue.push_back(transfer.clone());
+                        break;
+                    }
+                }
+                self.deferred.remove(&key);
+            }
+        }
+
+        fn finish_transfer(&mut self, transfer: PendingTransfer, accepted: bool) {
+            let Some(TransferRevision {
+                key,
+                revision,
+                partial,
+            }) = transfer.revision
+            else {
+                return;
+            };
+            let receipt = self.receipts.get_mut(&key).unwrap();
+            if !partial {
+                receipt.queued_full -= 1;
+            }
+            if accepted {
+                receipt.sent = Some(receipt.sent.map_or(revision, |sent| sent.max(revision)));
+            }
+            if receipt.sent.is_none() && receipt.queued_full == 0 {
+                // A permanently refused initial reply must not subscribe this key.
+                self.receipts.remove(&key);
+                self.deferred.remove(&key);
+            } else if self
+                .deferred
+                .get(&key)
+                .is_some_and(|&pending| (accepted || partial) && pending <= revision)
+            {
+                self.deferred.remove(&key);
+            }
+        }
     }
 
     /// What the server backend provides to the sync layer.
@@ -1223,9 +1327,12 @@ pub mod octree_sync {
         fn player_block_xz(&self, player: K) -> Option<(i32, i32)>;
     }
 
+    pub(crate) type PlayerLocations<K> = HashMap<K, (String, i32, i32)>;
+
     /// All players' sync state on the server.
     pub struct ServerSyncRegistry<K> {
         server_config: SessionConfig,
+        open: bool,
         players: HashMap<K, PlayerSyncState>,
     }
 
@@ -1233,16 +1340,58 @@ pub mod octree_sync {
         pub fn new(server_config: SessionConfig) -> Self {
             Self {
                 server_config,
+                open: false,
                 players: HashMap::new(),
             }
+        }
+
+        fn set_open(&mut self, open: bool) {
+            self.players.clear();
+            self.open = open;
         }
 
         pub fn remove_player(&mut self, player: K) {
             self.players.remove(&player);
         }
 
+        fn receive(
+            &mut self,
+            player: impl FnOnce() -> Result<K, mod_api::PayloadContextError>,
+            message: Message,
+            now: Instant,
+            source: &dyn ServerSource<K>,
+        ) -> Result<Vec<Message>, mod_api::PayloadContextError> {
+            if !self.open {
+                return Ok(Vec::new());
+            }
+            // Resolve the live play epoch under the same lock as logout. Negotiation stays
+            // lazy: a remote connection can send config as soon as its PlayerRef is bound,
+            // before player_logged_in. The server closes intake before orderly stop logout.
+            Ok(self.handle(player()?, message, now, source))
+        }
+
         pub fn player(&self, player: K) -> Option<&PlayerSyncState> {
             self.players.get(&player)
+        }
+
+        fn remove_level(&mut self, level: &str) {
+            for state in self.players.values_mut() {
+                state.receipts.retain(|(d, _), _| d != level);
+                state.deferred.retain(|(d, _), _| d != level);
+                state.sender.queue.retain_mut(|transfer| {
+                    if let Some(rev) = &transfer.revision
+                        && rev.key.0 == level
+                    {
+                        if rev.partial {
+                            return false;
+                        }
+                        // Keep the admitted request's response, but it cannot reestablish a
+                        // receipt for the retired level.
+                        transfer.revision = None;
+                    }
+                    true
+                });
+            }
         }
 
         /// Handle one clientbound-visible message from `player`; returns immediate replies.
@@ -1293,9 +1442,19 @@ pub mod octree_sync {
                             });
                             match response.encode() {
                                 Ok(final_message) => {
-                                    state
-                                        .sender
-                                        .send_in_chunks(buffer_id, buffer, final_message);
+                                    let key = (req.level, req.pos);
+                                    state.receipts.entry(key.clone()).or_default().queued_full += 1;
+                                    state.sender.queue.push_back(PendingTransfer {
+                                        buffer_id,
+                                        buffer: buffer.into(),
+                                        offset: 0,
+                                        final_message: final_message.into(),
+                                        revision: Some(TransferRevision {
+                                            key,
+                                            revision: dto.last_modified as u64,
+                                            partial: false,
+                                        }),
+                                    });
                                     Vec::new()
                                 }
                                 Err(_) => vec![not_modified],
@@ -1308,47 +1467,102 @@ pub mod octree_sync {
             }
         }
 
-        /// Queue one live edit for every `(player, block_x, block_z)` in `players` (already
-        /// restricted to the edited level) that wants it; one shared buffer id like
-        /// `AbstractDhServerLevel.java:252-274`. Returns how many players were queued.
-        pub fn queue_partial_update(
+        /// Record only actual mutations, not disk adoption or render dirtiness. A pending full
+        /// response can qualify a key, but it must clear the sender before a partial can start.
+        fn queue_partial_update(
             &mut self,
             level: &str,
-            dto: &OctreeSectionDto,
-            beacon_beams: Vec<BeaconBeam>,
-            players: &[(K, i32, i32)],
-        ) -> Result<usize, SyncError> {
-            let (payload, buffer) = OctreePayload::new(dto, beacon_beams)?;
-            let buffer_id = payload.buffer_id;
-            let final_message = Message::PartialUpdate(OctreePartialUpdate {
-                level: level.to_owned(),
-                payload,
-            })
-            .encode()?;
-            let mut queued = 0;
-            for &(key, x, z) in players {
-                if let Some(state) = self.players.get_mut(&key)
-                    && state.wants_partial_update(dto.pos, x, z)
-                {
-                    state
-                        .sender
-                        .send_in_chunks(buffer_id, buffer.clone(), final_message.clone());
-                    queued += 1;
+            changes: impl IntoIterator<Item = (OctreeSectionPos, u64)>,
+            players: &PlayerLocations<K>,
+        ) {
+            for (pos, revision) in changes {
+                let key = (level.to_owned(), pos);
+                for (&player, (dimension, x, z)) in players {
+                    if dimension == level
+                        && let Some(state) = self.players.get_mut(&player)
+                        && state.wants_partial_update(pos, *x, *z)
+                        && let Some(receipt) = state.receipts.get(&key)
+                        && receipt.sent.is_none_or(|sent| revision > sent)
+                    {
+                        state
+                            .deferred
+                            .entry(key.clone())
+                            .and_modify(|rev| {
+                                *rev = (*rev).max(revision);
+                            })
+                            .or_insert(revision);
+                    }
                 }
             }
-            Ok(queued)
         }
 
-        /// One 20 Hz server tick: the messages each player's bandwidth budget allows now.
-        pub fn tick(&mut self) -> Vec<(K, Vec<Vec<u8>>)> {
-            self.players
-                .iter_mut()
-                .filter_map(|(&key, state)| {
-                    let kbps = state.bandwidth_kbps();
-                    let msgs = state.sender.tick(kbps);
-                    (!msgs.is_empty()).then_some((key, msgs))
-                })
-                .collect()
+        /// Pace full replies and partials through the same queue. No host send holds the
+        /// registry: a network callback can append full replies while a frame is in flight.
+        fn tick(
+            registry: &Mutex<Self>,
+            locations: &PlayerLocations<K>,
+            source: &dyn ServerSource<K>,
+            mut send: impl FnMut(K, Vec<u8>) -> Result<(), PayloadSendError>,
+        ) -> u32 {
+            let players: Vec<_> = registry
+                .lock()
+                .unwrap()
+                .players
+                .iter()
+                .map(|(&k, state)| (k, PayloadSender::budget(state.bandwidth_kbps())))
+                .collect();
+            let mut encoded = EncodedUpdates::new();
+            let mut sent = 0;
+            for (player, mut budget) in players {
+                loop {
+                    let (id, bytes, chunk) = {
+                        let mut registry = registry.lock().unwrap();
+                        let Some(state) = registry.players.get_mut(&player) else {
+                            break;
+                        };
+                        let location = locations.get(&player);
+                        state.prepare_transfer(location, source, &mut encoded, budget);
+                        let Some(front) = state.sender.queue.front() else {
+                            break;
+                        };
+                        let Some((bytes, chunk)) = front.frame(budget) else {
+                            break;
+                        };
+                        (front.buffer_id, bytes, chunk)
+                    };
+                    let result = send(player, bytes);
+                    let accepted = result.is_ok();
+                    if accepted {
+                        sent += 1;
+                        budget -= chunk;
+                    }
+                    if matches!(result, Err(PayloadSendError::Backpressure)) {
+                        // Leave the offset/final message in place. An unstarted partial can
+                        // still be superseded by a newer revision or an intervening full reply.
+                        break;
+                    }
+                    let mut registry = registry.lock().unwrap();
+                    let Some(state) = registry.players.get_mut(&player) else {
+                        break;
+                    };
+                    if let Some(front) = state.sender.queue.front_mut()
+                        && front.buffer_id == id
+                    {
+                        if accepted && chunk != 0 {
+                            front.offset += chunk;
+                        } else {
+                            let done = state.sender.queue.pop_front().unwrap();
+                            state.finish_transfer(done, accepted);
+                        }
+                    } else {
+                        break;
+                    }
+                    if !accepted {
+                        break;
+                    }
+                }
+            }
+            sent
         }
     }
 
@@ -1547,9 +1761,28 @@ pub mod octree_sync {
         let _ = server_source().set(source);
     }
 
+    pub(crate) fn set_server_open(open: bool) {
+        server_registry().lock().unwrap().set_open(open);
+    }
+
     /// Forget a player's state on logout (`ServerPlayerState` lives per connection in DH).
     pub fn remove_player(player: PlayerRef) {
         server_registry().lock().unwrap().remove_player(player);
+    }
+
+    pub(crate) fn remove_level(level: &str) {
+        server_registry().lock().unwrap().remove_level(level);
+    }
+
+    pub(crate) fn publish_changes(
+        level: &str,
+        changes: impl IntoIterator<Item = (OctreeSectionPos, u64)>,
+        locations: &PlayerLocations<PlayerRef>,
+    ) {
+        server_registry()
+            .lock()
+            .unwrap()
+            .queue_partial_update(level, changes, locations);
     }
 
     /// Declare the optional raw play channel during `Hooks::register`. Not `droppable`: a dropped
@@ -1577,16 +1810,14 @@ pub mod octree_sync {
         ) -> Result<(), PayloadHandleError> {
             let failed = |e: String| PayloadHandleError::Failed(e);
             let msg = Message::decode(&payload.0).map_err(|e| failed(format!("{e:?}")))?;
-            let player = context.player().map_err(|e| failed(format!("{e:?}")))?;
             let Some(source) = server_source().get() else {
                 return Ok(());
             };
-            let replies = server_registry().lock().unwrap().handle(
-                player,
-                msg,
-                Instant::now(),
-                source.as_ref(),
-            );
+            let replies = server_registry()
+                .lock()
+                .unwrap()
+                .receive(|| context.player(), msg, Instant::now(), source.as_ref())
+                .map_err(|e| failed(format!("{e:?}")))?;
             for reply in replies {
                 if let Ok(bytes) = reply.encode() {
                     let _ = context.reply(&octree_sync_channel_id(), PayloadBytes(bytes));
@@ -1646,19 +1877,24 @@ pub mod octree_sync {
     }
 
     /// Drain every player's budget for this server tick (20 Hz).
-    pub fn server_tick(host: &mut dyn ServerHost) -> u32 {
-        let out = server_registry().lock().unwrap().tick();
-        let mut sent = 0;
-        for (player, messages) in out {
-            for message in messages {
-                sent += host.players_send_payload(
-                    &[player],
-                    &octree_sync_channel_id(),
-                    PayloadBytes(message),
-                );
-            }
-        }
-        sent
+    pub(crate) fn server_tick(
+        host: &mut dyn ServerHost,
+        locations: &PlayerLocations<PlayerRef>,
+    ) -> u32 {
+        let Some(source) = server_source().get() else {
+            return 0;
+        };
+        let channel = octree_sync_channel_id();
+        ServerSyncRegistry::tick(
+            server_registry(),
+            locations,
+            source.as_ref(),
+            |player, message| {
+                player
+                    .send_payload(host, &channel, PayloadBytes(message))
+                    .map(|_| ())
+            },
+        )
     }
 
     // ------------------------------------------------------------------ tests
@@ -1793,6 +2029,14 @@ pub mod octree_sync {
         struct Fake {
             dto: OctreeSectionDto,
         }
+        impl Fake {
+            fn of(section: &OctreeSection, mode: DhV2CompressionMode) -> Self {
+                Self {
+                    dto: OctreeSectionDto::from_section(section, &[], mode, 0).unwrap(),
+                }
+            }
+        }
+
         impl ServerSource<u32> for Fake {
             fn section_timestamp(&self, _: &str, _: OctreeSectionPos) -> Option<i64> {
                 Some(self.dto.last_modified)
@@ -1803,6 +2047,22 @@ pub mod octree_sync {
             fn player_block_xz(&self, _: u32) -> Option<(i32, i32)> {
                 Some((0, 0))
             }
+        }
+
+        fn wire_tick(
+            registry: &mut ServerSyncRegistry<u32>,
+            locations: &PlayerLocations<u32>,
+            source: &Fake,
+        ) -> HashMap<u32, Vec<Vec<u8>>> {
+            let config = registry.server_config;
+            let locked = Mutex::new(std::mem::replace(registry, ServerSyncRegistry::new(config)));
+            let mut wire = HashMap::<_, Vec<_>>::new();
+            ServerSyncRegistry::tick(&locked, locations, source, |player, bytes| {
+                wire.entry(player).or_default().push(bytes);
+                Ok(())
+            });
+            *registry = locked.into_inner().unwrap();
+            wire
         }
 
         #[test]
@@ -1881,7 +2141,9 @@ pub mod octree_sync {
                         .handle(1, Message::decode(&req).unwrap(), now, &source)
                         .is_empty()
                 );
-                let wire = registry.tick().pop().unwrap().1;
+                let wire = wire_tick(&mut registry, &HashMap::new(), &source)
+                    .remove(&1)
+                    .unwrap();
                 let events = deliver(&mut client, wire, now);
                 let [
                     ClientEvent::Section {
@@ -1964,10 +2226,28 @@ pub mod octree_sync {
                     x as u8
                 })
                 .collect();
-            let mut sender = PayloadSender::default();
-            sender.send_in_chunks(9, buffer.clone(), vec![0xAA]);
-            let wire = sender.tick(0);
-            assert!(sender.is_idle());
+            let cfg = SessionConfig {
+                player_bandwidth_limit: 0,
+                ..SessionConfig::default()
+            };
+            let mut registry = ServerSyncRegistry::new(cfg);
+            let mut state = PlayerSyncState::new(cfg);
+            state.sender.queue.push_back(PendingTransfer {
+                buffer_id: 9,
+                buffer: buffer.clone().into(),
+                offset: 0,
+                final_message: vec![0xAA].into(),
+                revision: None,
+            });
+            registry.players.insert(1, state);
+            let source = Fake::of(
+                &OctreeSection::new(OctreeSectionPos::new(0, 0, 0, 0)),
+                DEFAULT_COMPRESSION,
+            );
+            let wire = wire_tick(&mut registry, &HashMap::new(), &source)
+                .remove(&1)
+                .unwrap();
+            assert!(registry.players[&1].sender.is_idle());
             assert_eq!(wire.len(), 4); // 3 split messages + the final message
             assert_eq!(wire[3], vec![0xAA]);
             let mut receiver = SplitReceiver::default();
@@ -2015,7 +2295,7 @@ pub mod octree_sync {
             while events.is_empty() {
                 ticks += 1;
                 assert!(ticks < 100);
-                for (_, wire) in registry.tick() {
+                for (_, wire) in wire_tick(&mut registry, &HashMap::new(), &source) {
                     events.extend(deliver(&mut client, wire, t0));
                 }
             }
@@ -2047,7 +2327,11 @@ pub mod octree_sync {
             registry.handle(1, Message::decode(&req).unwrap(), now, &source);
             let mut all = Vec::new();
             while all.is_empty() || !registry.player(1).unwrap().sender.is_idle() {
-                all.extend(registry.tick().into_iter().flat_map(|(_, w)| w));
+                all.extend(
+                    wire_tick(&mut registry, &HashMap::new(), &source)
+                        .into_values()
+                        .flatten(),
+                );
             }
             all.remove(1); // lose a middle chunk
             let mut failure = None;
@@ -2063,58 +2347,317 @@ pub mod octree_sync {
         #[test]
         fn partial_update_roundtrips_and_respects_real_time_settings() {
             let pos = OctreeSectionPos::new(0, 10, 0, 0);
-            let section = varied_section(pos, 40);
-            let dto =
-                OctreeSectionDto::from_section(&section, &[], DEFAULT_COMPRESSION, 0).unwrap();
+            let mut section = varied_section(pos, 40);
+            let mut source = Fake::of(&section, DEFAULT_COMPRESSION);
             let beams = vec![BeaconBeam {
                 x: 1,
                 y: 2,
                 z: 3,
                 argb: -16711936,
             }];
-            let (payload, _) = OctreePayload::new(&dto, beams).unwrap();
+            let (payload, _) = OctreePayload::new(&source.dto, beams).unwrap();
             let msg = Message::PartialUpdate(OctreePartialUpdate {
                 level: LEVEL.into(),
                 payload,
             });
             assert_eq!(Message::decode(&msg.encode().unwrap()).unwrap(), msg);
 
+            const NETHER: &str = "minecraft:the_nether";
             let mut registry = ServerSyncRegistry::<u32>::new(SessionConfig::default());
-            let source = Fake { dto: dto.clone() };
             let now = Instant::now();
-            for p in [1, 2] {
-                registry.handle(
-                    p,
-                    Message::SessionConfig(SessionConfig::default()),
-                    now,
-                    &source,
+            let mut client = ClientSession::default();
+            for p in [1, 2, 4, 5, 6, 7, 8] {
+                let cfg = SessionConfig {
+                    enable_real_time_updates: p != 5,
+                    ..SessionConfig::default()
+                };
+                registry.handle(p, Message::SessionConfig(cfg), now, &source);
+                if p == 6 {
+                    continue;
+                }
+                let level = if p == 8 { NETHER } else { LEVEL };
+                let timestamp = (p == 7).then_some(source.dto.last_modified);
+                let request = if p == 1 {
+                    Message::decode(&client.request(level, pos, timestamp).unwrap()).unwrap()
+                } else {
+                    Message::Request(OctreeSectionRequest {
+                        future_id: 0,
+                        level: level.into(),
+                        pos,
+                        client_timestamp: timestamp,
+                    })
+                };
+                let replies = registry.handle(p, request, now, &source);
+                if p == 7 {
+                    assert!(matches!(
+                        replies.as_slice(),
+                        [Message::Response(OctreeSectionResponse {
+                            payload: None,
+                            ..
+                        })]
+                    ));
+                } else {
+                    assert!(replies.is_empty());
+                }
+            }
+            // All real replies have cleared the sender. Only 1 qualifies below (2 is far,
+            // 3 unnegotiated, 4 in another dimension, 5 opted out, 6 unserved, 7 unchanged,
+            // and 8 received the same position in a different level).
+            let locations = HashMap::from([
+                (1, (LEVEL.into(), 330, 0)),
+                (2, (LEVEL.into(), 100_000, 0)),
+                (3, (LEVEL.into(), 330, 0)),
+                (4, (NETHER.into(), 330, 0)),
+                (5, (LEVEL.into(), 330, 0)),
+                (6, (LEVEL.into(), 330, 0)),
+                (7, (LEVEL.into(), 330, 0)),
+                (8, (LEVEL.into(), 330, 0)),
+            ]);
+            let initial = wire_tick(&mut registry, &locations, &source)
+                .remove(&1)
+                .unwrap();
+            assert!(matches!(
+                deliver(&mut client, initial, now).as_slice(),
+                [ClientEvent::Section { .. }]
+            ));
+
+            section.set(0, 5, 0, Voxel::new(2, 0, 15, 0)); // refinement
+            let refined = section.clone();
+            section.set(0, 5, 0, Voxel::new(3, 0, 15, 0)); // live edit
+            let mut cleared = OctreeSection::new(pos); // an authored clearing revision
+            cleared.revision = section.revision + 1;
+            for change in [refined, section, cleared] {
+                source = Fake::of(&change, DEFAULT_COMPRESSION);
+                registry.queue_partial_update(LEVEL, [(pos, change.revision)], &locations);
+                let mut out = wire_tick(&mut registry, &locations, &source);
+                assert_eq!(out.len(), 1);
+                let events = deliver(&mut client, out.remove(&1).unwrap(), now);
+                let [
+                    ClientEvent::PartialUpdate {
+                        level,
+                        section: got,
+                        ..
+                    },
+                ] = events.as_slice()
+                else {
+                    panic!("{events:?}")
+                };
+                assert_eq!(level, LEVEL);
+                assert_eq!(got.revision, change.revision);
+                assert_eq!(got.to_dense(), change.to_dense());
+
+                registry.queue_partial_update(LEVEL, [(pos, change.revision)], &locations);
+                assert!(wire_tick(&mut registry, &locations, &source).is_empty());
+            }
+
+            registry.remove_level(LEVEL);
+            registry.queue_partial_update(
+                LEVEL,
+                [(pos, source.dto.last_modified as u64 + 1)],
+                &locations,
+            );
+            assert!(registry.players[&1].receipts.is_empty());
+            assert!(registry.players[&1].deferred.is_empty());
+            assert!(
+                registry.players[&8]
+                    .receipts
+                    .contains_key(&(NETHER.to_owned(), pos))
+            );
+        }
+
+        #[test]
+        fn backpressure_preserves_split_order_and_the_newest_deferred_revision() {
+            let pos = OctreeSectionPos::new(0, 0, 0, 0);
+            let cfg = SessionConfig {
+                player_bandwidth_limit: 1,
+                ..SessionConfig::default()
+            };
+            let mut section = varied_section(pos, 60);
+            let mode = DhV2CompressionMode::Uncompressed;
+            let mut source = Fake::of(&section, mode);
+            let mut state = ServerSyncRegistry::<u32>::new(cfg);
+            let locations = HashMap::from([(1, (LEVEL.into(), 0, 0))]);
+            let mut client = ClientSession::default();
+            let now = Instant::now();
+            state.handle(1, Message::SessionConfig(cfg), now, &source);
+            let req = Message::decode(&client.request(LEVEL, pos, None).unwrap()).unwrap();
+            state.handle(1, req, now, &source);
+            let registry = Mutex::new(state);
+
+            let mut wire = Vec::new();
+            // The first full is still queued when refinement arrives.
+            section.revision = 78;
+            source = Fake::of(&section, mode);
+            registry
+                .lock()
+                .unwrap()
+                .queue_partial_update(LEVEL, [(pos, 78)], &locations);
+            let mut request =
+                Some(Message::decode(&client.request(LEVEL, pos, None).unwrap()).unwrap());
+            let later = now + Duration::from_secs(1);
+            for _ in 0..100 {
+                ServerSyncRegistry::tick(&registry, &locations, &source, |player, bytes| {
+                    if let Message::Split(_) = Message::decode(&bytes).unwrap()
+                        && registry.lock().unwrap().players[&player]
+                            .sender
+                            .queue
+                            .front()
+                            .unwrap()
+                            .revision
+                            .as_ref()
+                            .unwrap()
+                            .partial
+                    {
+                        // This partial has not started. An off-thread request appends a full
+                        // reply while the registry lock is released around the refused send.
+                        registry.lock().unwrap().handle(
+                            player,
+                            request.take().unwrap(),
+                            later,
+                            &source,
+                        );
+                        return Err(PayloadSendError::Backpressure);
+                    }
+                    wire.push(bytes);
+                    Ok(())
+                });
+                if request.is_none() {
+                    break;
+                }
+            }
+            assert!(request.is_none());
+
+            // Coalesce 79 away while the admitted 78 full reply goes first. Then pause the
+            // final frame of the 80 partial after its split bytes were accepted.
+            for revision in [79, 80] {
+                registry
+                    .lock()
+                    .unwrap()
+                    .queue_partial_update(LEVEL, [(pos, revision)], &locations);
+            }
+            section.revision = 80;
+            source = Fake::of(&section, mode);
+            let mut refused_final = false;
+            for _ in 0..100 {
+                ServerSyncRegistry::tick(&registry, &locations, &source, |_, bytes| {
+                    match Message::decode(&bytes).unwrap() {
+                        Message::Split(split) => assert!(split.buffer.len() <= 51),
+                        Message::PartialUpdate(_) => {
+                            refused_final = true;
+                            return Err(PayloadSendError::Backpressure);
+                        }
+                        _ => {}
+                    }
+                    wire.push(bytes);
+                    Ok(())
+                });
+                if refused_final {
+                    break;
+                }
+            }
+            assert!(refused_final);
+
+            section.revision = 81;
+            source = Fake::of(&section, mode);
+            registry
+                .lock()
+                .unwrap()
+                .queue_partial_update(LEVEL, [(pos, 81)], &locations);
+            for _ in 0..100 {
+                if ServerSyncRegistry::tick(&registry, &locations, &source, |_, bytes| {
+                    wire.push(bytes);
+                    Ok(())
+                }) == 0
+                {
+                    break;
+                }
+            }
+            let events = deliver(&mut client, wire, now);
+            let revisions: Vec<_> = events
+                .iter()
+                .map(|event| match event {
+                    ClientEvent::Section { section, .. } => (false, section.revision),
+                    ClientEvent::PartialUpdate { section, .. } => (true, section.revision),
+                    _ => panic!("{event:?}"),
+                })
+                .collect();
+            assert_eq!(
+                revisions,
+                [(false, 77), (false, 78), (true, 80), (true, 81)]
+            );
+        }
+
+        #[test]
+        fn refused_full_and_retired_player_do_not_receive_updates() {
+            let now = Instant::now();
+            let pos = OctreeSectionPos::new(0, 0, 0, 0);
+            let source = Fake::of(&varied_section(pos, 4), DEFAULT_COMPRESSION);
+            let cfg = SessionConfig::default();
+            let mut state = ServerSyncRegistry::new(cfg);
+            state.set_open(true);
+            for player in [1, 2] {
+                // A valid play context can negotiate before the main-thread login notification.
+                assert_eq!(
+                    state
+                        .receive(|| Ok(player), Message::SessionConfig(cfg), now, &source)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                let request = Message::Request(OctreeSectionRequest {
+                    future_id: 0,
+                    level: LEVEL.into(),
+                    pos,
+                    client_timestamp: None,
+                });
+                assert!(
+                    state
+                        .receive(|| Ok(player), request, now, &source)
+                        .unwrap()
+                        .is_empty()
                 );
             }
-            // Section at x blocks 320..352: player 1 is next to it, player 2 is >256 chunks away.
-            let queued = registry
-                .queue_partial_update(
-                    LEVEL,
-                    &dto,
-                    Vec::new(),
-                    &[(1, 330, 0), (2, 100_000, 0), (3, 0, 0)],
-                )
-                .unwrap();
-            assert_eq!(queued, 1);
-            let mut client = ClientSession::default();
-            let wire = registry.tick().pop().unwrap().1;
-            let events = deliver(&mut client, wire, now);
-            let [
-                ClientEvent::PartialUpdate {
-                    level,
-                    section: got,
-                    ..
-                },
-            ] = events.as_slice()
-            else {
-                panic!()
-            };
-            assert_eq!(level, LEVEL);
-            assert_eq!(got.to_dense(), section.to_dense());
+            let locations = HashMap::from([(1, (LEVEL.into(), 0, 0)), (2, (LEVEL.into(), 0, 0))]);
+            state.queue_partial_update(LEVEL, [(pos, 78)], &locations);
+            let registry = Mutex::new(state);
+            ServerSyncRegistry::tick(&registry, &locations, &source, |player, _| {
+                if player == 1 {
+                    Err(PayloadSendError::UnsupportedPeer(octree_sync_channel_id()))
+                } else {
+                    Err(PayloadSendError::Backpressure)
+                }
+            });
+            let mut state = registry.into_inner().unwrap();
+            assert!(state.players[&1].receipts.is_empty());
+            assert!(state.players[&1].deferred.is_empty());
+            assert!(state.players[&1].sender.is_idle());
+            assert!(!state.players[&2].deferred.is_empty());
+            state.remove_player(2);
+            assert!(state.player(2).is_none());
+            assert!(
+                state
+                    .receive(
+                        || Err(mod_api::PayloadContextError::Disconnected),
+                        Message::SessionConfig(cfg),
+                        now,
+                        &source
+                    )
+                    .is_err()
+            );
+            assert!(state.player(2).is_none());
+            state.set_open(false);
+            assert!(
+                state
+                    .receive(
+                        || panic!("stopping server must not resolve the old epoch"),
+                        Message::SessionConfig(cfg),
+                        now,
+                        &source
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(state.players.is_empty());
         }
 
         #[test]
