@@ -614,13 +614,14 @@ pub fn ingest_distant(
         return;
     }
     let water = p.mapper.block_named(host, "minecraft:water");
+    let stone = p.mapper.block_named(host, "minecraft:stone");
     let store = p.stores.entry(dim.to_owned()).or_default();
     let mapper = std::cell::RefCell::new(&mut p.mapper);
     let mut block = |key| mapper.borrow_mut().block_key(host, key);
     let mut biome = |name: &str| mapper.borrow_mut().biome(name);
     let touched = if detail == 0 {
         crate::octree_ingest::ingest_distant_columns(
-            store, &columns, water, &mut block, &mut biome,
+            store, &columns, water, stone, &mut block, &mut biome,
         );
         let mapper = &p.mapper;
         p.stores
@@ -628,7 +629,7 @@ pub fn ingest_distant(
             .expect("store inserted above")
             .propagate_dirty(&|id| mapper.opacity(id))
     } else {
-        store.ingest_coarse_columns(detail, &columns, water, &mut block, &mut biome)
+        store.ingest_coarse_columns(detail, &columns, water, stone, &mut block, &mut biome)
     };
     p.unsaved
         .entry(dim.to_owned())

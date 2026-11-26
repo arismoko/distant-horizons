@@ -34,10 +34,10 @@ use std::hash::Hash;
 const VANILLA_SECTION: usize = 16;
 /// Vanilla biome storage is a 4×4×4 quart grid per section.
 const QUART: usize = 4;
-/// Solid voxels written under a G4 surface column so steep cliffs and mountain ridges stay
-/// solid instead of showing sky gaps underneath (`24` blocks at detail 0, `24 * 2^level` at
-/// coarse levels; greedy meshing culls all interior faces).
-pub const DISTANT_SOLID_DEPTH: i32 = 24;
+/// World-Y floor down to which G4 surface columns fill solid subsurface rock so steep mountains
+/// never leave hollow sky gaps underneath and coarse LODs never hang stalactites below `y = 0`
+/// (`vy = 0` at every octree detail level; greedy meshing culls all interior faces).
+pub const DISTANT_SOLID_FLOOR: i32 = 0;
 
 /// Where a chunk's voxels came from. The derived order is the priority order: `Loaded` wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -237,6 +237,7 @@ impl OctreeIngestStore {
         level: u8,
         columns: &[DistantColumn<'_, B>],
         water_block: u32,
+        subsurface_block: u32,
         block_id: &mut dyn FnMut(B) -> u32,
         biome_id: &mut dyn FnMut(&str) -> u16,
     ) -> Vec<OctreeSectionPos> {
@@ -273,14 +274,21 @@ impl OctreeIngestStore {
             if id == 0 {
                 continue;
             }
+            let sub_id = if subsurface_block != 0 {
+                subsurface_block
+            } else {
+                id
+            };
             let biome = biome_id(col.biome);
             let (vx, vz) = (col.x >> level, col.z >> level);
             let height = col.height >> level;
+            let bottom = height.min(DISTANT_SOLID_FLOOR >> level);
             let water_top = col.water.map(|w| w >> level).filter(|&w| w > height);
             let top = water_top.unwrap_or(height);
-            for y in (height - DISTANT_SOLID_DEPTH + 1)..=height {
-                set(self, vx, y, vz, Voxel::new(id, biome, 15, 0));
+            for y in bottom..height {
+                set(self, vx, y, vz, Voxel::new(sub_id, biome, 15, 0));
             }
+            set(self, vx, height, vz, Voxel::new(id, biome, 15, 0));
             if let Some(w) = water_top {
                 for y in (height + 1)..=w {
                     let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
@@ -445,15 +453,17 @@ pub fn ingest_saved_chunk<S: ChunkVoxelSource>(
     ingest_chunk(store, chunk, snap, IngestSource::Saved, block_id, biome_id)
 }
 
-/// G4: ingest `DetachedChunkGenerator::sample_surface_columns` results. Each column becomes
-/// `DISTANT_SOLID_DEPTH` solid voxels ending at `height`, the water span above it (sky light
-/// attenuated one level per block of depth, as vanilla water dampens light by 1), and a
-/// section's height of lit air on top so the top face and the coarser levels have a light source. Columns whose chunk is owned by G1
-/// or G3 are skipped. `water_block` is the Mapper id of water. Returns the columns written.
+/// G4: ingest `DetachedChunkGenerator::sample_surface_columns` results. Each column fills solid
+/// subsurface rock (`subsurface_block`, or `col.block` when `0`) from `DISTANT_SOLID_FLOOR` up to
+/// `height - 1`, `col.block` at `height`, the water span above it (sky light attenuated one level
+/// per block of depth, as vanilla water dampens light by 1), and a section's height of lit air on
+/// top so the top face and the coarser levels have a light source. Columns whose chunk is owned by
+/// G1 or G3 are skipped. `water_block` is the Mapper id of water. Returns the columns written.
 pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
     store: &mut OctreeIngestStore,
     columns: &[DistantColumn<'_, B>],
     water_block: u32,
+    subsurface_block: u32,
     block_id: &mut dyn FnMut(B) -> u32,
     biome_id: &mut dyn FnMut(&str) -> u16,
 ) -> usize {
@@ -467,6 +477,11 @@ pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
         if id == 0 {
             continue;
         }
+        let sub_id = if subsurface_block != 0 {
+            subsurface_block
+        } else {
+            id
+        };
         let biome = biome_id(col.biome);
         let (sx, sz) = (col.x.div_euclid(edge), col.z.div_euclid(edge));
         let (lx, lz) = (
@@ -483,12 +498,13 @@ pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
             }
         }
 
-        let bottom = col.height - DISTANT_SOLID_DEPTH + 1;
+        let bottom = col.height.min(DISTANT_SOLID_FLOOR);
         let water_top = col.water.filter(|&w| w > col.height);
         let top = water_top.unwrap_or(col.height);
-        for y in bottom..=col.height {
-            store.set_voxel(col.x, y, col.z, Voxel::new(id, biome, 15, 0));
+        for y in bottom..col.height {
+            store.set_voxel(col.x, y, col.z, Voxel::new(sub_id, biome, 15, 0));
         }
+        store.set_voxel(col.x, col.height, col.z, Voxel::new(id, biome, 15, 0));
         if let Some(w) = water_top {
             for y in (col.height + 1)..=w {
                 let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
@@ -665,7 +681,7 @@ mod tests {
         g3.put(2, 10, 2, DIRT);
         let g4 = [column(2, 2, 10, None, STONE)];
         let run_g4 = |store: &mut OctreeIngestStore| {
-            ingest_distant_columns(store, &g4, WATER, &mut |b| b, &mut |_| 7)
+            ingest_distant_columns(store, &g4, WATER, STONE, &mut |b| b, &mut |_| 7)
         };
 
         // G4 then G3 then G1: each higher source replaces the lower.
@@ -694,12 +710,12 @@ mod tests {
     fn distant_column_has_water_over_terrain_and_resample_replaces() {
         let mut store = OctreeIngestStore::new();
         let cols = [column(40, 5, 20, Some(24), DIRT)];
-        ingest_distant_columns(&mut store, &cols, WATER, &mut |b| b, &mut |_| 3);
+        ingest_distant_columns(&mut store, &cols, WATER, STONE, &mut |b| b, &mut |_| 3);
         assert_eq!(store.voxel_at(40, 20, 5).block_id(), DIRT);
         // Solids carry the surface's sky light: a face beside a leaf or grass voxel reads it.
         assert_eq!(store.voxel_at(40, 20, 5).sky_light(), 15);
-        assert_eq!(store.voxel_at(40, 13, 5).block_id(), DIRT);
-        assert!(store.voxel_at(40, 12, 5).is_air());
+        assert_eq!(store.voxel_at(40, 0, 5).block_id(), STONE);
+        assert!(store.voxel_at(40, -1, 5).is_air());
         assert_eq!(store.voxel_at(40, 24, 5).block_id(), WATER);
         assert_eq!(store.voxel_at(40, 24, 5).sky_light(), 15);
         assert_eq!(store.voxel_at(40, 21, 5).sky_light(), 12);
@@ -707,7 +723,7 @@ mod tests {
 
         // Terrain re-sampled lower and dry: old water and stone are gone.
         let cols = [column(40, 5, 18, None, STONE)];
-        ingest_distant_columns(&mut store, &cols, WATER, &mut |b| b, &mut |_| 3);
+        ingest_distant_columns(&mut store, &cols, WATER, STONE, &mut |b| b, &mut |_| 3);
         assert_eq!(store.voxel_at(40, 18, 5).block_id(), STONE);
         assert!(store.voxel_at(40, 20, 5).is_air());
         assert!(store.voxel_at(40, 24, 5).is_air());
