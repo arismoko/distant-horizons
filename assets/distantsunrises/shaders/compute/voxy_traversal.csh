@@ -145,14 +145,20 @@ void main() {
 
 #ifdef HIZ_PROOF
     if (gid == 0u) atomicOr(hiz_proof.trav_ran, 1u << proof_index.x);
-#endif
+    // GLSL requires short-circuiting, but vendored/upstream Naga lowers both operands
+    // before combining them (sunrise-org/sunrise#6248). Branch before the proof can record a reject.
+    if (outside_frustum(mn, mx)) {
+        return;
+    }
+    if (occluded_by_hiz(mn, mx, n.a.xy, node_idx)) {
+        return;
+    }
+#else
     if (outside_frustum(mn, mx) || occluded_by_hiz(mn, mx
-#ifdef HIZ_PROOF
-        , n.a.xy, node_idx
-#endif
     )) {
         return;
     }
+#endif
 
     uint section_id = n.a.z;
     uint child_base = n.a.w;

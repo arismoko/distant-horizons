@@ -151,14 +151,18 @@ void main() {
     vec3 mn = corner + vec3(aabb_off) * scale;
     vec3 mx = mn + vec3(aabb_size) * scale;
 
+#ifdef HIZ_PROOF
+    // GLSL requires short-circuiting, but vendored/upstream Naga lowers both operands
+    // before combining them (sunrise-org/sunrise#6248). Branch before the proof can record a reject.
+    bool visible = false;
+    if (live && visible_flags[id] != 0u && !outside_frustum(mn, mx)) {
+        visible = !occluded_by_hiz(mn, mx, meta.a.xy, id);
+    }
+    if (id == 0u) hiz_proof.cmdgen_ran = 1u;
+#else
     bool visible = live && visible_flags[id] != 0u && !outside_frustum(mn, mx)
         && !occluded_by_hiz(mn, mx
-#ifdef HIZ_PROOF
-            , meta.a.xy, id
-#endif
         );
-#ifdef HIZ_PROOF
-    if (id == 0u) hiz_proof.cmdgen_ran = 1u;
 #endif
 
     // Face bucket visibility from the section's position relative to the camera section
