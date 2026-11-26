@@ -1629,24 +1629,38 @@ pub mod octree_sync {
             Message::SessionConfig(*local).encode()
         }
 
-        /// Encode a request; `known_timestamp` is the cached section's revision, if any.
+        /// Encode and track a request for callers driving the protocol directly. Live sends
+        /// track it only after the connection has accepted its bytes.
         pub fn request(
             &mut self,
             level: &str,
             pos: OctreeSectionPos,
             known_timestamp: Option<i64>,
         ) -> Result<Vec<u8>, SyncError> {
-            let future_id = self.next_future;
-            let bytes = Message::Request(OctreeSectionRequest {
-                future_id,
+            let bytes = self.encode_request(level, pos, known_timestamp)?;
+            self.track_request(level, pos);
+            Ok(bytes)
+        }
+
+        fn encode_request(
+            &self,
+            level: &str,
+            pos: OctreeSectionPos,
+            known_timestamp: Option<i64>,
+        ) -> Result<Vec<u8>, SyncError> {
+            Message::Request(OctreeSectionRequest {
+                future_id: self.next_future,
                 level: level.to_owned(),
                 pos,
                 client_timestamp: known_timestamp,
             })
-            .encode()?;
+            .encode()
+        }
+
+        fn track_request(&mut self, level: &str, pos: OctreeSectionPos) {
+            self.pending
+                .insert(self.next_future, (level.to_owned(), pos));
             self.next_future = self.next_future.wrapping_add(1);
-            self.pending.insert(future_id, (level.to_owned(), pos));
-            Ok(bytes)
         }
 
         pub fn on_message(
@@ -1764,6 +1778,26 @@ pub mod octree_sync {
                 self.open = true;
             }
             self.open
+        }
+
+        fn send_request(
+            &mut self,
+            level: &str,
+            pos: OctreeSectionPos,
+            known_timestamp: Option<i64>,
+            send: impl FnOnce(PayloadBytes) -> Result<PayloadAccepted, PayloadSendError>,
+        ) -> bool {
+            if !self.open {
+                return false;
+            }
+            let Ok(bytes) = self.session.encode_request(level, pos, known_timestamp) else {
+                return false;
+            };
+            if !matches!(send(PayloadBytes(bytes)), Ok(PayloadAccepted::Queued)) {
+                return false;
+            }
+            self.session.track_request(level, pos);
+            true
         }
 
         fn close(&mut self) {
@@ -1885,24 +1919,22 @@ pub mod octree_sync {
         client_intake().lock().unwrap().close();
     }
 
-    /// Send one request from the client tick.
+    /// Queue one request from the client tick. Only local acceptance records a pending future.
     pub fn client_send_request(
         host: &mut dyn ClientHost,
         level: &str,
         pos: OctreeSectionPos,
         known_timestamp: Option<i64>,
     ) -> bool {
-        let Ok(bytes) =
-            client_intake()
-                .lock()
-                .unwrap()
-                .session
-                .request(level, pos, known_timestamp)
-        else {
-            return false;
-        };
-        host.send_payload_to_server(&octree_sync_channel_id(), PayloadBytes(bytes))
-            .is_ok()
+        let channel = octree_sync_channel_id();
+        // Hold intake across the narrow nonblocking send and publish the accepted future before
+        // a raw reply can acquire the guard. The raw callback never acquires PIPELINE.
+        client_intake()
+            .lock()
+            .unwrap()
+            .send_request(level, pos, known_timestamp, |bytes| {
+                host.send_payload_to_server(&channel, bytes)
+            })
     }
 
     /// Drain each player's per-tick budget on an eligible published server's Overworld post-tick.
@@ -2159,6 +2191,122 @@ pub mod octree_sync {
             });
             *registry = locked.into_inner().unwrap();
             wire
+        }
+
+        #[test]
+        fn refused_scan_and_gpu_requests_remain_selectable_until_they_queue() {
+            use crate::octree_ingest::OctreeIngestStore;
+            use crate::pipeline::request_remote_sections;
+            use std::collections::HashSet;
+
+            let now = Instant::now();
+            for from_gpu in [false, true] {
+                let mut store = OctreeIngestStore::default();
+                let resident = OctreeSectionPos::new(0, 0, -2, 0);
+                store.replace_section(varied_section(resident, 1));
+                let (pos, gpu_demand) = if from_gpu {
+                    (OctreeSectionPos::new(1, -2, 0, 1), vec![(1, [-2, 0, 1])])
+                } else {
+                    (OctreeSectionPos::new(0, 0, -1, 0), Vec::new())
+                };
+                let section = varied_section(pos, 1);
+                let source = Fake::of(&section, DhV2CompressionMode::Uncompressed);
+                let mut registry = ServerSyncRegistry::new(SessionConfig::default());
+                registry.set_open(true);
+                let mut intake = ClientIntake::default();
+                assert!(
+                    !intake
+                        .send_request(LEVEL, pos, None, |_| panic!("closed intake sent a request"))
+                );
+                assert!(intake.configure(|cfg| {
+                    let msg = Message::decode(&cfg.0).unwrap();
+                    assert_eq!(
+                        registry.receive(|| Ok(1), msg, now, &source).unwrap().len(),
+                        1
+                    );
+                    Ok(PayloadAccepted::Queued)
+                }));
+
+                let mut requested = HashSet::new();
+                let mut refused = Vec::new();
+                request_remote_sections(
+                    Some(&store),
+                    &mut requested,
+                    [0.0; 3],
+                    0,
+                    1,
+                    gpu_demand.clone(),
+                    |key| {
+                        assert_eq!(key, pos);
+                        intake.send_request(LEVEL, key, None, |bytes| {
+                            refused = bytes.0;
+                            Err(PayloadSendError::Backpressure)
+                        })
+                    },
+                );
+                assert!(
+                    !refused.is_empty(),
+                    "selected key reached the encoder and send"
+                );
+                assert!(requested.is_empty());
+                assert!(intake.session.pending.is_empty());
+                assert!(registry.player(1).unwrap().sender.is_idle());
+
+                request_remote_sections(
+                    Some(&store),
+                    &mut requested,
+                    [0.0; 3],
+                    0,
+                    1,
+                    gpu_demand,
+                    |key| {
+                        assert_eq!(key, pos);
+                        intake.send_request(LEVEL, key, None, |bytes| {
+                            assert_eq!(bytes.0, refused);
+                            let msg = Message::decode(&bytes.0).unwrap();
+                            let Message::Request(req) = &msg else {
+                                panic!("expected a request")
+                            };
+                            assert_eq!(req.pos, pos);
+                            assert_eq!(req.level, LEVEL);
+                            assert_eq!(req.future_id, 0);
+                            assert!(
+                                registry
+                                    .receive(|| Ok(1), msg, now, &source)
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                            Ok(PayloadAccepted::Queued)
+                        })
+                    },
+                );
+                assert_eq!(requested, HashSet::from([pos]));
+                assert_eq!(
+                    intake.session.pending.get(&0).unwrap(),
+                    &(LEVEL.to_owned(), pos)
+                );
+                assert!(!registry.player(1).unwrap().sender.is_idle());
+                let wire = wire_tick(&mut registry, &HashMap::new(), &source)
+                    .remove(&1)
+                    .unwrap();
+                for bytes in &wire {
+                    intake.receive(bytes, now, || true).unwrap();
+                }
+                assert!(intake.session.pending.is_empty());
+                let [
+                    ClientEvent::Section {
+                        level,
+                        section: received,
+                        ..
+                    },
+                ] = intake.events.as_slice()
+                else {
+                    panic!("accepted request did not produce a section");
+                };
+                assert_eq!(level, LEVEL);
+                assert_eq!(received.to_rle(), section.to_rle());
+                assert_eq!(received.revision, section.revision);
+            }
         }
 
         #[test]

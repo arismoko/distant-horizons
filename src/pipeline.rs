@@ -1127,16 +1127,16 @@ impl Pipeline {
 /// Level-0 section rows (`y`) the sweeps cover; level `n` covers them shifted right by `n`.
 const Y_SECTIONS: std::ops::RangeInclusive<i32> = -2..=9;
 
-/// The sections the GPU traversal asked for (`render_bridge::drain_gpu_node_requests`: finer
-/// children of visible nodes) that the store lacks and nobody asked for yet, at most `budget`,
-/// marked as requested. Positions outside the vertical range the sweeps cover are ignored.
+/// The sections the GPU traversal asked for that are not resident, outstanding or duplicated
+/// within this sweep. Positions outside the vertical range the sweeps cover are ignored.
 fn take_gpu_requested(
     store: Option<&OctreeIngestStore>,
-    requested: &mut HashSet<OctreeSectionPos>,
+    requested: &HashSet<OctreeSectionPos>,
+    demand: impl IntoIterator<Item = (u8, [i32; 3])>,
     budget: usize,
 ) -> Vec<OctreeSectionPos> {
     let mut out = Vec::new();
-    for (detail, [x, y, z]) in crate::render_bridge::drain_gpu_node_requests() {
+    for (detail, [x, y, z]) in demand {
         if out.len() >= budget {
             break;
         }
@@ -1146,7 +1146,10 @@ fn take_gpu_requested(
             continue;
         }
         let pos = OctreeSectionPos::new(detail, x, y, z);
-        if store.is_some_and(|s| s.section(pos).is_some()) || !requested.insert(pos) {
+        if store.is_some_and(|s| s.section(pos).is_some())
+            || requested.contains(&pos)
+            || out.contains(&pos)
+        {
             continue;
         }
         out.push(pos);
@@ -1170,9 +1173,13 @@ pub fn request_stored_sections(
     let disk = p.disk.entry(dim.to_owned()).or_default();
     let store = p.stores.get(dim);
     let mut left = budget;
-    // take_gpu_requested uses the supplied set to dedupe within the sweep. The disk intake
-    // owns the authoritative outstanding request (warm and mutation probes share it).
-    for pos in take_gpu_requested(store, &mut HashSet::new(), left) {
+    // The disk intake owns the outstanding request (warm and mutation probes share it).
+    for pos in take_gpu_requested(
+        store,
+        &HashSet::new(),
+        crate::render_bridge::drain_gpu_node_requests(),
+        left,
+    ) {
         if disk.probe(&mut p.next_probe, io, world_dir, dim, pos, false) {
             left -= 1;
         }
@@ -1341,35 +1348,59 @@ pub fn client_sync(
             p.queue(&level, [pos]);
         }
     }
-    let mut want = Vec::new();
-    {
-        let mut guard = PIPELINE.lock().unwrap();
-        let p = &mut *guard;
-        let requested = p.requested.entry(dim.to_owned()).or_default();
-        let store = p.stores.get(dim);
-        want.extend(take_gpu_requested(store, requested, budget));
-        let edge = crate::octree::SECTION_EDGE as f64;
-        let (cx, cz) = (
-            (center[0] / edge).floor() as i32,
-            (center[2] / edge).floor() as i32,
-        );
-        'scan: for sx in cx - radius..=cx + radius {
-            for sz in cz - radius..=cz + radius {
-                for sy in -2..=9 {
-                    if want.len() >= budget {
-                        break 'scan;
-                    }
-                    let pos = OctreeSectionPos::new(0, sx, sy, sz);
-                    if store.is_some_and(|s| s.section(pos).is_some()) || !requested.insert(pos) {
-                        continue;
-                    }
-                    want.push(pos);
+    let mut guard = PIPELINE.lock().unwrap();
+    let p = &mut *guard;
+    // PIPELINE -> client intake only for the nonblocking send. Reset closes intake and drops
+    // that guard before retiring PIPELINE, so an accepted send cannot mark the next world.
+    request_remote_sections(
+        p.stores.get(dim),
+        p.requested.entry(dim.to_owned()).or_default(),
+        center,
+        radius,
+        budget,
+        crate::render_bridge::drain_gpu_node_requests(),
+        |pos| crate::network::octree_sync::client_send_request(host, dim, pos, None),
+    );
+}
+
+/// Select up to the existing per-tick budget, GPU demand first. Selection itself is temporary:
+/// only a queued send marks a key, while every attempt uses the same budget as before.
+pub(crate) fn request_remote_sections(
+    store: Option<&OctreeIngestStore>,
+    requested: &mut HashSet<OctreeSectionPos>,
+    center: [f64; 3],
+    radius: i32,
+    budget: usize,
+    gpu_demand: impl IntoIterator<Item = (u8, [i32; 3])>,
+    mut send: impl FnMut(OctreeSectionPos) -> bool,
+) {
+    let mut want = take_gpu_requested(store, requested, gpu_demand, budget);
+    let edge = crate::octree::SECTION_EDGE as f64;
+    let (cx, cz) = (
+        (center[0] / edge).floor() as i32,
+        (center[2] / edge).floor() as i32,
+    );
+    'scan: for sx in cx - radius..=cx + radius {
+        for sz in cz - radius..=cz + radius {
+            for sy in Y_SECTIONS {
+                if want.len() >= budget {
+                    break 'scan;
                 }
+                let pos = OctreeSectionPos::new(0, sx, sy, sz);
+                if store.is_some_and(|s| s.section(pos).is_some())
+                    || requested.contains(&pos)
+                    || want.contains(&pos)
+                {
+                    continue;
+                }
+                want.push(pos);
             }
         }
     }
     for pos in want {
-        crate::network::octree_sync::client_send_request(host, dim, pos, None);
+        if send(pos) {
+            requested.insert(pos);
+        }
     }
 }
 
