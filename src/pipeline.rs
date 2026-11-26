@@ -914,7 +914,9 @@ pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
         while queued < limit {
             let Some(&pos) = set.iter().next() else { break };
             set.remove(&pos);
-            let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
+            // A clear must supersede any pending save; only the I/O worker knows whether
+            // there is a disk slot to rewrite.
+            let Some(section) = store.section(pos) else {
                 continue;
             };
             let (_, mapping) = p.mapper.mapping_of(section);
