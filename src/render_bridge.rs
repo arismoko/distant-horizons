@@ -630,6 +630,7 @@ trait TerrainGpu {
 
     fn create_arena(&mut self, config: ArenaConfig) -> Result<Self::Arena, ArenaError>;
     fn create_quad_mesh(&mut self) -> Result<Self::Mesh, ArenaError>;
+    fn release_quad_mesh(&self, mesh: Self::Mesh) -> Result<(), mod_api::MeshError>;
     fn request_buffer_size(&self, arena: &Self::Arena) -> Result<u64, mod_api::BufferError>;
     fn poll_readback(&self, ticket: Self::Ticket) -> Result<Option<Vec<u8>>, mod_api::BufferError>;
     fn release_readback(&self, ticket: Self::Ticket) -> Result<(), mod_api::BufferError>;
@@ -767,6 +768,10 @@ impl TerrainGpu for dyn mod_api::ClientHost + '_ {
             .map_err(|_| ArenaError::Buffer(mod_api::BufferError::Unavailable))
     }
 
+    fn release_quad_mesh(&self, mesh: Self::Mesh) -> Result<(), mod_api::MeshError> {
+        mesh.release(self)
+    }
+
     fn request_buffer_size(&self, arena: &Self::Arena) -> Result<u64, mod_api::BufferError> {
         arena.requests.size(self)
     }
@@ -794,8 +799,16 @@ fn ensure_arena<'a, G: TerrainGpu + ?Sized>(
 ) -> Result<&'a mut ArenaState<G::Arena, G::Mesh>, ArenaError> {
     if slot.is_none() {
         let quad_mesh = gpu.create_quad_mesh()?;
+        let arena = match gpu.create_arena(config) {
+            Ok(arena) => arena,
+            Err(error) => {
+                // The arena builder has rolled back its buffers, including all size fallbacks.
+                report("release unused quad mesh", gpu.release_quad_mesh(quad_mesh));
+                return Err(error);
+            }
+        };
         *slot = Some(ArenaState {
-            arena: gpu.create_arena(config)?,
+            arena,
             quad_mesh: Some(quad_mesh),
             ids: HashMap::new(),
         });
@@ -1783,7 +1796,9 @@ mod tests {
         available: bool,
         retired_arena: Option<u32>,
         arenas: u32,
+        arena_error: Option<BufferError>,
         meshes: u32,
+        live_meshes: RefCell<HashSet<u32>>,
         ready: RefCell<Option<Vec<u8>>>,
         polled: RefCell<Vec<u32>>,
         released: RefCell<Vec<u32>>,
@@ -1795,13 +1810,26 @@ mod tests {
         type Ticket = u32;
 
         fn create_arena(&mut self, _: ArenaConfig) -> Result<Self::Arena, ArenaError> {
+            if let Some(error) = self.arena_error {
+                assert!(
+                    self.live_meshes.get_mut().contains(&self.meshes),
+                    "mesh allocated first"
+                );
+                return Err(error.into());
+            }
             self.arenas += 1;
             Ok(self.arenas)
         }
 
         fn create_quad_mesh(&mut self) -> Result<Self::Mesh, ArenaError> {
             self.meshes += 1;
+            self.live_meshes.get_mut().insert(self.meshes);
             Ok(self.meshes)
+        }
+
+        fn release_quad_mesh(&self, mesh: Self::Mesh) -> Result<(), mod_api::MeshError> {
+            assert!(self.live_meshes.borrow_mut().remove(&mesh));
+            Ok(())
         }
 
         fn request_buffer_size(&self, arena: &Self::Arena) -> Result<u64, BufferError> {
@@ -1915,6 +1943,39 @@ mod tests {
         assert!(new.ids.is_empty());
         assert_eq!(host.arenas, 2);
         assert_eq!(host.meshes, 2);
+    }
+
+    #[test]
+    fn final_arena_refusal_releases_new_mesh_and_next_ensure_can_allocate() {
+        let mut gpu = RecordingGpu {
+            arena_error: Some(BufferError::ExceedsDeviceLimit),
+            ..Default::default()
+        };
+        let config = ArenaConfig {
+            max_sections: 4,
+            geometry_bytes: 0,
+        };
+        let mut slot = None;
+        assert!(matches!(
+            ensure_arena(&mut slot, &mut gpu, config),
+            Err(ArenaError::Buffer(BufferError::ExceedsDeviceLimit))
+        ));
+        assert!(slot.is_none());
+        assert_eq!(gpu.meshes, 1);
+        assert!(gpu.live_meshes.get_mut().is_empty());
+        assert_eq!(gpu.arenas, 0);
+
+        gpu.arena_error = None;
+        let state = ensure_arena(&mut slot, &mut gpu, config).unwrap();
+        assert_eq!(state.quad_mesh, Some(2));
+        assert_eq!(*gpu.live_meshes.get_mut(), HashSet::from([2]));
+        assert_eq!(gpu.arenas, 1);
+        assert_eq!(
+            ensure_arena(&mut slot, &mut gpu, config).unwrap().quad_mesh,
+            Some(2)
+        );
+        assert_eq!(gpu.meshes, 2);
+        assert_eq!(gpu.arenas, 1);
     }
 
     #[test]
