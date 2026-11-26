@@ -80,11 +80,17 @@ pub struct GenResult {
     pub outcome: GenOutcome,
 }
 
+#[derive(Clone, Copy, Default)]
+struct DimensionEpoch {
+    epoch: u64,
+    unloading: bool,
+}
+
 struct Shared {
     queue: Mutex<VecDeque<GenJob>>,
     cv: Condvar,
     in_flight: Mutex<HashMap<(String, SectionPos), u64>>,
-    dim_epochs: Mutex<HashMap<String, u64>>,
+    dim_epochs: Mutex<HashMap<String, DimensionEpoch>>,
     done: Mutex<Vec<GenResult>>,
     global_epoch: AtomicU64,
     next_job_id: AtomicU64,
@@ -258,7 +264,11 @@ impl GenWorkerPool {
                 .dim_epochs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            epochs.get(&dimension).copied().unwrap_or(0)
+            let epoch = epochs.get(&dimension).copied().unwrap_or_default();
+            if epoch.unloading {
+                return false;
+            }
+            epoch.epoch
         };
         {
             let mut in_flight = self
@@ -302,7 +312,7 @@ impl GenWorkerPool {
                 .dim_epochs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            epochs.get(dim).copied().unwrap_or(0)
+            epochs.get(dim).map_or(0, |entry| entry.epoch)
         };
 
         let mut done = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
@@ -371,8 +381,26 @@ impl GenWorkerPool {
             .retain(|res| !(res.dimension == dim && res.pos == pos));
     }
 
-    /// Cancel queued, running, and completed work for a single unloading dimension by bumping
-    /// its per-dimension epoch.
+    pub fn dimension_allowed(&self, dim: &str) -> bool {
+        self.shared
+            .dim_epochs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dim)
+            .is_none_or(|entry| !entry.unloading)
+    }
+
+    pub fn allow_dimension(&self, dim: &str) {
+        self.shared
+            .dim_epochs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(dim.to_owned())
+            .or_default()
+            .unloading = false;
+    }
+
+    /// Cancel queued, running, and completed work for this level and reject more until load.
     pub fn reset_dimension(&self, dim: &str) {
         {
             let mut epochs = self
@@ -380,8 +408,9 @@ impl GenWorkerPool {
                 .dim_epochs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let entry = epochs.entry(dim.to_owned()).or_insert(0);
-            *entry = entry.wrapping_add(1);
+            let entry = epochs.entry(dim.to_owned()).or_default();
+            entry.epoch = entry.epoch.wrapping_add(1);
+            entry.unloading = true;
         }
         self.shared
             .queue
@@ -448,7 +477,11 @@ fn is_job_valid(shared: &Shared, job: &GenJob) -> bool {
     }
     let dim_ok = {
         let epochs = shared.dim_epochs.lock().unwrap_or_else(|e| e.into_inner());
-        epochs.get(&job.dimension).copied().unwrap_or(0) == job.dim_epoch
+        epochs
+            .get(&job.dimension)
+            .map_or(job.dim_epoch == 0, |entry| {
+                !entry.unloading && entry.epoch == job.dim_epoch
+            })
     };
     if !dim_ok {
         return false;
@@ -639,6 +672,18 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_level_rejects_generation_until_reloaded() {
+        let pool = GenWorkerPool::new();
+        assert!(pool.dimension_allowed("unloading"));
+        pool.reset_dimension("unloading");
+        assert!(!pool.dimension_allowed("unloading"));
+        assert!(pool.dimension_allowed("sibling"));
+        pool.allow_dimension("unloading");
+        assert!(pool.dimension_allowed("unloading"));
+        assert_eq!(pool.shared.dim_epochs.lock().unwrap()["unloading"].epoch, 1);
+    }
 
     #[test]
     fn done_chunk_cap_pauses_detail0_dispatch() {

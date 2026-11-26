@@ -394,6 +394,32 @@ enum TerrainInput {
 }
 
 impl DiskIntake {
+    fn needed(&self, store: &OctreeIngestStore) -> HashSet<OctreeSectionPos> {
+        let mut needed = HashSet::new();
+        for input in &self.pending {
+            match input {
+                TerrainInput::Chunk(edit) => needed.extend(edit.positions()),
+                TerrainInput::Estimate {
+                    detail, columns, ..
+                } => {
+                    for col in columns {
+                        store.estimate_positions(
+                            *detail,
+                            col.x,
+                            col.z,
+                            col.height,
+                            col.water,
+                            |pos| {
+                                needed.insert(pos);
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        needed
+    }
+
     fn probe(
         &mut self,
         next: &mut u64,
@@ -515,28 +541,7 @@ impl Pipeline {
             return;
         }
         let store = self.stores.entry(dim.to_owned()).or_default();
-        let mut needed = HashSet::new();
-        for input in &disk.pending {
-            match input {
-                TerrainInput::Chunk(edit) => needed.extend(edit.positions()),
-                TerrainInput::Estimate {
-                    detail, columns, ..
-                } => {
-                    for col in columns {
-                        store.estimate_positions(
-                            *detail,
-                            col.x,
-                            col.z,
-                            col.height,
-                            col.water,
-                            |pos| {
-                                needed.insert(pos);
-                            },
-                        );
-                    }
-                }
-            }
-        }
+        let needed = disk.needed(store);
         let mut waiting = false;
         for &pos in &needed {
             if store.section(pos).is_some()
@@ -597,18 +602,23 @@ pub fn reset_server_intake() {
     }
 }
 
-/// Drops every section of `dim` (level unload).
-pub fn clear_dimension(dim: &str) {
+/// Drops every section of `dim` at the start of a fresh server lifetime.
+fn clear_dimension(dim: &str) {
     MESH_WORKER.clear_dim(dim);
-    let mut p = PIPELINE.lock().unwrap();
-    p.stores.remove(dim);
-    p.dirty.remove(dim);
-    p.queued.remove(dim);
-    p.section_epoch.retain(|(d, _), _| d != dim);
-    p.rendered.remove(dim);
-    p.unsaved.remove(dim);
-    p.requested.remove(dim);
-    p.disk.remove(dim);
+    PIPELINE.lock().unwrap().clear_dimension(dim);
+}
+
+impl Pipeline {
+    fn clear_dimension(&mut self, dim: &str) {
+        self.stores.remove(dim);
+        self.dirty.remove(dim);
+        self.queued.remove(dim);
+        self.section_epoch.retain(|(d, _), _| d != dim);
+        self.rendered.remove(dim);
+        self.unsaved.remove(dim);
+        self.requested.remove(dim);
+        self.disk.remove(dim);
+    }
 }
 
 /// A resource reload, shader-pack change or `/ds remesh` invalidates every baked model: bake them
@@ -1127,25 +1137,70 @@ pub fn advance_intake(host: &dyn Host, io: &LodIoWorker, world_dir: Option<&Path
     }
 }
 
-pub fn finish_intake(host: &dyn Host, io: &LodIoWorker, dir: &Path) {
-    let mut p = PIPELINE.lock().unwrap();
-    let dims: Vec<_> = p
-        .disk
-        .iter()
-        .filter(|(_, d)| !d.pending.is_empty())
-        .map(|(d, _)| d.clone())
-        .collect();
-    for dim in &dims {
-        p.advance_intake(io, dir, dim, false);
+/// No generation for the unloading level is admitted after this point. Read/merge work already
+/// in intake may still finish and is saved before the in-memory level is retired.
+pub fn finish_server_io(
+    host: &dyn Host,
+    io: &LodIoWorker,
+    dir: Option<&Path>,
+    unloading: Option<&str>,
+) {
+    if let Some(dim) = unloading {
+        MESH_WORKER.clear_dim(dim);
     }
-    drop(p);
-    io.flush();
-    let mut p = PIPELINE.lock().unwrap();
-    p.accept_probes(io, dir, |mapper, section, mapping| {
-        mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
-    });
-    for dim in &dims {
-        p.advance_intake(io, dir, dim, true);
+    PIPELINE
+        .lock()
+        .unwrap()
+        .finish_server_io(io, dir, unloading, |mapper, section, mapping| {
+            mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
+        });
+}
+
+impl Pipeline {
+    fn finish_server_io(
+        &mut self,
+        io: &LodIoWorker,
+        dir: Option<&Path>,
+        unloading: Option<&str>,
+        remap: impl FnMut(&mut Mapper, OctreeSection, OctreeMapping) -> OctreeSection,
+    ) {
+        let dims: Vec<_> = self
+            .disk
+            .iter()
+            .filter(|(_, disk)| !disk.pending.is_empty())
+            .map(|(dim, _)| dim.clone())
+            .collect();
+        if let Some(dir) = dir {
+            for dim in &dims {
+                self.advance_intake(io, dir, dim, false);
+            }
+            io.flush();
+            self.accept_probes(io, dir, remap);
+            for dim in &dims {
+                self.advance_intake(io, dir, dim, true);
+            }
+            self.flush_saves(io, dir, usize::MAX);
+            io.flush();
+        } else {
+            for dim in dims
+                .into_iter()
+                .filter(|d| unloading.is_none_or(|level| d.as_str() == level))
+            {
+                let disk = self.disk.get_mut(&dim).unwrap();
+                let store = self.stores.entry(dim.clone()).or_default();
+                for pos in disk.needed(store) {
+                    if disk.failed.insert(pos) {
+                        eprintln!(
+                            "DH: octree slot {pos:?} in {dim} was not read: no world directory"
+                        );
+                    }
+                }
+                disk.pending.clear();
+            }
+        }
+        if let Some(dim) = unloading {
+            self.clear_dimension(dim);
+        }
     }
 }
 
@@ -1465,6 +1520,64 @@ mod tests {
         }
         drop(fresh);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn level_unload_saves_unqueued_dirty_sections_and_applies_waiting_edits() {
+        use crate::storage::RegionCache;
+        let dir = fixture_dir("unload");
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        let dirty = OctreeSectionPos::new(0, 0, 0, 0);
+        let waiting = dirty.neighbor(Face::PosX);
+        let mut older = OctreeSection::new(waiting);
+        let sibling = Voxel::new(3, 0, 11, 0);
+        older.set(0, 0, 0, Voxel::new(2, 0, 9, 0));
+        older.set(16, 0, 0, sibling);
+        RegionCache::default()
+            .save_octree_section(
+                &dir,
+                DIM,
+                &older,
+                &OctreeMapping::default(),
+                DEFAULT_OCTREE_COMPRESSION,
+            )
+            .unwrap();
+
+        stage_live(&mut p, [0, 0], 1);
+        p.advance_intake(&io, &dir, DIM, false);
+        io.flush();
+        adopt_fixture(&mut p, &io, &dir);
+        assert!(p.unsaved[DIM].contains(&dirty));
+        assert!(
+            RegionCache::default()
+                .load_octree_section(&dir, DIM, dirty)
+                .unwrap()
+                .is_none()
+        );
+        stage_live(&mut p, [2, 0], 0);
+        p.advance_intake(&io, &dir, DIM, false);
+        assert!(p.disk[DIM].loading.contains_key(&waiting));
+
+        p.finish_server_io(&io, Some(&dir), Some(DIM), |_, section, _| section);
+        assert!(!p.stores.contains_key(DIM));
+        assert!(!p.unsaved.contains_key(DIM));
+        assert!(!p.disk.contains_key(DIM));
+        drop(io);
+        let mut fresh = RegionCache::default();
+        let (changed, _) = fresh
+            .load_octree_section(&dir, DIM, dirty)
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.get(0, 0, 0).block_id(), 1);
+        let (merged, _) = fresh
+            .load_octree_section(&dir, DIM, waiting)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.get(0, 0, 0), Voxel::air_with_light(15, 0));
+        assert_eq!(merged.get(16, 0, 0), sibling);
+        drop(fresh);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
