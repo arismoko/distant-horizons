@@ -437,6 +437,10 @@ impl GenWorkerPool {
 
     /// Cancel all queued and running work and join every worker thread on world close.
     pub fn shutdown_and_join(&self) {
+        self.shutdown_and_join_with(|| {});
+    }
+
+    fn shutdown_and_join_with(&self, before_join: impl FnOnce()) {
         // Keep start and resize out until every slot has joined. Workers never take this lock.
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         {
@@ -456,9 +460,16 @@ impl GenWorkerPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        before_join();
         for handle in handles.drain(..) {
             let _ = handle.join();
         }
+        // A worker finishing its final sample can publish after the initial clear.
+        self.shared
+            .done
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.max_in_flight.store(0, Ordering::Release);
         self.shared.stop.store(false, Ordering::Release);
     }
@@ -775,6 +786,39 @@ mod tests {
         assert_eq!(finished.try_recv(), Ok(()));
         assert!(pool.handles.lock().unwrap().is_empty());
         assert!(!pool.has_capacity());
+    }
+
+    #[test]
+    fn close_discards_a_batch_completed_after_cancellation() {
+        let pool = GenWorkerPool::new();
+        let (release, held) = mpsc::channel();
+        let (completed, finished) = mpsc::channel();
+        let shared = Arc::clone(&pool.shared);
+        let epoch = shared.global_epoch.load(Ordering::Acquire);
+        let worker = thread::spawn(move || {
+            held.recv().unwrap();
+            assert!(shared.stop.load(Ordering::Acquire));
+            shared.done.lock().unwrap().push(GenResult {
+                job_id: 1,
+                global_epoch: epoch,
+                dim_epoch: 0,
+                dimension: "closing".into(),
+                pos: SectionPos::new(0, 0, 0),
+                cells: vec![(0, 0)],
+                samples: vec![None],
+                saved_chunks: Vec::new(),
+                generated_chunks: Vec::new(),
+                outcome: GenOutcome::Complete,
+            });
+            completed.send(()).unwrap();
+        });
+        pool.handles.lock().unwrap().push(worker);
+
+        // Release the final batch only after the pre-join clears and stop publication.
+        pool.shutdown_and_join_with(|| release.send(()).unwrap());
+        assert_eq!(finished.try_recv(), Ok(()));
+        // Inspect the buffer directly: drain_for_dim would hide stale output via its epoch check.
+        assert!(pool.shared.done.lock().unwrap().is_empty());
     }
 
     #[test]
