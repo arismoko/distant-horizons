@@ -1087,7 +1087,9 @@ pub fn ingest_distant(
 }
 
 /// Hand up to `limit` changed sections of every dimension to the I/O worker (it coalesces newer
-/// saves of one section). Returns how many were queued.
+/// saves of one section). Returns how many the worker accepted; if it refuses one (unavailable
+/// or shut down) the flush stops, reports once, and keeps that section and the rest unsaved.
+/// Nothing is retried within the flush.
 pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
     PIPELINE.lock().unwrap().flush_saves(io, world_dir, limit)
 }
@@ -1102,21 +1104,27 @@ impl Pipeline {
             };
             while queued < limit {
                 let Some(&pos) = set.iter().next() else { break };
-                set.remove(&pos);
                 // A clear must supersede any pending save; only the I/O worker knows whether
                 // there is a disk slot to rewrite.
                 let Some(section) = store.section(pos) else {
+                    set.remove(&pos);
                     continue;
                 };
                 let record = OctreeRecord::from(section);
                 let (_, mapping) = self.mapper.mapping_of(&record.rle.palette);
-                io.queue_octree_record(
+                if !io.queue_octree_record(
                     world_dir.to_owned(),
                     dim.clone(),
                     record,
                     mapping,
                     DEFAULT_OCTREE_COMPRESSION,
-                );
+                ) {
+                    eprintln!(
+                        "DH: octree saves refused by the I/O worker; unsaved sections kept for a later flush"
+                    );
+                    return queued;
+                }
+                set.remove(&pos);
                 queued += 1;
             }
         }
@@ -1511,6 +1519,43 @@ mod tests {
             mapping.biomes,
             BTreeMap::from([(1, "minecraft:forest".into())])
         );
+    }
+
+    #[test]
+    fn refused_saves_are_not_counted_and_stay_unsaved_until_a_worker_accepts() {
+        let dir = TestTempDir::new("refused-save");
+        let (mapper, first) = section_with_unused_ids();
+        let second =
+            OctreeSection::filled(OctreeSectionPos::new(0, 0, 0, 0), Voxel::new(1, 1, 5, 0));
+        let mut p = Pipeline {
+            mapper,
+            ..Pipeline::default()
+        };
+        let store = p.stores.entry(DIM.into()).or_default();
+        store.replace_section(first.clone());
+        store.replace_section(second.clone());
+        p.unsaved
+            .entry(DIM.into())
+            .or_default()
+            .extend([first.pos, second.pos]);
+
+        let refusing = LodIoWorker::spawn_unavailable();
+        for _ in 0..2 {
+            assert_eq!(p.flush_saves(&refusing, &dir, usize::MAX), 0);
+            assert_eq!(p.unsaved[DIM].len(), 2, "refused records are kept");
+        }
+
+        let io = LodIoWorker::spawn();
+        assert_eq!(p.flush_saves(&io, &dir, usize::MAX), 2);
+        assert!(p.unsaved[DIM].is_empty());
+        io.flush().unwrap();
+        for section in [&first, &second] {
+            let (loaded, _) = crate::storage::RegionCache::default()
+                .load_octree_section(&dir, DIM, section.pos)
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.to_rle(), section.to_rle());
+        }
     }
 
     #[test]
