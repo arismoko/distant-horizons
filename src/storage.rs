@@ -1040,15 +1040,23 @@ impl OpenRegion {
             Err(e) => return Err(e),
         };
 
-        let file_len = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::other("region path is not a regular file"));
+        }
+        let file_len = metadata.len();
         let parsed = if file_len >= REGION_HEADER_BYTES as u64 {
-            let mut page_a = [0u8; HEADER_PAGE_BYTES];
-            let mut page_b = [0u8; HEADER_PAGE_BYTES];
+            let mut pages = [[0u8; HEADER_PAGE_BYTES]; 2];
             file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut page_a)?;
-            file.read_exact(&mut page_b)?;
-            let a = parse_header_page(&page_a, file_len);
-            let b = parse_header_page(&page_b, file_len);
+            let mut parsed = [None, None];
+            for (page, out) in pages.iter_mut().zip(&mut parsed) {
+                match file.read_exact(page) {
+                    Ok(()) => *out = parse_header_page(page, file_len),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            let [a, b] = parsed;
             match (a, b) {
                 (Some(pa), Some(pb)) => Some(if pb.0 > pa.0 { pb } else { pa }),
                 (Some(pa), None) => Some(pa),
@@ -1109,23 +1117,26 @@ impl OpenRegion {
     }
 
     /// Raw record bytes of `slot_idx`, bounds-checked against the header limits.
-    fn read_slot_bytes(&mut self, slot_idx: usize) -> Option<(Vec<u8>, u32)> {
+    fn read_slot_bytes(&mut self, slot_idx: usize) -> io::Result<Option<(Vec<u8>, u32)>> {
         let entry = self.slots[slot_idx];
-        if entry.len == 0
-            || (entry.len as usize) > MAX_COMPRESSED_RECORD_BYTES
-            || entry.offset < REGION_HEADER_BYTES as u64
-        {
-            return None;
+        if entry.len == 0 {
+            return Ok(None);
         }
-        let file = self.file.as_mut()?;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("region handle closed"))?;
         let mut buf = vec![0u8; entry.len as usize];
-        file.seek(SeekFrom::Start(entry.offset)).ok()?;
-        file.read_exact(&mut buf).ok()?;
-        Some((buf, entry.crc32))
+        file.seek(SeekFrom::Start(entry.offset))?;
+        match file.read_exact(&mut buf) {
+            Ok(()) => Ok(Some((buf, entry.crc32))),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn read_slot(&mut self, slot_idx: usize, expected_pos: SectionPos) -> Option<LodSection> {
-        let (buf, crc) = self.read_slot_bytes(slot_idx)?;
+        let (buf, crc) = self.read_slot_bytes(slot_idx).ok()??;
         let sec = decompress_section_record(&buf, Some(crc))?;
         if sec.pos != expected_pos {
             return None;
@@ -1411,32 +1422,40 @@ impl RegionCache {
         res
     }
 
-    /// Load one octree section; a missing, torn or corrupt slot reads as `None`.
+    /// Load one octree section. A missing or malformed slot is a miss; filesystem errors
+    /// propagate so a caller cannot mistake an unread slot for available space.
     pub fn load_octree_section(
         &mut self,
         world_dir: &Path,
         dimension: &str,
         pos: OctreeSectionPos,
-    ) -> Option<(OctreeSection, OctreeMapping)> {
+    ) -> OctreeRead {
         let path = octree_region_path(world_dir, dimension, pos);
         let (_, _, _, slot_idx) = octree_region_slot(pos);
-        let Ok(Some(reg)) = self.get_region(&path, false) else {
-            return None;
+        let Some(reg) = self.get_region(&path, false)? else {
+            return Ok(None);
         };
-        let (bytes, slot_crc) = reg.read_slot_bytes(slot_idx)?;
+        let Some((bytes, slot_crc)) = reg.read_slot_bytes(slot_idx)? else {
+            return Ok(None);
+        };
         if octree_record_crc(&bytes) != Some(slot_crc) {
-            return None;
+            return Ok(None);
         }
-        let (section, mapping) = decode_octree_section(&bytes).ok()?;
-        (section.pos == pos).then_some((section, mapping))
+        Ok(decode_octree_section(&bytes)
+            .ok()
+            .filter(|(section, _)| section.pos == pos))
     }
 }
 
-/// Result of a [`LodIoWorker::load_octree_section`] request that found data.
+pub type OctreeRead = io::Result<Option<(OctreeSection, OctreeMapping)>>;
+
+/// Completion (including misses or failures) of one tagged octree probe.
 pub struct OctreeLoaded {
+    pub world_dir: PathBuf,
     pub dimension: String,
-    pub section: OctreeSection,
-    pub mapping: OctreeMapping,
+    pub pos: OctreeSectionPos,
+    pub request: u64,
+    pub result: OctreeRead,
 }
 
 pub enum IoResponse {
@@ -1465,7 +1484,7 @@ struct IoQueueState {
     /// Coalesced pending octree saves (newest write per `(world_dir, dimension, pos)` wins).
     pending_octree_saves: HashMap<OctreeSaveKey, OctreeSaveJob>,
     octree_save_order: VecDeque<OctreeSaveKey>,
-    pending_octree_loads: VecDeque<OctreeSaveKey>,
+    pending_octree_loads: VecDeque<(OctreeSaveKey, u64)>,
     octree_responses: Vec<OctreeLoaded>,
     in_flight: usize,
     shutdown: bool,
@@ -1587,20 +1606,26 @@ impl LodIoWorker {
         self.shared.wake_worker.notify_one();
     }
 
-    /// Queue a background load; the result (if any is stored) arrives through
-    /// [`Self::drain_octree_responses`].
+    /// Queue a tagged background probe; every completion arrives through
+    /// [`Self::drain_octree_responses`]. Probes needed by mutations go ahead of the warm sweep.
     pub fn load_octree_section(
         &self,
         world_dir: PathBuf,
         dimension: String,
         pos: OctreeSectionPos,
+        request: u64,
+        for_write: bool,
     ) {
         let mut st = self.shared.state.lock().unwrap();
         if st.shutdown {
             return;
         }
-        st.pending_octree_loads
-            .push_back((world_dir, dimension, pos));
+        let job = ((world_dir, dimension, pos), request);
+        if for_write {
+            st.pending_octree_loads.push_front(job);
+        } else {
+            st.pending_octree_loads.push_back(job);
+        }
         self.shared.wake_worker.notify_one();
     }
 
@@ -1646,7 +1671,7 @@ fn run_io_worker(shared: Arc<IoShared>) {
             Save(PathBuf, String, LodSection),
             Load(PathBuf, String, SectionPos),
             OctreeSave(OctreeSaveKey, OctreeSaveJob),
-            OctreeLoad(OctreeSaveKey),
+            OctreeLoad(OctreeSaveKey, u64),
             Exit,
         }
 
@@ -1669,9 +1694,9 @@ fn run_io_worker(shared: Arc<IoShared>) {
                     st.in_flight += 1;
                     break Task::OctreeSave(key, job);
                 }
-                if let Some(key) = st.pending_octree_loads.pop_front() {
+                if let Some((key, request)) = st.pending_octree_loads.pop_front() {
                     st.in_flight += 1;
-                    break Task::OctreeLoad(key);
+                    break Task::OctreeLoad(key, request);
                 }
                 if st.shutdown {
                     break Task::Exit;
@@ -1699,17 +1724,17 @@ fn run_io_worker(shared: Arc<IoShared>) {
                     shared.wake_flusher.notify_all();
                 }
             }
-            Task::OctreeLoad((world_dir, dimension, pos)) => {
-                let loaded = cache.load_octree_section(&world_dir, &dimension, pos);
+            Task::OctreeLoad((world_dir, dimension, pos), request) => {
+                let result = cache.load_octree_section(&world_dir, &dimension, pos);
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
-                if let Some((section, mapping)) = loaded {
-                    st.octree_responses.push(OctreeLoaded {
-                        dimension,
-                        section,
-                        mapping,
-                    });
-                }
+                st.octree_responses.push(OctreeLoaded {
+                    world_dir,
+                    dimension,
+                    pos,
+                    request,
+                    result,
+                });
                 if st.idle() {
                     shared.wake_flusher.notify_all();
                 }
@@ -2181,17 +2206,19 @@ mod tests {
             .unwrap();
 
         let mut cold = RegionCache::default();
-        let (la, lm) = cold.load_octree_section(&dir, dim, a_pos).unwrap();
+        let (la, lm) = cold.load_octree_section(&dir, dim, a_pos).unwrap().unwrap();
         assert_eq!(la.to_dense(), a.to_dense());
         assert_eq!(lm, a_map);
-        let (lb, _) = cold.load_octree_section(&dir, dim, b_pos).unwrap();
+        let (lb, _) = cold.load_octree_section(&dir, dim, b_pos).unwrap().unwrap();
         assert_eq!(lb.to_dense(), b.to_dense());
         assert!(
             cold.load_octree_section(&dir, dim, OctreeSectionPos::new(0, 3, 0, 3))
+                .unwrap()
                 .is_none()
         );
         assert!(
             cold.load_octree_section(&dir, "minecraft:the_nether", a_pos)
+                .unwrap()
                 .is_none()
         );
 
@@ -2204,8 +2231,18 @@ mod tests {
         f.write_all(&[0xFF; 64]).unwrap();
         drop(f);
         let mut recovered = RegionCache::default();
-        assert!(recovered.load_octree_section(&dir, dim, a_pos).is_some());
-        assert!(recovered.load_octree_section(&dir, dim, b_pos).is_none());
+        assert!(
+            recovered
+                .load_octree_section(&dir, dim, a_pos)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            recovered
+                .load_octree_section(&dir, dim, b_pos)
+                .unwrap()
+                .is_none()
+        );
 
         // Corrupt magic on both pages: reads fail soft, the next save quarantines and restarts.
         drop(recovered);
@@ -2215,7 +2252,12 @@ mod tests {
         f.write_all(&[0u8; 16]).unwrap();
         drop(f);
         let mut after = RegionCache::default();
-        assert!(after.load_octree_section(&dir, dim, a_pos).is_none());
+        assert!(
+            after
+                .load_octree_section(&dir, dim, a_pos)
+                .unwrap()
+                .is_none()
+        );
         after
             .save_octree_section(&dir, dim, &b, &b_map, DEFAULT_OCTREE_COMPRESSION)
             .unwrap();
@@ -2224,7 +2266,12 @@ mod tests {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().contains(".corrupt."));
         assert!(quarantined);
-        assert!(after.load_octree_section(&dir, dim, b_pos).is_some());
+        assert!(
+            after
+                .load_octree_section(&dir, dim, b_pos)
+                .unwrap()
+                .is_some()
+        );
 
         // A flipped payload byte fails the record CRC and reads as absent.
         drop(after);
@@ -2233,7 +2280,7 @@ mod tests {
         raw[last] ^= 0xFF;
         fs::write(&path, &raw).unwrap();
         let mut bad = RegionCache::default();
-        assert!(bad.load_octree_section(&dir, dim, b_pos).is_none());
+        assert!(bad.load_octree_section(&dir, dim, b_pos).unwrap().is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2262,21 +2309,36 @@ mod tests {
         ] {
             worker.save_octree_section(dir.clone(), dim.into(), section, OctreeMapping::default());
         }
-        worker.load_octree_section(dir.clone(), dim.into(), pos);
+        worker.load_octree_section(dir.clone(), dim.into(), pos, 7, false);
         worker.flush();
         let responses = worker.drain_octree_responses();
         assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0].section.revision, clear.revision);
-        assert_eq!(responses[0].section.to_dense(), clear.to_dense());
+        let (reloaded, _) = responses
+            .into_iter()
+            .next()
+            .unwrap()
+            .result
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.revision, clear.revision);
+        assert_eq!(reloaded.to_dense(), clear.to_dense());
         drop(worker);
 
         let mut fresh = RegionCache::default();
-        let (reopened, _) = fresh.load_octree_section(&dir, dim, pos).unwrap();
+        let (reopened, _) = fresh.load_octree_section(&dir, dim, pos).unwrap().unwrap();
         assert_eq!(reopened.revision, clear.revision);
         assert_eq!(reopened.to_dense(), clear.to_dense());
-        let (reopened_neighbor, _) = fresh.load_octree_section(&dir, dim, neighbor).unwrap();
+        let (reopened_neighbor, _) = fresh
+            .load_octree_section(&dir, dim, neighbor)
+            .unwrap()
+            .unwrap();
         assert_eq!(reopened_neighbor.to_dense(), other.to_dense());
-        assert!(fresh.load_octree_section(&dir, dim, missing).is_none());
+        assert!(
+            fresh
+                .load_octree_section(&dir, dim, missing)
+                .unwrap()
+                .is_none()
+        );
         assert!(!octree_region_path(&dir, dim, absent_region).exists());
         drop(fresh);
         fs::remove_dir_all(dir).unwrap();
@@ -2298,7 +2360,7 @@ mod tests {
             handle: Mutex::new(None),
         };
         worker.save_octree_section(dir.clone(), dim.into(), old, mapping);
-        worker.load_octree_section(dir.clone(), dim.into(), pos);
+        worker.load_octree_section(dir.clone(), dim.into(), pos, 7, false);
         worker.save_octree_section(
             dir.clone(),
             dim.into(),
@@ -2308,7 +2370,9 @@ mod tests {
         worker.shared.state.lock().unwrap().shutdown = true;
         run_io_worker(Arc::clone(&worker.shared));
 
-        assert!(worker.drain_octree_responses().is_empty());
+        let got = worker.drain_octree_responses();
+        assert_eq!(got.len(), 1);
+        assert!(got.into_iter().next().unwrap().result.unwrap().is_none());
         assert!(!octree_region_path(&dir, dim, pos).exists());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2326,13 +2390,15 @@ mod tests {
         worker.save_octree_section(dir.clone(), dim.into(), first, mapping.clone());
         worker.save_octree_section(dir.clone(), dim.into(), second.clone(), mapping.clone());
         worker.flush();
-        worker.load_octree_section(dir.clone(), dim.into(), pos);
+        worker.load_octree_section(dir.clone(), dim.into(), pos, 7, false);
         worker.flush();
         let got = worker.drain_octree_responses();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].dimension, dim);
-        assert_eq!(got[0].section.to_dense(), second.to_dense());
-        assert_eq!(got[0].mapping, mapping);
+        assert_eq!(got[0].request, 7);
+        let (loaded, loaded_mapping) = got.into_iter().next().unwrap().result.unwrap().unwrap();
+        assert_eq!(loaded.to_dense(), second.to_dense());
+        assert_eq!(loaded_mapping, mapping);
 
         // A save still queued at drop is written before the worker thread exits.
         let other = OctreeSectionPos::new(1, -2, 0, -1);
@@ -2346,7 +2412,10 @@ mod tests {
         );
         drop(worker);
         let mut reader = RegionCache::default();
-        let (loaded, _) = reader.load_octree_section(&dir, dim, other).unwrap();
+        let (loaded, _) = reader
+            .load_octree_section(&dir, dim, other)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.to_dense(), extra.to_dense());
 
         let _ = fs::remove_dir_all(&dir);
