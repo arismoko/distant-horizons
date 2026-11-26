@@ -628,8 +628,8 @@ fn send_status(host: &mut dyn ClientHost) {
             Text::literal(dim),
             Text::literal(cfg.render_distance_chunks.to_string()),
             Text::literal(s.active_sections.to_string()),
-            Text::literal(s.rendered_sections.to_string()),
-            Text::literal(s.rendered_quads.to_string()),
+            Text::literal(s.section_high_water.to_string()),
+            Text::literal(s.resident_sections.to_string()),
             Text::literal(format!("{:.0}%/{:.0}%", rain * 100.0, thunder * 100.0)),
         ],
     ));
