@@ -34,8 +34,10 @@ use std::hash::Hash;
 const VANILLA_SECTION: usize = 16;
 /// Vanilla biome storage is a 4×4×4 quart grid per section.
 const QUART: usize = 4;
-/// Solid blocks written under a G4 surface column so the top face has body beneath it.
-pub const DISTANT_SOLID_DEPTH: i32 = 8;
+/// Solid voxels written under a G4 surface column so steep cliffs and mountain ridges stay
+/// solid instead of showing sky gaps underneath (`24` blocks at detail 0, `24 * 2^level` at
+/// coarse levels; greedy meshing culls all interior faces).
+pub const DISTANT_SOLID_DEPTH: i32 = 24;
 
 /// Where a chunk's voxels came from. The derived order is the priority order: `Loaded` wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

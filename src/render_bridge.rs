@@ -661,9 +661,8 @@ pub fn prepare_draws(
     } else {
         0.0
     };
-    // Atmospheric haze + smooth far-horizon fade over the real LOD radius (matching Voxy
-    // `NormalRenderPipeline.java`: environmental fog + 90%-100% horizon fade).
-    let fog_start = (rd_blocks * 0.45).max(frame.vanilla_far_blocks + 32.0);
+    // Gentle atmospheric haze + smooth 90%-100% far-horizon fade (Voxy `NormalRenderPipeline.java`).
+    let fog_start = (rd_blocks * 0.25).max(frame.vanilla_far_blocks + 32.0);
     let fog_end = rd_blocks.max(fog_start + 64.0);
     let quad_params = quad_params_bytes(
         view_proj,
@@ -672,7 +671,7 @@ pub fn prepare_draws(
         far_dh,
         clip_dist,
         frame.sun_brightness,
-        [fog_start, fog_end, 2.0, 0.0],
+        [fog_start, fog_end, 1.0, 0.0],
         frame.fog_color,
         false, // frames store vanilla gamma; no sRGB decode in the shader
         frame.config.shading_enabled,
