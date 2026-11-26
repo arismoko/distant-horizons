@@ -552,7 +552,10 @@ fn bake_face(
     if qs.is_empty() {
         return BakedFace::EMPTY;
     }
-    qs.sort_by(|x, y| x.depth.total_cmp(&y.depth));
+    // Exact total order: quantize depth to 1/1024-block steps so coplanar overlays
+    // (e.g. `grass_block_side` + `grass_block_side_overlay`) sort deterministically with
+    // tinted overlays ahead of base dirt without an epsilon comparator.
+    qs.sort_by_key(|q| ((q.depth * 1024.0).round() as i32, !q.tinted));
     let nearest = qs[0].depth;
     // Voxy: a face deeper than -0.1 exists (`offset < -0.1` is empty).
     if nearest < -0.1 {
@@ -569,6 +572,7 @@ fn bake_face(
     for j in 0..FACE_GRID {
         for i in 0..FACE_GRID {
             let (mut r, mut g, mut b, mut a_sum) = (0u32, 0u32, 0u32, 0u32);
+            let (mut tr, mut tg, mut tb, mut tw) = (0u32, 0u32, 0u32, 0u32);
             let mut weight = 0u32;
             let mut tint_votes = 0u32;
             let mut taken = 0u32;
@@ -615,6 +619,10 @@ fn bake_face(
                         taken += 1;
                         if q.tinted {
                             tint_votes += 1;
+                            tr += px[0] as u32 * w;
+                            tg += px[1] as u32 * w;
+                            tb += px[2] as u32 * w;
+                            tw += w;
                         }
                         break;
                     }
@@ -623,7 +631,14 @@ fn bake_face(
             if taken == 0 {
                 continue;
             }
-            let mut rgb = [(r / weight) as u8, (g / weight) as u8, (b / weight) as u8];
+            // When a texel hits a tinted overlay (e.g. grass_block_side_overlay along the top row
+            // of a 4x4 face), keep the tinted overlay's greyscale RGB unblended with the brown dirt
+            // below so the shader's greyscale partial-tint test tints the grass lip green.
+            let mut rgb = if tw > 0 && tint_votes > 0 {
+                [(tr / tw) as u8, (tg / tw) as u8, (tb / tw) as u8]
+            } else {
+                [(r / weight) as u8, (g / weight) as u8, (b / weight) as u8]
+            };
             if let Some(m) = fixed_mul {
                 rgb = mix_rgb(rgb, m);
             }

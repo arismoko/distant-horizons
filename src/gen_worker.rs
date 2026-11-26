@@ -15,7 +15,9 @@
 
 use crate::config::ThreadPreset;
 use crate::lod::SectionPos;
-use mod_api::{ChunkSnapshot, DetachedChunkGenerator, SavedChunkReader, TerrainColumn};
+use mod_api::{
+    ChunkSnapshot, DetachedChunkGenerator, GenerationStage, SavedChunkReader, TerrainColumn,
+};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -45,6 +47,9 @@ struct GenJob {
     pos: SectionPos,
     generator: DetachedChunkGenerator,
     saved_reader: Option<SavedChunkReader>,
+    /// When set on a `detail == 0` job, unsaved chunks run `generate_chunk(chunk, stage)` so
+    /// near/mid distant terrain gets real vanilla trees, foliage, and surface features.
+    feature_stage: Option<GenerationStage>,
     cells: Vec<(usize, usize)>,
 }
 
@@ -58,6 +63,8 @@ pub struct GenResult {
     pub samples: Vec<Option<TerrainColumn>>,
     /// Chunks read from saved Anvil storage (G3). Their columns are absent from `cells`.
     pub saved_chunks: Vec<([i32; 2], ChunkSnapshot)>,
+    /// Chunks generated at `Features`/`Light` stage (G4 full 3D chunks with trees).
+    pub generated_chunks: Vec<([i32; 2], ChunkSnapshot)>,
     pub outcome: GenOutcome,
 }
 
@@ -192,6 +199,7 @@ impl GenWorkerPool {
         pos: SectionPos,
         generator: DetachedChunkGenerator,
         saved_reader: Option<SavedChunkReader>,
+        feature_stage: Option<GenerationStage>,
         cells: Vec<(usize, usize)>,
     ) -> bool {
         if cells.is_empty() {
@@ -235,6 +243,7 @@ impl GenWorkerPool {
             pos,
             generator,
             saved_reader,
+            feature_stage,
             cells,
         });
         self.shared.cv.notify_one();
@@ -462,36 +471,50 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
         let run_result = catch_unwind(AssertUnwindSafe(|| {
             let mut samples = Vec::with_capacity(job.cells.len());
             let mut saved_chunks: Vec<([i32; 2], ChunkSnapshot)> = Vec::new();
+            let mut generated_chunks: Vec<([i32; 2], ChunkSnapshot)> = Vec::new();
             let mut outcome = GenOutcome::Complete;
             let mut query = Vec::with_capacity(WORKER_CHUNK_COLS);
             let mut fallback_cells: Vec<(usize, usize)> = Vec::with_capacity(job.cells.len());
 
-            // G3: a detail-0 section is 4x4 chunks; ingest every already-saved chunk straight
-            // from Anvil storage. Coarser sections are filled by downsampling their children.
-            if job.pos.detail == 0
-                && let Some(reader) = job.saved_reader.as_ref()
-            {
+            // G3 + G4 full 3D chunks for detail-0 (4x4 chunks): read saved Anvil chunks first,
+            // then generate unsaved chunks at `feature_stage` (`Features`/`Light`) so near/mid
+            // terrain carries real vanilla trees and foliage. Coarser rings stay on fast column
+            // sampling.
+            if job.pos.detail == 0 && (job.saved_reader.is_some() || job.feature_stage.is_some()) {
                 let mut chunk_state: HashMap<[i32; 2], bool> = HashMap::new();
                 for &(cx, cz) in &job.cells {
                     let chunk = [(ox + cx as i32) >> 4, (oz + cz as i32) >> 4];
-                    let saved = match chunk_state.get(&chunk) {
+                    let covered = match chunk_state.get(&chunk) {
                         Some(&known) => known,
                         None => {
                             if !is_job_valid(&shared, &job) {
-                                return (samples, saved_chunks, Vec::new(), GenOutcome::Cancelled);
+                                return (
+                                    samples,
+                                    saved_chunks,
+                                    generated_chunks,
+                                    Vec::new(),
+                                    GenOutcome::Cancelled,
+                                );
                             }
-                            let found = match reader.read(chunk) {
-                                Ok(Some(snap)) => {
-                                    saved_chunks.push((chunk, snap));
-                                    true
-                                }
-                                Ok(None) | Err(_) => false,
-                            };
+                            let mut found = false;
+                            if let Some(reader) = job.saved_reader.as_ref()
+                                && let Ok(Some(snap)) = reader.read(chunk)
+                            {
+                                saved_chunks.push((chunk, snap));
+                                found = true;
+                            }
+                            if !found
+                                && let Some(stage) = job.feature_stage
+                                && let Ok(snap) = job.generator.generate_chunk(chunk, stage)
+                            {
+                                generated_chunks.push((chunk, snap));
+                                found = true;
+                            }
                             chunk_state.insert(chunk, found);
                             found
                         }
                     };
-                    if !saved {
+                    if !covered {
                         fallback_cells.push((cx, cz));
                     }
                 }
@@ -499,7 +522,7 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
                 fallback_cells.extend_from_slice(&job.cells);
             }
 
-            // G4: everything not saved is sampled by the detached generator.
+            // G4: everything not covered by a 3D snapshot is sampled by the detached generator.
             for chunk in fallback_cells.chunks(WORKER_CHUNK_COLS) {
                 if !is_job_valid(&shared, &job) {
                     outcome = GenOutcome::Cancelled;
@@ -520,12 +543,24 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
                     }
                 }
             }
-            (samples, saved_chunks, fallback_cells, outcome)
+            (
+                samples,
+                saved_chunks,
+                generated_chunks,
+                fallback_cells,
+                outcome,
+            )
         }));
 
-        let (samples, saved_chunks, cells, outcome) = match run_result {
+        let (samples, saved_chunks, generated_chunks, cells, outcome) = match run_result {
             Ok(parts) => parts,
-            Err(_) => (Vec::new(), Vec::new(), Vec::new(), GenOutcome::Error),
+            Err(_) => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                GenOutcome::Error,
+            ),
         };
 
         // DH `threadRunTimeRatio`: idle for `busy * (1/ratio - 1)` so the thread runs `ratio` of
@@ -553,6 +588,7 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
                 cells,
                 samples,
                 saved_chunks,
+                generated_chunks,
                 outcome,
             });
     }

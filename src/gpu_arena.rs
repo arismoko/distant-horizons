@@ -349,6 +349,149 @@ impl From<BufferError> for ArenaError {
     }
 }
 
+/// Size in bytes of `TransSortMeta` (`visible_count`, `pad0`, 256 counts, 256 offsets).
+pub const TRANS_SORT_META_BYTES: u64 = (2 + 256 * 2) * 4;
+/// Size in bytes of one `TransSortEntries` element (`uvec2(section_id, bucket)`).
+pub const TRANS_SORT_ENTRY_BYTES: u64 = 8;
+/// Size in bytes of one `GpuNode` record (`uvec4 a; uvec4 b;`).
+pub const GPU_NODE_BYTES: u64 = 32;
+/// Maximum nodes in the GPU hierarchical octree (`8 MiB` at 32 bytes/node).
+pub const GPU_MAX_NODES: u64 = 1 << 18;
+/// Maximum node indices in each ping-pong traversal queue (`512 KiB`).
+pub const GPU_TRAV_QUEUE_CAP: u32 = 1 << 17;
+/// Size in bytes of one ping-pong queue buffer (`4 * u32` header + `GPU_TRAV_QUEUE_CAP * u32`).
+pub const GPU_TRAV_QUEUE_BYTES: u64 = (4 + GPU_TRAV_QUEUE_CAP as u64) * 4;
+/// Size in bytes of one indirect compute dispatch buffer (`wg_x, wg_y, wg_z, pad`).
+pub const GPU_DISPATCH_BYTES: u64 = 16;
+
+/// One 32-byte node in `NodeBuffer` for `voxy_traversal.csh`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuNode {
+    pub pos0: u32,
+    pub pos1: u32,
+    pub section_id: u32,
+    pub child_base: u32,
+    pub child_mask: u32,
+    pub aabb: u32,
+}
+
+impl GpuNode {
+    pub const NONE: u32 = u32::MAX;
+
+    pub fn to_bytes(self) -> [u8; 32] {
+        let words = [
+            self.pos0,
+            self.pos1,
+            self.section_id,
+            self.child_base,
+            self.child_mask,
+            self.aabb,
+            0,
+            0,
+        ];
+        let mut out = [0u8; 32];
+        for (i, w) in words.into_iter().enumerate() {
+            out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// Builds a compact top-down octree node table (`detail = MAX_OCTREE_DETAIL` roots down to
+/// `detail = 0` leaves) with contiguous 8-child blocks for `voxy_traversal.csh`.
+pub fn build_node_tree(
+    live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+) -> (Vec<GpuNode>, Vec<u32>) {
+    use crate::octree::{MAX_OCTREE_DETAIL, child_index};
+
+    let mut nodes: Vec<GpuNode> = Vec::new();
+    let mut root_index: HashMap<[i32; 3], usize> = HashMap::new();
+    let mut roots: Vec<u32> = Vec::new();
+
+    // Ensure a root node exists at `MAX_OCTREE_DETAIL` and return its index.
+    let ensure_root = |pos: [i32; 3],
+                       nodes: &mut Vec<GpuNode>,
+                       root_index: &mut HashMap<[i32; 3], usize>,
+                       roots: &mut Vec<u32>|
+     -> usize {
+        if let Some(&idx) = root_index.get(&pos) {
+            return idx;
+        }
+        let idx = nodes.len();
+        let [pos0, pos1] = pack_section_pos(MAX_OCTREE_DETAIL, pos[0], pos[1], pos[2]);
+        nodes.push(GpuNode {
+            pos0,
+            pos1,
+            section_id: GpuNode::NONE,
+            child_base: GpuNode::NONE,
+            child_mask: 0,
+            aabb: SectionAabb::FULL.pack(),
+        });
+        root_index.insert(pos, idx);
+        roots.push(idx as u32);
+        idx
+    };
+
+    for (&section_id, &(level, pos, aabb)) in live_meta {
+        let clamped_level = level.min(MAX_OCTREE_DETAIL);
+        // Walk from root down to `clamped_level`, allocating 8-child blocks as needed.
+        let shift = MAX_OCTREE_DETAIL - clamped_level;
+        let root_pos = [pos[0] >> shift, pos[1] >> shift, pos[2] >> shift];
+        let mut cur_idx = ensure_root(root_pos, &mut nodes, &mut root_index, &mut roots);
+        let mut cur_pos = root_pos;
+        let mut cur_level = MAX_OCTREE_DETAIL;
+        while cur_level > clamped_level {
+            let next_level = cur_level - 1;
+            let next_shift = next_level - clamped_level;
+            let next_pos = [
+                pos[0] >> next_shift,
+                pos[1] >> next_shift,
+                pos[2] >> next_shift,
+            ];
+            let oct = child_index(
+                (next_pos[0] & 1) as usize,
+                (next_pos[1] & 1) as usize,
+                (next_pos[2] & 1) as usize,
+            );
+            let child_base = if nodes[cur_idx].child_base != GpuNode::NONE {
+                nodes[cur_idx].child_base as usize
+            } else {
+                let base = nodes.len();
+                nodes[cur_idx].child_base = base as u32;
+                for ci in 0..8usize {
+                    let cx = cur_pos[0] * 2 + (ci & 1) as i32;
+                    let cy = cur_pos[1] * 2 + ((ci >> 2) & 1) as i32;
+                    let cz = cur_pos[2] * 2 + ((ci >> 1) & 1) as i32;
+                    let [p0, p1] = pack_section_pos(next_level, cx, cy, cz);
+                    nodes.push(GpuNode {
+                        pos0: p0,
+                        pos1: p1,
+                        section_id: GpuNode::NONE,
+                        child_base: GpuNode::NONE,
+                        child_mask: 0,
+                        aabb: SectionAabb::FULL.pack(),
+                    });
+                }
+                base
+            };
+            nodes[cur_idx].child_mask |= 1u32 << oct;
+            // Any internal node with children must keep FULL bounds regardless of HashMap
+            // iteration order so frustum/Hi-Z culling never drops children outside a masked mesh.
+            nodes[cur_idx].aabb = SectionAabb::FULL.pack();
+            cur_idx = child_base + oct;
+            cur_pos = next_pos;
+            cur_level = next_level;
+        }
+        nodes[cur_idx].section_id = section_id;
+        // Leaf nodes tighten to their exact geometry AABB; internal nodes keep FULL.
+        if nodes[cur_idx].child_mask == 0 {
+            nodes[cur_idx].aabb = aabb.pack();
+        }
+    }
+
+    (nodes, roots)
+}
+
 /// Whole-buffer [`StorageBufferSlice`]s of the arena's bound buffers.
 #[derive(Clone, Copy)]
 pub struct ArenaSlices {
@@ -356,6 +499,15 @@ pub struct ArenaSlices {
     pub sections: StorageBufferSlice,
     pub opaque_commands: StorageBufferSlice,
     pub translucent_commands: StorageBufferSlice,
+    pub trans_sort_meta: StorageBufferSlice,
+    pub trans_sort_entries: StorageBufferSlice,
+    pub nodes: StorageBufferSlice,
+    pub roots: StorageBufferSlice,
+    pub visibility: StorageBufferSlice,
+    pub queue_a: StorageBufferSlice,
+    pub queue_b: StorageBufferSlice,
+    pub dispatch_a: StorageBufferSlice,
+    pub dispatch_b: StorageBufferSlice,
     pub models: StorageBufferSlice,
     pub biome_tints: StorageBufferSlice,
 }
@@ -366,8 +518,26 @@ pub struct GpuArena {
     pub sections: StorageBufferRef,
     /// `max_sections * 7` commands, `indirect: true`, written by `voxy_cmdgen.csh`.
     pub opaque_commands: StorageBufferRef,
-    /// `max_sections` commands, `indirect: true`.
+    /// `max_sections` commands, `indirect: true`, sorted back-to-front by `voxy_trans_scatter.csh`.
     pub translucent_commands: StorageBufferRef,
+    /// 256-bucket Manhattan-distance sort histogram & prefix-summed offsets (`voxy_trans_*.csh`).
+    pub trans_sort_meta: StorageBufferRef,
+    /// Visible translucent `(section_id, bucket)` pairs written by `voxy_cmdgen.csh`.
+    pub trans_sort_entries: StorageBufferRef,
+    /// Hierarchical octree node table (`voxy_traversal.csh`).
+    pub nodes: StorageBufferRef,
+    /// Top-level `detail == MAX_OCTREE_DETAIL` root node indices (`voxy_trav_init.csh`).
+    pub roots: StorageBufferRef,
+    /// Per-section visibility flags written by `voxy_traversal.csh` and read by `voxy_cmdgen.csh`.
+    pub visibility: StorageBufferRef,
+    /// Ping-pong traversal queue A (`count`, pad, `items[]`).
+    pub queue_a: StorageBufferRef,
+    /// Ping-pong traversal queue B (`count`, pad, `items[]`).
+    pub queue_b: StorageBufferRef,
+    /// Indirect compute dispatch arguments for queue A (`indirect: true`).
+    pub dispatch_a: StorageBufferRef,
+    /// Indirect compute dispatch arguments for queue B (`indirect: true`).
+    pub dispatch_b: StorageBufferRef,
     /// Baked model table: `MODEL_WORDS` (16) `u32`s per 20-bit state id (see `voxy_quads.vsh`).
     pub models: StorageBufferRef,
     /// Biome tint LUT: grass, foliage, water `0x00BBGGRR` per 9-bit biome id.
@@ -379,21 +549,27 @@ pub struct GpuArena {
     ids: IdAllocator,
     /// Quad-arena start (in quads) per live section id.
     live: HashMap<u32, u32>,
+    /// `(level, pos, aabb)` per live section id for building the GPU octree node table.
+    live_meta: HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    nodes_dirty: bool,
+    root_count: u32,
     dirty: BTreeMap<u32, SectionMeta>,
 }
 
 impl GpuArena {
     pub fn new(host: &mut dyn ClientHost, config: ArenaConfig) -> Result<Self, ArenaError> {
-        let mut sections = config.max_sections.max(1);
+        let initial_sections = config.max_sections.max(1);
+        let min_sections = initial_sections.min(1 << 14);
+        let mut sections = initial_sections;
         let mut geometry = config.geometry_bytes.max(MIN_GEOMETRY_BYTES);
         loop {
             match Self::try_new(host, sections, geometry) {
                 Ok(arena) => return Ok(arena),
                 Err(ArenaError::Buffer(_))
-                    if geometry > MIN_GEOMETRY_BYTES || sections > 1 << 14 =>
+                    if geometry > MIN_GEOMETRY_BYTES || sections > min_sections =>
                 {
                     geometry = (geometry / 2).max(MIN_GEOMETRY_BYTES);
-                    sections = (sections / 2).max(1 << 14);
+                    sections = (sections / 2).max(min_sections);
                 }
                 Err(e) => return Err(e),
             }
@@ -427,34 +603,50 @@ impl GpuArena {
             host,
             StorageBufferDescriptor::new(n * SECTION_METADATA_BYTES),
         )?;
-        let opaque_commands = make(
-            host,
-            StorageBufferDescriptor::new(
-                n * OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES,
-            )
-            .indirect(true),
-        )?;
-        let translucent_commands = make(
-            host,
-            StorageBufferDescriptor::new(
-                n * TRANSLUCENT_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES,
-            )
-            .indirect(true),
-        )?;
-        let models = make(
-            host,
-            StorageBufferDescriptor::new(MODEL_COUNT * MODEL_WORDS * 4),
-        )?;
-        let biome_tints = make(host, StorageBufferDescriptor::new(BIOME_COUNT * 3 * 4))?;
         let cmd_bytes = n * OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
         let tcmd_bytes = n * TRANSLUCENT_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
+        let tsort_entry_bytes = n * TRANS_SORT_ENTRY_BYTES;
+        let opaque_commands = make(host, StorageBufferDescriptor::new(cmd_bytes).indirect(true))?;
+        let translucent_commands = make(
+            host,
+            StorageBufferDescriptor::new(tcmd_bytes).indirect(true),
+        )?;
+        let trans_sort_meta = make(host, StorageBufferDescriptor::new(TRANS_SORT_META_BYTES))?;
+        let trans_sort_entries = make(host, StorageBufferDescriptor::new(tsort_entry_bytes))?;
+        let node_bytes = GPU_MAX_NODES * GPU_NODE_BYTES;
+        let root_bytes = GPU_TRAV_QUEUE_CAP as u64 * 4;
+        let vis_bytes = n * 4;
+        let nodes = make(host, StorageBufferDescriptor::new(node_bytes))?;
+        let roots = make(host, StorageBufferDescriptor::new(root_bytes))?;
+        let visibility = make(host, StorageBufferDescriptor::new(vis_bytes))?;
+        let queue_a = make(host, StorageBufferDescriptor::new(GPU_TRAV_QUEUE_BYTES))?;
+        let queue_b = make(host, StorageBufferDescriptor::new(GPU_TRAV_QUEUE_BYTES))?;
+        let dispatch_a = make(
+            host,
+            StorageBufferDescriptor::new(GPU_DISPATCH_BYTES).indirect(true),
+        )?;
+        let dispatch_b = make(
+            host,
+            StorageBufferDescriptor::new(GPU_DISPATCH_BYTES).indirect(true),
+        )?;
         let model_bytes = MODEL_COUNT * MODEL_WORDS * 4;
         let biome_bytes = BIOME_COUNT * 3 * 4;
+        let models = make(host, StorageBufferDescriptor::new(model_bytes))?;
+        let biome_tints = make(host, StorageBufferDescriptor::new(biome_bytes))?;
         let slices = ArenaSlices {
             quads: quads.slice(0, geometry_bytes),
             sections: sections.slice(0, n * SECTION_METADATA_BYTES),
             opaque_commands: opaque_commands.slice(0, cmd_bytes),
             translucent_commands: translucent_commands.slice(0, tcmd_bytes),
+            trans_sort_meta: trans_sort_meta.slice(0, TRANS_SORT_META_BYTES),
+            trans_sort_entries: trans_sort_entries.slice(0, tsort_entry_bytes),
+            nodes: nodes.slice(0, node_bytes),
+            roots: roots.slice(0, root_bytes),
+            visibility: visibility.slice(0, vis_bytes),
+            queue_a: queue_a.slice(0, GPU_TRAV_QUEUE_BYTES),
+            queue_b: queue_b.slice(0, GPU_TRAV_QUEUE_BYTES),
+            dispatch_a: dispatch_a.slice(0, GPU_DISPATCH_BYTES),
+            dispatch_b: dispatch_b.slice(0, GPU_DISPATCH_BYTES),
             models: models.slice(0, model_bytes),
             biome_tints: biome_tints.slice(0, biome_bytes),
         };
@@ -466,10 +658,22 @@ impl GpuArena {
             sections,
             opaque_commands,
             translucent_commands,
+            trans_sort_meta,
+            trans_sort_entries,
+            nodes,
+            roots,
+            visibility,
+            queue_a,
+            queue_b,
+            dispatch_a,
+            dispatch_b,
             max_sections,
             quad_alloc: FreeList::new(geometry_bytes / QUAD_BYTES),
             ids: IdAllocator::new(max_sections),
             live: HashMap::new(),
+            live_meta: HashMap::new(),
+            nodes_dirty: false,
+            root_count: 0,
             dirty: BTreeMap::new(),
         })
     }
@@ -499,6 +703,10 @@ impl GpuArena {
 
     pub fn live_sections(&self) -> usize {
         self.live.len()
+    }
+
+    pub fn root_count(&self) -> u32 {
+        self.root_count
     }
 
     /// Uploads `section` (replacing `old_id` when given, like `uploadReplaceSection`) and returns
@@ -537,6 +745,9 @@ impl GpuArena {
             return Err(e.into());
         }
         self.live.insert(id, start as u32);
+        self.live_meta
+            .insert(id, (section.level, section.pos, section.aabb));
+        self.nodes_dirty = true;
         self.dirty
             .insert(id, SectionMeta::new(section, start as u32));
         if let Some(old) = old_id {
@@ -551,6 +762,8 @@ impl GpuArena {
             .live
             .remove(&id)
             .ok_or(ArenaError::UnknownSection(id))?;
+        self.live_meta.remove(&id);
+        self.nodes_dirty = true;
         self.quad_alloc.free(start as u64);
         self.ids.free(id);
         self.dirty.insert(id, SectionMeta::default());
@@ -583,6 +796,34 @@ impl GpuArena {
                 .write_range(&*host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
         }
         self.dirty.clear();
+        if self.nodes_dirty {
+            let (node_list, root_list) = build_node_tree(&self.live_meta);
+            if (node_list.len() as u64) > GPU_MAX_NODES {
+                eprintln!(
+                    "distantsunrises: GPU node tree ({} nodes) exceeds GPU_MAX_NODES ({GPU_MAX_NODES}); skipping node/root upload",
+                    node_list.len()
+                );
+                self.nodes_dirty = false;
+                return Ok(());
+            }
+            if !node_list.is_empty() {
+                let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
+                for n in &node_list {
+                    nbytes.extend_from_slice(&n.to_bytes());
+                }
+                self.nodes.write_range(&*host, 0, &nbytes)?;
+            }
+            let rcount = root_list.len().min(GPU_TRAV_QUEUE_CAP as usize);
+            if rcount > 0 {
+                let mut rbytes = Vec::with_capacity(rcount * 4);
+                for &r in &root_list[..rcount] {
+                    rbytes.extend_from_slice(&r.to_le_bytes());
+                }
+                self.roots.write_range(&*host, 0, &rbytes)?;
+            }
+            self.root_count = rcount as u32;
+            self.nodes_dirty = false;
+        }
         Ok(())
     }
 
@@ -620,6 +861,15 @@ impl GpuArena {
         self.sections.release(&*host)?;
         self.opaque_commands.release(&*host)?;
         self.translucent_commands.release(&*host)?;
+        self.trans_sort_meta.release(&*host)?;
+        self.trans_sort_entries.release(&*host)?;
+        self.nodes.release(&*host)?;
+        self.roots.release(&*host)?;
+        self.visibility.release(&*host)?;
+        self.queue_a.release(&*host)?;
+        self.queue_b.release(&*host)?;
+        self.dispatch_a.release(&*host)?;
+        self.dispatch_b.release(&*host)?;
         self.models.release(&*host)?;
         self.biome_tints.release(&*host)?;
         Ok(())
@@ -769,5 +1019,39 @@ mod tests {
         assert_eq!(m.b, [1 | 2 << 16, 3 | 4 << 16, 5 | 6 << 16, 7 | 8 << 16]);
         assert_eq!(m.to_bytes().len(), 32);
         assert_eq!(SectionAabb::FULL.pack() >> 15, 0b11111_11111_11111);
+    }
+
+    #[test]
+    fn gpu_node_tree_links_roots_to_leaves() {
+        let mut live = HashMap::new();
+        live.insert(10, (0u8, [-3, 2, 5], SectionAabb::FULL));
+        live.insert(20, (4u8, [-1, 0, 0], SectionAabb::FULL));
+        let (nodes, roots) = build_node_tree(&live);
+        assert_eq!(roots.len(), 1);
+        let root = nodes[roots[0] as usize];
+        assert_eq!(root.section_id, 20);
+        assert_ne!(root.child_mask, 0);
+        // Walk down 4 levels from root to detail-0 leaf section 10.
+        let mut cur = root;
+        for _ in 0..4 {
+            assert_ne!(cur.child_base, GpuNode::NONE);
+            let ci = cur.child_mask.trailing_zeros() as usize;
+            cur = nodes[cur.child_base as usize + ci];
+        }
+        assert_eq!(cur.section_id, 10);
+        assert_eq!(unpack_section_pos([cur.pos0, cur.pos1]), (0, [-3, 2, 5]));
+    }
+
+    #[test]
+    fn gpu_node_tree_keeps_parent_aabb_full_regardless_of_insert_order() {
+        let tight = SectionAabb {
+            offset: [1, 2, 3],
+            size: [4, 5, 6],
+        };
+        let mut live = HashMap::new();
+        live.insert(1, (4u8, [0, 0, 0], tight));
+        live.insert(2, (0u8, [0, 0, 0], tight));
+        let (nodes, roots) = build_node_tree(&live);
+        assert_eq!(nodes[roots[0] as usize].aabb, SectionAabb::FULL.pack());
     }
 }

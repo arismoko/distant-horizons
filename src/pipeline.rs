@@ -9,7 +9,7 @@ use crate::bakery::{
     MODEL_TRANSLUCENT, SpriteError, SpritePixels, SpriteSource, default_translucent, pack_rgba,
 };
 use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
-use crate::mesh::{SectionQuads, mesh_octree_section};
+use crate::mesh::{SectionQuads, mesh_octree_section_masked};
 use crate::network::octree_sync::{ClientEvent, MappingEntry, OctreeSectionDto, ServerSource};
 use crate::octree::Voxel;
 use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
@@ -29,8 +29,10 @@ use std::sync::{LazyLock, Mutex};
 
 /// Block models baked per client tick (each bake reads sprite pixels on the CPU).
 const BAKES_PER_TICK: usize = 64;
-/// Sections meshed per client tick.
+/// Maximum dirty sections handed off to the background mesher thread per client tick.
 const MESHES_PER_TICK: usize = 16;
+/// Backpressure cap on the background mesher queue so RAM stays bounded while flying fast.
+const MAX_PENDING_MESH_JOBS: usize = 64;
 
 /// Octree voxel ids: `0` is air, `n` is `states[n - 1]`; biome ids index `biomes`.
 #[derive(Default)]
@@ -72,13 +74,15 @@ impl Mapper {
         id
     }
 
-    /// The octree id of `key`'s first (default) state; air and unknown blocks are `0`.
+    /// The octree id of `key`'s vanilla default state (`Block.defaultBlockState`, e.g.
+    /// `grass_block[snowy=false]` rather than ordinal 0 `snowy=true`); air and unknown blocks
+    /// are `0`.
     fn block_key(&mut self, host: &dyn Host, key: BlockKey) -> u32 {
-        match host
-            .block_states()
-            .states_of(key)
-            .and_then(|r| r.iter().next())
-        {
+        match host.block_state_default(key).or_else(|| {
+            host.block_states()
+                .states_of(key)
+                .and_then(|r| r.iter().next())
+        }) {
             Some(state) => self.block(host, state),
             None => 0,
         }
@@ -169,15 +173,111 @@ impl Mapper {
     }
 }
 
+/// Compact immutable snapshot of `ModelMeta` by block id, shared with the background mesher
+/// thread so meshing never blocks the main render thread or holds `PIPELINE`.
+#[derive(Default)]
+struct MetaTable(Vec<crate::bakery::ModelMeta>);
+
+impl crate::bakery::ModelLookup for MetaTable {
+    fn meta(&self, block_id: u32) -> crate::bakery::ModelMeta {
+        self.0
+            .get(block_id as usize)
+            .copied()
+            .unwrap_or(crate::bakery::ModelMeta::EMPTY)
+    }
+}
+
+struct MeshJob {
+    dim: String,
+    pos: OctreeSectionPos,
+    epoch: u64,
+    section: OctreeSection,
+    borders: NeighborBorders,
+    covered: u8,
+    metas: Arc<MetaTable>,
+}
+
+type MeshDone = (String, OctreeSectionPos, u64, BuiltSection);
+
+struct MeshWorker {
+    queue: Arc<(Mutex<VecDeque<MeshJob>>, std::sync::Condvar)>,
+    done: Arc<Mutex<Vec<MeshDone>>>,
+}
+
+impl MeshWorker {
+    fn new() -> Self {
+        let queue = Arc::new((
+            Mutex::new(VecDeque::<MeshJob>::new()),
+            std::sync::Condvar::new(),
+        ));
+        let done = Arc::new(Mutex::new(Vec::<MeshDone>::new()));
+        let q_bg = Arc::clone(&queue);
+        let d_bg = Arc::clone(&done);
+        let _ = std::thread::Builder::new()
+            .name("dh-mesher".to_owned())
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let (lock, cv) = &*q_bg;
+                        let mut q = lock.lock().unwrap();
+                        while q.is_empty() {
+                            q = cv.wait(q).unwrap();
+                        }
+                        q.pop_front().unwrap()
+                    };
+                    let quads = mesh_octree_section_masked(
+                        &job.section,
+                        &job.borders,
+                        &*job.metas,
+                        job.covered,
+                    );
+                    let built = built_section(&quads);
+                    d_bg.lock()
+                        .unwrap()
+                        .push((job.dim, job.pos, job.epoch, built));
+                }
+            });
+        Self { queue, done }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.queue.0.lock().unwrap().len()
+    }
+
+    fn push(&self, job: MeshJob) {
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().push_back(job);
+        cv.notify_one();
+    }
+
+    fn clear_dim(&self, dim: &str) {
+        self.queue.0.lock().unwrap().retain(|j| j.dim != dim);
+        self.done.lock().unwrap().retain(|(d, _, _, _)| d != dim);
+    }
+
+    fn drain_done(&self) -> Vec<MeshDone> {
+        std::mem::take(&mut *self.done.lock().unwrap())
+    }
+}
+
+static MESH_WORKER: LazyLock<MeshWorker> = LazyLock::new(MeshWorker::new);
+
 #[derive(Default)]
 struct Pipeline {
     stores: HashMap<String, OctreeIngestStore>,
     mapper: Mapper,
     models: BakedModelTable,
+    meta_snapshot: Arc<MetaTable>,
     baked: usize,
     models_dirty: bool,
     dirty: HashMap<String, VecDeque<OctreeSectionPos>>,
     queued: HashMap<String, HashSet<OctreeSectionPos>>,
+    /// Monotonic epoch per `(dim, pos)` so stale off-thread mesh results are dropped before upload.
+    next_epoch: u64,
+    section_epoch: HashMap<(String, OctreeSectionPos), u64>,
+    /// Sections currently uploaded to the GPU arena (strictly leaf sections: never both parent
+    /// and child for the same volume).
+    rendered: HashMap<String, HashSet<OctreeSectionPos>>,
     /// Sections changed since their last save.
     unsaved: HashMap<String, HashSet<OctreeSectionPos>>,
     /// Sections already asked of disk or of the server, per dimension.
@@ -186,23 +286,98 @@ struct Pipeline {
 
 static PIPELINE: LazyLock<Mutex<Pipeline>> = LazyLock::new(Default::default);
 
+/// 8-bit mask of child octants of `pos` that already have a rendered (uploaded to the GPU arena)
+/// finer section or descendant. Used when meshing a parent so an octant is never masked out
+/// before its replacement child is actually drawn (preventing X-ray pop-in holes).
+fn covered_rendered_mask(rendered: &HashSet<OctreeSectionPos>, pos: OctreeSectionPos) -> u8 {
+    let Some(kids) = pos.children() else {
+        return 0;
+    };
+    let mut mask = 0u8;
+    for (ci, child) in kids.into_iter().enumerate() {
+        if rendered.contains(&child)
+            || (child.detail > 0 && covered_rendered_mask(rendered, child) != 0)
+        {
+            mask |= 1u8 << ci;
+        }
+    }
+    mask
+}
+
+/// 8-bit mask of child octants of `pos` (indexed by `child_index(cx, cy, cz)`) that already have
+/// a non-empty finer section or descendant in `store`. Covered octants are masked out when meshing
+/// `pos` so parent and child never overlap, while uncovered octants still draw so LOD ring
+/// boundaries never open sky holes or flat stone ceilings.
+#[cfg(test)]
+pub(crate) fn covered_child_mask(store: &OctreeIngestStore, pos: OctreeSectionPos) -> u8 {
+    let Some(kids) = pos.children() else {
+        return 0;
+    };
+    let mut mask = 0u8;
+    for (ci, child) in kids.into_iter().enumerate() {
+        if store.section(child).is_some_and(|s| !s.is_empty())
+            || (child.detail > 0 && has_non_empty_descendant(store, child))
+        {
+            mask |= 1u8 << ci;
+        }
+    }
+    mask
+}
+
+/// Returns `true` when `pos` exists, is non-empty, and has no finer non-empty descendants.
+#[cfg(test)]
+pub(crate) fn is_render_leaf(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
+    let Some(section) = store.section(pos) else {
+        return false;
+    };
+    !section.is_empty() && covered_child_mask(store, pos) == 0
+}
+
+#[cfg(test)]
+fn has_non_empty_descendant(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
+    covered_child_mask(store, pos) != 0
+}
+
 impl Pipeline {
     fn queue(&mut self, dim: &str, positions: impl IntoIterator<Item = OctreeSectionPos>) {
+        let rendered = self.rendered.get(dim);
         let set = self.queued.entry(dim.to_owned()).or_default();
         let queue = self.dirty.entry(dim.to_owned()).or_default();
-        for pos in positions {
+        let mut push = |pos: OctreeSectionPos| {
             if set.insert(pos) {
                 queue.push_back(pos);
+            }
+        };
+        for pos in positions {
+            push(pos);
+            // Evict any currently-rendered ancestor superseded by a finer section, and re-mesh
+            // any currently-rendered same-detail neighbour so touching border walls are culled.
+            if let Some(live) = rendered {
+                let mut anc = pos.parent();
+                while let Some(a) = anc {
+                    if live.contains(&a) {
+                        push(a);
+                    }
+                    anc = a.parent();
+                }
+                for face in Face::ALL {
+                    let nb = pos.neighbor(face);
+                    if live.contains(&nb) {
+                        push(nb);
+                    }
+                }
             }
         }
     }
 }
 
-/// Which source a snapshot came from: G1 (live chunk) or G3 (saved Anvil chunk).
+/// Which source a snapshot came from: G1 (live chunk), G3 (saved Anvil chunk), or G4 (detached
+/// full-chunk generation with trees/features).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotSource {
     Loaded,
     Saved,
+    Distant,
 }
 
 /// Ingest one chunk snapshot into `dim`'s octree store (server thread) and queue the touched
@@ -217,19 +392,35 @@ pub fn ingest_chunk(
 ) -> bool {
     let mut guard = PIPELINE.lock().unwrap();
     let p = &mut *guard;
+    let cave_cull = (source == SnapshotSource::Distant && dim != "minecraft:the_nether")
+        .then(|| (60, p.mapper.block_named(host, "minecraft:stone")));
     let store = p.stores.entry(dim.to_owned()).or_default();
     let mapper = std::cell::RefCell::new(&mut p.mapper);
-    let ingest = match source {
-        SnapshotSource::Loaded => ingest_chunk_snapshot,
-        SnapshotSource::Saved => ingest_saved_chunk,
+    let accepted = match source {
+        SnapshotSource::Loaded => ingest_chunk_snapshot(
+            store,
+            chunk,
+            snapshot,
+            &mut |state| mapper.borrow_mut().block(host, state),
+            &mut |biome| mapper.borrow_mut().biome(biome),
+        ),
+        SnapshotSource::Saved => ingest_saved_chunk(
+            store,
+            chunk,
+            snapshot,
+            &mut |state| mapper.borrow_mut().block(host, state),
+            &mut |biome| mapper.borrow_mut().biome(biome),
+        ),
+        SnapshotSource::Distant => crate::octree_ingest::ingest_chunk_culled(
+            store,
+            chunk,
+            snapshot,
+            crate::octree_ingest::IngestSource::Distant,
+            cave_cull,
+            &mut |state| mapper.borrow_mut().block(host, state),
+            &mut |biome| mapper.borrow_mut().biome(biome),
+        ),
     };
-    let accepted = ingest(
-        store,
-        chunk,
-        snapshot,
-        &mut |state| mapper.borrow_mut().block(host, state),
-        &mut |biome| mapper.borrow_mut().biome(biome),
-    );
     if accepted {
         let mapper = &p.mapper;
         let touched = p
@@ -248,10 +439,13 @@ pub fn ingest_chunk(
 
 /// Drops every section of `dim` (level unload).
 pub fn clear_dimension(dim: &str) {
+    MESH_WORKER.clear_dim(dim);
     let mut p = PIPELINE.lock().unwrap();
     p.stores.remove(dim);
     p.dirty.remove(dim);
     p.queued.remove(dim);
+    p.section_epoch.retain(|(d, _), _| d != dim);
+    p.rendered.remove(dim);
     p.unsaved.remove(dim);
     p.requested.remove(dim);
 }
@@ -394,11 +588,16 @@ fn model_words(index: usize, m: &BakedModel, atlas: &mut [u8]) -> [u32; MODEL_WO
         BakedTint::Water => 3,
     };
     let cutout = m.faces.iter().any(|f| f.cutout);
+    let mut face_tints = 0u32;
+    for (i, face) in m.faces.iter().enumerate() {
+        face_tints |= (u32::from(face.tint_state) & 3) << (16 + i * 2);
+    }
     w[12] = u32::from(m.flags & MODEL_TRANSLUCENT != 0)
         | 2
         | (u32::from(cutout) << 2)
         | (tint_kind << 4)
-        | (u32::from(m.dh_material_id & 0xF) << 8);
+        | (u32::from(m.dh_material_id & 0xF) << 8)
+        | face_tints;
     w[15] = m.mc_entity as u32;
     w
 }
@@ -412,7 +611,10 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
     }
     let mut counts = [0u16; BUCKETS];
     let mut all = Vec::with_capacity(quads.quad_count() as usize);
-    for (i, bucket) in by_bucket.into_iter().enumerate() {
+    for (i, mut bucket) in by_bucket.into_iter().enumerate() {
+        if bucket.len() > u16::MAX as usize {
+            bucket.truncate(u16::MAX as usize);
+        }
         counts[i] = bucket.len() as u16;
         all.extend(bucket);
     }
@@ -436,7 +638,11 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
 /// Client tick: bake pending block models, upload the model and biome tables when they grew, then
 /// mesh dirty sections of `dim` into the GPU arena queue.
 pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
-    let mut guard = PIPELINE.lock().unwrap();
+    // Non-blocking lock: if the server thread is ingesting a distant batch, skip this tick rather
+    // than stalling the main render thread.
+    let Ok(mut guard) = PIPELINE.try_lock() else {
+        return;
+    };
     let p = &mut *guard;
 
     let sprites = AtlasSprites { host };
@@ -462,13 +668,61 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             .iter()
             .flat_map(|t| [t.grass, t.foliage, t.water])
             .collect();
+        let mut metas = Vec::with_capacity(p.mapper.states.len() + 1);
+        for id in 0..=p.mapper.states.len() {
+            metas.push(p.models.meta_for(id as u32));
+        }
+        p.meta_snapshot = Arc::new(MetaTable(metas));
         crate::render_bridge::queue_model_tables(words, tint_words, atlas);
     }
     if p.baked < p.mapper.states.len() {
         return;
     }
 
+    let mut remesh_ancestors: Vec<(String, OctreeSectionPos)> = Vec::new();
+    for (done_dim, pos, epoch, built) in MESH_WORKER.drain_done() {
+        if p.section_epoch.get(&(done_dim.clone(), pos)).copied() != Some(epoch) {
+            continue;
+        }
+        let has_quads = !built.is_empty();
+        let key = (done_dim.clone(), pos.detail, [pos.x, pos.y, pos.z]);
+        submit_built_section(key, built);
+        let changed = if has_quads {
+            p.rendered.entry(done_dim.clone()).or_default().insert(pos)
+        } else {
+            p.rendered
+                .get_mut(&done_dim)
+                .is_some_and(|live| live.remove(&pos))
+        };
+        if changed {
+            let mut anc = pos.parent();
+            while let Some(a) = anc {
+                let should_requeue = if has_quads {
+                    p.rendered
+                        .get(&done_dim)
+                        .is_some_and(|live| live.contains(&a))
+                } else {
+                    p.stores
+                        .get(&done_dim)
+                        .is_some_and(|s| s.section(a).is_some_and(|sec| !sec.is_empty()))
+                };
+                if should_requeue {
+                    remesh_ancestors.push((done_dim.clone(), a));
+                }
+                anc = a.parent();
+            }
+        }
+    }
+    for (anc_dim, anc_pos) in remesh_ancestors {
+        p.queue(&anc_dim, [anc_pos]);
+    }
+
+    let metas = Arc::clone(&p.meta_snapshot);
+    let mut pending = MESH_WORKER.pending_len();
     for _ in 0..MESHES_PER_TICK {
+        if pending >= MAX_PENDING_MESH_JOBS {
+            break;
+        }
         let Some(pos) = p.dirty.get_mut(dim).and_then(VecDeque::pop_front) else {
             break;
         };
@@ -479,15 +733,49 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             continue;
         };
         let key = (dim.to_owned(), pos.detail, [pos.x, pos.y, pos.z]);
-        let Some(section) = store.section(pos) else {
-            submit_built_section(key, empty_section(pos));
+        let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
+            p.next_epoch = p.next_epoch.wrapping_add(1);
+            p.section_epoch.insert((dim.to_owned(), pos), p.next_epoch);
+            if p.rendered
+                .get_mut(dim)
+                .is_some_and(|live| live.remove(&pos))
+            {
+                submit_built_section(key, empty_section(pos));
+            }
             continue;
         };
+        let covered = p
+            .rendered
+            .get(dim)
+            .map_or(0, |live| covered_rendered_mask(live, pos));
+        if covered == 0xFF {
+            p.next_epoch = p.next_epoch.wrapping_add(1);
+            p.section_epoch.insert((dim.to_owned(), pos), p.next_epoch);
+            if p.rendered
+                .get_mut(dim)
+                .is_some_and(|live| live.remove(&pos))
+            {
+                submit_built_section(key, empty_section(pos));
+            }
+            continue;
+        }
         let neighbors: [Option<&OctreeSection>; 6] =
             Face::ALL.map(|face| store.section(pos.neighbor(face)));
         let borders = NeighborBorders::from_neighbors(neighbors);
-        let quads = mesh_octree_section(section, &borders, &p.models);
-        submit_built_section(key, built_section(&quads));
+        let section_clone = section.clone();
+        p.next_epoch = p.next_epoch.wrapping_add(1);
+        let epoch = p.next_epoch;
+        p.section_epoch.insert((dim.to_owned(), pos), epoch);
+        MESH_WORKER.push(MeshJob {
+            dim: dim.to_owned(),
+            pos,
+            epoch,
+            section: section_clone,
+            borders,
+            covered,
+            metas: Arc::clone(&metas),
+        });
+        pending += 1;
     }
 }
 
@@ -534,13 +822,14 @@ pub fn ingest_distant(
         return;
     }
     let water = p.mapper.block_named(host, "minecraft:water");
+    let stone = p.mapper.block_named(host, "minecraft:stone");
     let store = p.stores.entry(dim.to_owned()).or_default();
     let mapper = std::cell::RefCell::new(&mut p.mapper);
     let mut block = |key| mapper.borrow_mut().block_key(host, key);
     let mut biome = |name: &str| mapper.borrow_mut().biome(name);
     let touched = if detail == 0 {
         crate::octree_ingest::ingest_distant_columns(
-            store, &columns, water, &mut block, &mut biome,
+            store, &columns, water, stone, &mut block, &mut biome,
         );
         let mapper = &p.mapper;
         p.stores
@@ -548,7 +837,7 @@ pub fn ingest_distant(
             .expect("store inserted above")
             .propagate_dirty(&|id| mapper.opacity(id))
     } else {
-        store.ingest_coarse_columns(detail, &columns, water, &mut block, &mut biome)
+        store.ingest_coarse_columns(detail, &columns, water, stone, &mut block, &mut biome)
     };
     p.unsaved
         .entry(dim.to_owned())
@@ -764,4 +1053,35 @@ impl ServerSource<PlayerRef> for PipelineSource {
 /// Serve octree sections to connected players (call once when the server starts).
 pub fn install_sync_source() {
     crate::network::octree_sync::install_server_source(Arc::new(PipelineSource));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaf_selection_never_renders_parent_alongside_non_empty_child() {
+        let mut store = OctreeIngestStore::new();
+        let parent_pos = OctreeSectionPos::new(1, 0, 2, 0);
+        let mut parent = OctreeSection::new(parent_pos);
+        parent.set(0, 0, 0, Voxel::new(1, 0, 15, 0));
+        store.adopt_section(parent);
+        assert!(
+            is_render_leaf(&store, parent_pos),
+            "coarse section with no children is a render leaf"
+        );
+
+        let child_pos = parent_pos.children().unwrap()[0];
+        let mut child = OctreeSection::new(child_pos);
+        child.set(0, 0, 0, Voxel::new(1, 0, 15, 0));
+        store.adopt_section(child);
+        assert!(
+            is_render_leaf(&store, child_pos),
+            "finer child becomes the render leaf"
+        );
+        assert!(
+            !is_render_leaf(&store, parent_pos),
+            "parent is no longer rendered once a finer child exists"
+        );
+    }
 }

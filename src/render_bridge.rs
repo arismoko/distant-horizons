@@ -33,16 +33,26 @@ use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
 pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
 pub const SHADER_HIZ: &str = "distantsunrises:voxy_hiz";
+pub const SHADER_TRAV_INIT: &str = "distantsunrises:voxy_trav_init";
+pub const SHADER_TRAV_CLEAR: &str = "distantsunrises:voxy_trav_clear";
+pub const SHADER_TRAVERSAL: &str = "distantsunrises:voxy_traversal";
 pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
+pub const SHADER_TRANS_CLEAR: &str = "distantsunrises:voxy_trans_clear";
+pub const SHADER_TRANS_PREFIX: &str = "distantsunrises:voxy_trans_prefix";
+pub const SHADER_TRANS_SCATTER: &str = "distantsunrises:voxy_trans_scatter";
+pub const SHADER_SSAO: &str = "distantsunrises:voxy_ssao";
+pub const SHADER_SSAO_APPLY: &str = "distantsunrises:core/voxy_ssao_apply";
 
 pub const PIPELINE_OPAQUE: &str = "distantsunrises:voxy_opaque";
 pub const PIPELINE_TRANSLUCENT: &str = "distantsunrises:voxy_translucent";
+pub const PIPELINE_SSAO_APPLY: &str = "distantsunrises:voxy_ssao_apply";
 pub const PIPELINE_PACK_TERRAIN: &str = "distantsunrises:voxy_pack_terrain";
 pub const PIPELINE_PACK_WATER: &str = "distantsunrises:voxy_pack_water";
 pub const PIPELINE_PACK_SHADOW: &str = "distantsunrises:voxy_pack_shadow";
 
 /// Compute workgroup sizes; must match `local_size_*` in the `.csh` files.
 pub const CMDGEN_WORKGROUP: u32 = 128;
+pub const TRAV_WORKGROUP: u32 = 64;
 pub const HIZ_WORKGROUP: u32 = 8;
 
 fn id(text: &str) -> mod_api::Identifier {
@@ -72,7 +82,7 @@ pub fn quad_layout() -> mod_api::BindGroupLayout {
         .entry(storage("BiomeTintBuffer", true, 4))
         .sampler(
             "BlockAtlas",
-            SamplerFilter::Nearest,
+            SamplerFilter::Linear,
             SamplerAddress::ClampToEdge,
         )
         .build()
@@ -94,7 +104,7 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
         .entry(storage("BiomeTintBuffer", true, 4))
         .sampler(
             "BlockAtlas",
-            SamplerFilter::Nearest,
+            SamplerFilter::Linear,
             SamplerAddress::ClampToEdge,
         )
         .build()
@@ -105,8 +115,10 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
 /// pipelines (Hi-Z, command generation) are added with the compute primitives.
 pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
     use mod_api::{PipelineBlend, PrimitiveTopology, RenderPipeline, WorldDepth};
-    // Opaque: depth-tested, culled by the index order of the quad mesh; translucent: sorted by the
-    // arena's bucket order, blended, no depth write.
+    // Opaque: depth-tested, culled by the index order of the quad mesh; translucent: depth-tested
+    // and depth-writing (matching Voxy `MDICSectionRenderer.renderTranslucent` and vanilla
+    // `RenderType.translucent`) so closer water surfaces reject farther/back water faces instead
+    // of double-blending.
     event.register(
         RenderPipeline::new(
             id(PIPELINE_OPAQUE),
@@ -114,6 +126,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
             PipelineBlend::Opaque,
             WorldDepth::Tested,
         )
+        .depth_write(true)
         .topology(PrimitiveTopology::Triangles)
         .cull(false)
         .bind_group_layout(quad_layout())
@@ -127,7 +140,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
             WorldDepth::Tested,
         )
         .define("TRANSLUCENT")
-        .depth_write(false)
+        .depth_write(true)
         .topology(PrimitiveTopology::Triangles)
         .cull(false)
         .bind_group_layout(quad_layout()),
@@ -159,6 +172,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
                 blend,
                 WorldDepth::Tested,
             )
+            .depth_write(true)
             .topology(PrimitiveTopology::Triangles)
             .cull(false)
             .bind_group_layout(pack_layout())
@@ -203,13 +217,74 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
             .build(),
     );
     event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_trav_init"), id(SHADER_TRAV_INIT))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .uniform_buffer("TravInitParams", 16)
+                    .entry(storage("RootBuffer", true, 4))
+                    .entry(storage("VisibilityBuffer", false, 4))
+                    .entry(storage("QueueA", false, 20))
+                    .entry(storage("DispatchA", false, 16))
+                    .build()
+                    .expect("static trav_init layout"),
+            )
+            .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_trav_clear"), id(SHADER_TRAV_CLEAR))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .entry(storage("QueueOut", false, 20))
+                    .entry(storage("DispatchOut", false, 16))
+                    .build()
+                    .expect("static trav_clear layout"),
+            )
+            .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_traversal"), id(SHADER_TRAVERSAL))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .uniform_buffer("TraversalParams", 128)
+                    .entry(storage("NodeBuffer", true, 32))
+                    .entry(storage("QueueIn", true, 20))
+                    .entry(storage("QueueOut", false, 20))
+                    .entry(storage("DispatchOut", false, 16))
+                    .entry(storage("VisibilityBuffer", false, 4))
+                    .sampler(
+                        "HizPyramid",
+                        SamplerFilter::Nearest,
+                        SamplerAddress::ClampToEdge,
+                    )
+                    .build()
+                    .expect("static traversal layout"),
+            )
+            .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(
+            id("distantsunrises:voxy_trans_clear"),
+            id(SHADER_TRANS_CLEAR),
+        )
+        .bind_group_layout(
+            BindGroupLayout::builder()
+                .entry(storage("TransSortMeta", false, 2056))
+                .build()
+                .expect("static trans_clear layout"),
+        )
+        .build(),
+    );
+    event.compute_pipeline(
         ComputePipeline::builder(id("distantsunrises:voxy_cmdgen"), id(SHADER_CMDGEN))
             .bind_group_layout(
                 BindGroupLayout::builder()
                     .uniform_buffer("CmdgenParams", 112)
                     .entry(storage("SectionBuffer", true, 32))
+                    .entry(storage("VisibilityBuffer", true, 4))
                     .entry(storage("OpaqueCommands", false, 20))
                     .entry(storage("TranslucentCommands", false, 20))
+                    .entry(storage("TransSortMeta", false, 2056))
+                    .entry(storage("TransSortEntries", false, 8))
                     .sampler(
                         "HizPyramid",
                         SamplerFilter::Nearest,
@@ -219,6 +294,76 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     .expect("static cmdgen layout"),
             )
             .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(
+            id("distantsunrises:voxy_trans_prefix"),
+            id(SHADER_TRANS_PREFIX),
+        )
+        .bind_group_layout(
+            BindGroupLayout::builder()
+                .entry(storage("TransSortMeta", false, 2056))
+                .build()
+                .expect("static trans_prefix layout"),
+        )
+        .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(
+            id("distantsunrises:voxy_trans_scatter"),
+            id(SHADER_TRANS_SCATTER),
+        )
+        .bind_group_layout(
+            BindGroupLayout::builder()
+                .entry(storage("SectionBuffer", true, 32))
+                .entry(storage("TranslucentCommands", false, 20))
+                .entry(storage("TransSortMeta", false, 2056))
+                .entry(storage("TransSortEntries", true, 8))
+                .build()
+                .expect("static trans_scatter layout"),
+        )
+        .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_ssao"), id(SHADER_SSAO))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .uniform_buffer("SsaoParams", 32)
+                    .sampler(
+                        "WorldDepthTex",
+                        SamplerFilter::Nearest,
+                        SamplerAddress::ClampToEdge,
+                    )
+                    .entry(mod_api::BindEntry::new(
+                        "SsaoOut",
+                        mod_api::BindingKind::StorageImage {
+                            access: StorageImageAccess::WriteOnly,
+                        },
+                    ))
+                    .build()
+                    .expect("static ssao layout"),
+            )
+            .build(),
+    );
+    event.register(
+        mod_api::RenderPipeline::new(
+            id(PIPELINE_SSAO_APPLY),
+            id(SHADER_SSAO_APPLY),
+            mod_api::PipelineBlend::Translucent,
+            mod_api::WorldDepth::ThroughWalls,
+        )
+        .topology(mod_api::PrimitiveTopology::Triangles)
+        .cull(false)
+        .bind_group_layout(
+            BindGroupLayout::builder()
+                .sampler(
+                    "SsaoTex",
+                    SamplerFilter::Nearest,
+                    SamplerAddress::ClampToEdge,
+                )
+                .build()
+                .expect("static ssao_apply layout"),
+        ),
     );
 }
 
@@ -343,11 +488,11 @@ impl HizTarget {
 
 /// The Hi-Z pyramid for a `size` viewport, created or resized on demand. `None` when the
 /// adapter refuses the target; the caller then skips Hi-Z culling (`hiz_enabled = false`).
-fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<(HizTarget, bool)> {
+fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<HizTarget> {
     use mod_api::{RenderTargetDescriptor, RenderTargetFormat, StorageImageAccess};
     let mut slot = HIZ.lock().unwrap();
     if let Some(h) = slot.as_ref().filter(|h| h.size == size) {
-        return Some((HizTarget { ..*h }, false));
+        return Some(HizTarget { ..*h });
     }
     if let Some(old) = slot.take() {
         let _ = old.target.release(host);
@@ -360,7 +505,56 @@ fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<(HizTarg
     let target = host.create_render_target(&desc).ok()?;
     let made = HizTarget { target, size, mips };
     *slot = Some(HizTarget { ..made });
-    Some((made, true))
+    Some(made)
+}
+
+/// Mod-owned `R32Float` SSAO output target, resized with the viewport.
+struct SsaoTarget {
+    target: mod_api::RenderTargetRef,
+    size: [u32; 2],
+}
+
+static SSAO: Mutex<Option<SsaoTarget>> = Mutex::new(None);
+
+impl SsaoTarget {
+    fn dest(&self) -> mod_api::StorageImageBinding {
+        mod_api::StorageImageBinding::new(self.target, 0, 0)
+    }
+    fn source(&self) -> mod_api::TextureSource<'static> {
+        mod_api::TextureSource::RenderTargetColorMip(mod_api::RenderTargetMipView::single(
+            self.target,
+            0,
+            0,
+        ))
+    }
+}
+
+fn ensure_ssao(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<SsaoTarget> {
+    use mod_api::{RenderTargetDescriptor, RenderTargetFormat, StorageImageAccess};
+    let mut slot = SSAO.lock().unwrap();
+    if let Some(s) = slot.as_ref().filter(|s| s.size == size) {
+        return Some(SsaoTarget { ..*s });
+    }
+    if let Some(old) = slot.take() {
+        let _ = old.target.release(host);
+    }
+    let desc = RenderTargetDescriptor::new(size)
+        .color_target(RenderTargetFormat::R32Float)
+        .mip_levels(1)
+        .storage(StorageImageAccess::WriteOnly);
+    let target = host.create_render_target(&desc).ok()?;
+    let made = SsaoTarget { target, size };
+    *slot = Some(SsaoTarget { ..made });
+    Some(made)
+}
+
+/// Consistent circular vanilla clip distance shared between opaque LODs and compute SSAO.
+fn vanilla_clip_dist(frame: &RenderFrameParams) -> f32 {
+    if frame.config.overdraw_prevention > 0.0 {
+        (frame.vanilla_far_blocks * frame.config.overdraw_prevention - 2.0).max(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
@@ -561,12 +755,38 @@ pub fn setup_compute(
         return;
     };
     let assets = host.render_assets();
-    let ids = ["voxy_hiz_copy", "voxy_hiz_reduce", "voxy_cmdgen"]
-        .map(|n| assets.compute_pipeline(&id(&format!("distantsunrises:{n}"))));
-    let [Ok(copy), Ok(reduce), Ok(cmdgen)] = ids else {
+    let ids = [
+        "voxy_hiz_copy",
+        "voxy_hiz_reduce",
+        "voxy_trav_init",
+        "voxy_trav_clear",
+        "voxy_traversal",
+        "voxy_trans_clear",
+        "voxy_cmdgen",
+        "voxy_trans_prefix",
+        "voxy_trans_scatter",
+    ]
+    .map(|n| assets.compute_pipeline(&id(&format!("distantsunrises:{n}"))));
+    let [
+        Ok(copy),
+        Ok(reduce),
+        Ok(trav_init),
+        Ok(trav_clear),
+        Ok(traversal),
+        Ok(trans_clear),
+        Ok(cmdgen),
+        Ok(trans_prefix),
+        Ok(trans_scatter),
+    ] = ids
+    else {
         return;
     };
-    let Some((hiz, _)) = ensure_hiz(host, [w, h]) else {
+    let root_count = arena.root_count();
+    let dispatch_a_ref = arena.dispatch_a;
+    let dispatch_b_ref = arena.dispatch_b;
+    let focal_px = (h as f32 * 0.5 * camera.projection[5].abs()).max(1.0);
+    let lod_threshold = 2.0f32;
+    let Some(hiz) = ensure_hiz(host, [w, h]) else {
         return;
     };
     let mips = hiz.mips;
@@ -608,12 +828,93 @@ pub fn setup_compute(
             );
             (sw, sh) = (dw, dh);
         }
+        let init_threads = sections.max(root_count).max(1);
+        let init_params = Std140(Vec::with_capacity(16))
+            .u32s(&[
+                sections,
+                root_count,
+                crate::gpu_arena::GPU_TRAV_QUEUE_CAP,
+                0,
+            ])
+            .0;
+        let init_bindings = DrawBindings::new()
+            .inline_uniform("TravInitParams", &init_params)
+            .storage_buffer("RootBuffer", slices.roots)
+            .storage_buffer("VisibilityBuffer", slices.visibility)
+            .storage_buffer("QueueA", slices.queue_a)
+            .storage_buffer("DispatchA", slices.dispatch_a);
+        report(
+            "trav_init dispatch",
+            ctx.dispatch(
+                trav_init,
+                &init_bindings,
+                [init_threads.div_ceil(TRAV_WORKGROUP), 1, 1],
+            ),
+        );
+        let (base, sub) = camera_split(camera.position);
+        let trav_params = Std140(Vec::with_capacity(128))
+            .f32s(&view_proj)
+            .i32s(&[
+                base[0],
+                base[1],
+                base[2],
+                crate::gpu_arena::GPU_TRAV_QUEUE_CAP as i32,
+            ])
+            .f32s(&[sub[0], sub[1], sub[2], focal_px])
+            .i32s(&[w as i32, h as i32, mips as i32, 1])
+            .f32s(&[lod_threshold, 0.0, 0.0, 0.0])
+            .0;
+        for iter in 0..=crate::octree::MAX_OCTREE_DETAIL {
+            let (q_in, q_out, d_in_ref, d_out) = if iter % 2 == 0 {
+                (
+                    slices.queue_a,
+                    slices.queue_b,
+                    dispatch_a_ref,
+                    slices.dispatch_b,
+                )
+            } else {
+                (
+                    slices.queue_b,
+                    slices.queue_a,
+                    dispatch_b_ref,
+                    slices.dispatch_a,
+                )
+            };
+            let tclear_bindings = DrawBindings::new()
+                .storage_buffer("QueueOut", q_out)
+                .storage_buffer("DispatchOut", d_out);
+            report(
+                "trav_clear dispatch",
+                ctx.dispatch(trav_clear, &tclear_bindings, [1, 1, 1]),
+            );
+            let trav_bindings = DrawBindings::new()
+                .inline_uniform("TraversalParams", &trav_params)
+                .storage_buffer("NodeBuffer", slices.nodes)
+                .storage_buffer("QueueIn", q_in)
+                .storage_buffer("QueueOut", q_out)
+                .storage_buffer("DispatchOut", d_out)
+                .storage_buffer("VisibilityBuffer", slices.visibility)
+                .texture("HizPyramid", hiz.all_mips());
+            report(
+                "traversal dispatch_indirect",
+                ctx.dispatch_indirect(traversal, &trav_bindings, d_in_ref, 0),
+            );
+        }
+        let clear_bindings =
+            DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
+        report(
+            "trans_clear dispatch",
+            ctx.dispatch(trans_clear, &clear_bindings, [1, 1, 1]),
+        );
         let params = cmdgen_params_bytes(view_proj, camera.position, sections, [w, h], mips, true);
         let bindings = DrawBindings::new()
             .inline_uniform("CmdgenParams", &params)
             .storage_buffer("SectionBuffer", slices.sections)
+            .storage_buffer("VisibilityBuffer", slices.visibility)
             .storage_buffer("OpaqueCommands", slices.opaque_commands)
             .storage_buffer("TranslucentCommands", slices.translucent_commands)
+            .storage_buffer("TransSortMeta", slices.trans_sort_meta)
+            .storage_buffer("TransSortEntries", slices.trans_sort_entries)
             .texture("HizPyramid", hiz.all_mips());
         report(
             "cmdgen dispatch",
@@ -623,8 +924,68 @@ pub fn setup_compute(
                 [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
             ),
         );
+        let prefix_bindings =
+            DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
+        report(
+            "trans_prefix dispatch",
+            ctx.dispatch(trans_prefix, &prefix_bindings, [1, 1, 1]),
+        );
+        let scatter_bindings = DrawBindings::new()
+            .storage_buffer("SectionBuffer", slices.sections)
+            .storage_buffer("TranslucentCommands", slices.translucent_commands)
+            .storage_buffer("TransSortMeta", slices.trans_sort_meta)
+            .storage_buffer("TransSortEntries", slices.trans_sort_entries);
+        report(
+            "trans_scatter dispatch",
+            ctx.dispatch(
+                trans_scatter,
+                &scatter_bindings,
+                [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
+            ),
+        );
     });
     report("add_compute_pass", added);
+
+    // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
+    // Uses the target ensured during `prepare_draws` so a resize never frees a handle already
+    // bound by this frame's `ssao_apply` draw.
+    if frame.config.ssao_enabled
+        && let (Ok(ssao_pipe), Some(ssao_target)) = (
+            assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
+            ensure_ssao(host, [w, h]),
+        )
+    {
+        let clip_dist = vanilla_clip_dist(&frame);
+        let ssao_params = Std140(Vec::with_capacity(32))
+            .f32s(&[
+                camera.projection[0].abs().max(1e-4),
+                camera.projection[5].abs().max(1e-4),
+                camera.near,
+                clip_dist,
+            ])
+            .i32s(&[w as i32, h as i32, 0, 0])
+            .0;
+        let ssao_desc = ComputePassDescriptor::new("distantsunrises:ssao")
+            .reads(FrameTarget::MainDepth)
+            .writes(FrameTarget::Mod(ssao_target.target))
+            .after_stage(OPAQUE_STAGE)
+            .before_stage(TRANSLUCENT_STAGE);
+        let added_ssao = graph.add_compute_pass(ssao_desc, &mut |ctx| {
+            let bindings = DrawBindings::new()
+                .inline_uniform("SsaoParams", &ssao_params)
+                .texture("WorldDepthTex", TextureSource::WorldDepth)
+                .storage_image("SsaoOut", ssao_target.dest());
+            report(
+                "ssao dispatch",
+                ctx.dispatch(
+                    ssao_pipe,
+                    &bindings,
+                    [w.div_ceil(HIZ_WORKGROUP), h.div_ceil(HIZ_WORKGROUP), 1],
+                ),
+            );
+        });
+        report("add_ssao_compute_pass", added_ssao);
+    }
 }
 
 /// Prepares this frame's two indirect draws (opaque in [`OPAQUE_STAGE`], translucent in
@@ -649,18 +1010,31 @@ pub fn prepare_draws(
     let assets = host.render_assets();
     let view_proj = camera.view_projection();
     let near_dh = 8.0;
-    let far_dh = (frame.config.render_distance_blocks() * 1.4).max(1024.0);
+    let rd_blocks = frame.config.render_distance_blocks().max(256.0);
+    let far_dh = (rd_blocks * 1.4).max(1024.0);
     let atlas_id = id(ATLAS_TEXTURE);
+    let clip_dist = vanilla_clip_dist(&frame);
+    // Keep mid-ground hills crisp like Voxy (`NormalRenderPipeline.java`), respecting
+    // `fog_enabled`, `fog_falloff`, and `fog_spherical`.
+    let (fog_start, fog_end) = if frame.config.fog_enabled {
+        let start = (rd_blocks * 0.55).max(frame.vanilla_far_blocks + 64.0);
+        (start, rd_blocks.max(start + 64.0))
+    } else {
+        (far_dh * 4.0, far_dh * 8.0)
+    };
     let quad_params = quad_params_bytes(
         view_proj,
         camera.position,
         camera.near,
         far_dh,
-        (frame.vanilla_far_blocks * frame.config.overdraw_prevention).max(0.0),
+        clip_dist,
         frame.sun_brightness,
-        // DH's own far fog: vanilla's environmental end is about the vanilla render distance, where
-        // the LOD starts, so using it would fog every LOD quad into the sky colour.
-        [far_dh * 0.75, far_dh, 0.0, 0.0],
+        [
+            fog_start,
+            fog_end,
+            frame.config.fog_falloff.min(2) as f32,
+            f32::from(frame.config.fog_spherical),
+        ],
         frame.fog_color,
         false, // frames store vanilla gamma; no sRGB decode in the shader
         frame.config.shading_enabled,
@@ -682,6 +1056,31 @@ pub fn prepare_draws(
         .to_bytes()
     };
     let s = arena.slices;
+    // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws.
+    // Ensure the target for the current window size here (before `setup_compute`) so resize
+    // reallocations happen once per frame before any draw holds the handle.
+    if frame.config.ssao_enabled
+        && let (Some(win_size), Ok(ssao_apply), Ok(_)) = (
+            host.window_size(),
+            assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
+            assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
+        )
+        && let Some(ssao_target) = ensure_ssao(host, win_size)
+    {
+        let bindings = DrawBindings::new().texture("SsaoTex", ssao_target.source());
+        if let Some(batch) = report(
+            "ssao_apply draw",
+            context.draw_mesh(
+                TRANSLUCENT_STAGE,
+                ssao_apply,
+                state.quad_mesh,
+                mod_api::MeshDraw::indexed(0..3, 0),
+                &bindings,
+            ),
+        ) {
+            PREPARED.lock().unwrap().push((TRANSLUCENT_STAGE, batch));
+        }
+    }
     for (stage, plain, pack, cmds, count) in [
         (
             OPAQUE_STAGE,
@@ -771,16 +1170,6 @@ pub fn prepare_draws(
         ) {
             PREPARED.lock().unwrap().push((OPAQUE_STAGE, batch));
         }
-    }
-    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if LOGGED.fetch_add(1, Ordering::Relaxed).is_multiple_of(300) {
-        eprintln!(
-            "distantsunrises: arena sections high-water {sections}, live {}, opaque commands {}, quad bytes used {}, vanilla far {} blocks",
-            arena.live_sections(),
-            arena.opaque_command_count(),
-            arena.used_geometry_bytes(),
-            frame.vanilla_far_blocks
-        );
     }
     record_frame_stats(sections as u64, arena.live_sections() as u64);
 }

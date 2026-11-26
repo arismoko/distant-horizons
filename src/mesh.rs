@@ -203,11 +203,32 @@ pub fn mesh_octree_section(
     borders: &crate::octree::NeighborBorders,
     models: &dyn crate::bakery::ModelLookup,
 ) -> SectionQuads {
+    mesh_octree_section_masked(section, borders, models, 0)
+}
+
+/// Like [`mesh_octree_section`], but skips emitting faces for voxels in any octant whose bit
+/// (`1 << child_index(x >> 4, y >> 4, z >> 4)`) is set in `covered_octants` (already rendered by a
+/// finer octree child). Neighbour occlusion still reads the full section so no fake seam walls are
+/// emitted between masked and unmasked octants.
+pub fn mesh_octree_section_masked(
+    section: &crate::octree::OctreeSection,
+    borders: &crate::octree::NeighborBorders,
+    models: &dyn crate::bakery::ModelLookup,
+    covered_octants: u8,
+) -> SectionQuads {
     use crate::bakery::ModelMeta;
-    use crate::octree::{Face, SECTION_EDGE, Voxel, voxel_index};
+    use crate::octree::{Face, SECTION_EDGE, Voxel, child_index, voxel_index};
     use std::collections::HashMap;
 
     const N: usize = SECTION_EDGE;
+    let mut out = SectionQuads {
+        pos: section.pos,
+        revision: section.revision,
+        ..Default::default()
+    };
+    if covered_octants == 0xFF {
+        return out;
+    }
     let dense = section.to_dense();
     let mut metas: HashMap<u32, ModelMeta> = HashMap::new();
     let mut meta_of = |v: Voxel| -> ModelMeta {
@@ -219,11 +240,6 @@ pub fn mesh_octree_section(
             .or_insert_with(|| models.meta(v.block_id()))
     };
 
-    let mut out = SectionQuads {
-        pos: section.pos,
-        revision: section.revision,
-        ..Default::default()
-    };
     let mut bmin = [N as u8; 3];
     let mut bmax = [0u8; 3];
     let mut mask = vec![0u64; N * N];
@@ -238,6 +254,11 @@ pub fn mesh_octree_section(
             for b in 0..N {
                 for a in 0..N {
                     let [x, y, z] = slice_voxel(face, s, a, b);
+                    if covered_octants != 0
+                        && (covered_octants & (1u8 << child_index(x >> 4, y >> 4, z >> 4))) != 0
+                    {
+                        continue;
+                    }
                     let v = dense[voxel_index(x, y, z)];
                     let meta = meta_of(v);
                     if meta.is_empty() || !meta.has_face(face) {
@@ -252,6 +273,27 @@ pub fn mesh_octree_section(
                     } else {
                         borders.get(face, x, y, z)
                     };
+                    if meta.fluid() {
+                        // Never emit vertical water walls or undersides into an unloaded border
+                        // or unwritten air (e.g. the unpopulated half of a 32³ section beside a
+                        // 16×16 loaded chunk), and at coarse LODs (detail >= 1) emit only `+Y`
+                        // water surfaces so detail-0/detail-1 steps and coarse springs do not
+                        // produce vertical blue ribbons or floating blobs.
+                        let unwritten_air = neighbor.is_some_and(|n| n.is_air() && n.light() == 0);
+                        if ((neighbor.is_none() || unwritten_air) && face != Face::PosY)
+                            || (section.pos.detail >= 1 && face != Face::PosY)
+                        {
+                            continue;
+                        }
+                    } else if neighbor.is_none()
+                        && ((face == Face::NegY && section.pos.y == 0)
+                            || (section.pos.detail >= 1 && face != Face::PosY))
+                    {
+                        // Never emit underside faces into unloaded void below the solid floor
+                        // (`y = 0`), and at coarse LODs (`detail >= 1`) never emit giant vertical
+                        // side walls along the unloaded edge of the generated world.
+                        continue;
+                    }
                     if let Some(nv) = neighbor
                         && !nv.is_air()
                     {
@@ -262,12 +304,13 @@ pub fn mesh_octree_section(
                             continue;
                         }
                     }
-                    // No neighbour loaded beyond a section border: open sky, not the solid voxel's own 0.
-                    // Air that no source wrote (light byte 0) is open sky too: distant columns only
-                    // carry a section's height of lit air above their surface, so beside a cliff
-                    // or under an overhang the neighbouring "air" is unwritten, not dark.
+                    // No neighbour loaded beyond a section border, or an unlit/unwritten
+                    // non-occluding neighbour (unwritten air, unlit seagrass/leaves/water in a
+                    // chunk whose light was not ready): fall back to the voxel's own light if
+                    // non-zero, otherwise open sky 15, so visible surfaces never turn pitch black.
                     let light = match neighbor {
-                        Some(n) if !(n.is_air() && n.light() == 0) => n.light(),
+                        Some(n) if n.light() != 0 => n.light(),
+                        _ if v.light() != 0 => v.light(),
                         _ => 0x0F,
                     };
                     let biome = if meta.biome_coloured() {
@@ -389,7 +432,7 @@ mod octree_mesh_tests {
     }
 
     fn pos() -> OctreeSectionPos {
-        OctreeSectionPos::new(0, 0, 0, 0)
+        OctreeSectionPos::new(0, 0, 2, 0)
     }
 
     fn area(quads: &[PackedQuad], face: Face, plane: impl Fn(&PackedQuad) -> u8, at: u8) -> u32 {
@@ -433,7 +476,7 @@ mod octree_mesh_tests {
     fn greedy_quads_cover_each_visible_face_exactly_once() {
         use std::collections::HashMap;
         const N: usize = 32;
-        let mut s = OctreeSection::new(pos());
+        let mut s = OctreeSection::filled(pos(), Voxel::air_with_light(15, 0));
         // Terrain with a cave and an overhang.
         for x in 0..N {
             for z in 0..N {
@@ -691,5 +734,65 @@ mod octree_mesh_tests {
         };
         assert_eq!(sky(Face::NegX), 15);
         assert_eq!(sky(Face::PosZ), 3);
+    }
+
+    #[test]
+    fn fluid_skips_unloaded_border_side_walls_and_coarse_undersides() {
+        let mut s = OctreeSection::new(OctreeSectionPos::new(1, 0, 2, 0));
+        // Water touching the +X border (x = 31) with no neighbour loaded.
+        s.set(31, 4, 4, Voxel::new(WATER, 1, 15, 0));
+        let m = mesh_octree_section(&s, &NeighborBorders::none(), &models);
+        assert!(
+            m.translucent.iter().any(|q| q.face() == Face::PosY.id()),
+            "top water face is still emitted"
+        );
+        assert!(
+            !m.translucent.iter().any(|q| q.face() == Face::PosX.id()),
+            "unloaded border side wall is not emitted for fluids"
+        );
+        assert!(
+            !m.translucent.iter().any(|q| q.face() == Face::NegY.id()),
+            "coarse-LOD fluid underside is skipped"
+        );
+    }
+
+    #[test]
+    fn masked_octant_skips_covered_half_without_emitting_seam_wall() {
+        let mut s = OctreeSection::new(OctreeSectionPos::new(1, 0, 0, 0));
+        // Solid bridge across the x=15 | x=16 octant boundary.
+        s.set(15, 2, 2, Voxel::new(STONE, 0, 15, 0));
+        s.set(16, 2, 2, Voxel::new(STONE, 0, 15, 0));
+        let oct0 = 1u8 << crate::octree::child_index(0, 0, 0);
+        let m = mesh_octree_section_masked(&s, &NeighborBorders::none(), &models, oct0);
+        assert!(
+            !m.opaque.iter().any(|q| q.x() == 15),
+            "covered octant (x=15) emits no quads"
+        );
+        assert!(
+            m.opaque
+                .iter()
+                .any(|q| q.x() == 16 && q.face() == Face::PosY.id()),
+            "uncovered octant (x=16) still emits its top face"
+        );
+        assert!(
+            !m.opaque
+                .iter()
+                .any(|q| q.x() == 16 && q.face() == Face::NegX.id()),
+            "solid neighbour in covered octant still culls the internal seam wall"
+        );
+    }
+
+    #[test]
+    fn y0_section_skips_unloaded_bottom_face() {
+        let s = OctreeSection::filled(
+            OctreeSectionPos::new(0, 0, 0, 0),
+            Voxel::new(STONE, 0, 15, 0),
+        );
+        let m = mesh_octree_section(&s, &NeighborBorders::none(), &models);
+        assert!(
+            !m.opaque.iter().any(|q| q.face() == Face::NegY.id()),
+            "unloaded y=0 bottom face is not emitted"
+        );
+        assert_eq!(m.opaque_count(), 20);
     }
 }

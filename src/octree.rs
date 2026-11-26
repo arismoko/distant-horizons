@@ -385,10 +385,41 @@ impl OctreeSection {
         true
     }
 
-    /// Fill the vertical span `y0..y1` (local, clamped to the section) of column `(x, z)`.
+    /// Fill the vertical span `y0..y1` (local, clamped to the section) of column `(x, z)` with one
+    /// palette lookup instead of per-voxel `set` overhead.
     pub fn fill_column(&mut self, x: usize, z: usize, y0: usize, y1: usize, voxel: Voxel) {
-        for y in y0..y1.min(SECTION_EDGE) {
-            self.set(x, y, z, voxel);
+        let end = y1.min(SECTION_EDGE);
+        if x >= SECTION_EDGE || z >= SECTION_EDGE || y0 >= end {
+            return;
+        }
+        if self.indices.is_none() && self.palette[0] == voxel {
+            return;
+        }
+        let pi = match self.lookup.get(&voxel) {
+            Some(&p) => p,
+            None => {
+                if self.palette.len() > SECTION_VOLUME {
+                    self.compact();
+                }
+                let p = self.palette.len() as u16;
+                self.palette.push(voxel);
+                self.lookup.insert(voxel, p);
+                p
+            }
+        };
+        let ix = self
+            .indices
+            .get_or_insert_with(|| vec![0u16; SECTION_VOLUME]);
+        let mut changed = false;
+        for y in y0..end {
+            let idx = voxel_index(x, y, z);
+            if ix[idx] != pi {
+                ix[idx] = pi;
+                changed = true;
+            }
+        }
+        if changed {
+            self.revision += 1;
         }
     }
 
@@ -607,25 +638,63 @@ impl NeighborBorders {
     }
 }
 
-/// `Mipper.mip`: pick the parent voxel from eight children. `children[x << 2 | y << 1 | z]`
-/// (Voxy's `I{x}{y}{z}` argument naming). `opacity(block_id)` is `Mapper.getBlockStateOpacity`
-/// (block-state light dampening, with leaves forced to 15).
+/// `Mipper.mip` with surface-wins tie-breaking: pick the parent voxel from eight children
+/// `children[x << 2 | y << 1 | z]`. Primary key is `opacity(block_id)` (`Mapper.getBlockStateOpacity`);
+/// among equal-opacity children, the upper layer (`y = 1`) always beats the lower layer (`y = 0`)
+/// so surface grass/snow/leaves never lose to underground dirt/stone on slopes, and within that
+/// layer the majority block wins (breaking ties deterministically by index).
 pub fn mip_voxels(children: [Voxel; 8], opacity: &dyn Fn(u32) -> u8) -> Voxel {
-    let mut best: i32 = -1;
+    let mut best_op: i32 = -1;
+    let mut best_y: i32 = -1;
     for (idx, v) in children.iter().enumerate() {
-        if !v.is_air() {
-            let score = ((opacity(v.block_id()) as i32) << 4) | idx as i32;
-            best = best.max(score);
+        if v.is_air() {
+            continue;
+        }
+        let op = opacity(v.block_id()) as i32;
+        let y = ((idx >> 1) & 1) as i32;
+        if op > best_op || (op == best_op && y > best_y) {
+            best_op = op;
+            best_y = y;
         }
     }
-    if best != -1 {
-        return children[(best & 0b111) as usize];
+    if best_op != -1 {
+        // Majority vote among the winning (opacity, y) layer so single-block noise does not
+        // override surrounding terrain; ties break toward higher index.
+        let mut best_idx = 0usize;
+        let mut best_count = 0u8;
+        for (idx, v) in children.iter().enumerate() {
+            if v.is_air()
+                || opacity(v.block_id()) as i32 != best_op
+                || ((idx >> 1) & 1) as i32 != best_y
+            {
+                continue;
+            }
+            let bid = v.block_id();
+            let count = children
+                .iter()
+                .enumerate()
+                .filter(|(j, u)| {
+                    !u.is_air()
+                        && ((j >> 1) & 1) as i32 == best_y
+                        && opacity(u.block_id()) as i32 == best_op
+                        && u.block_id() == bid
+                })
+                .count() as u8;
+            if count > best_count || (count == best_count && idx >= best_idx) {
+                best_count = count;
+                best_idx = idx;
+            }
+        }
+        return children[best_idx];
     }
     let mut block = 0u32;
     let mut sky = 0u32;
     for v in &children {
-        block += (v.light() & 0xF0) as u32;
-        sky += (v.light() & 0x0F) as u32;
+        // Treat unwritten air (light == 0) as open sky (15) when mipping air light so a mix of
+        // lit air and unwritten air never averages down to sky 1..2 and darkens coarse cliffs.
+        let l = if v.light() == 0 { 0x0F } else { v.light() };
+        block += (l & 0xF0) as u32;
+        sky += (l & 0x0F) as u32;
     }
     let block = (block / 8) & 0xF0;
     let sky = sky.div_ceil(8);
@@ -640,8 +709,21 @@ pub fn downsample_2x2x2(
     children: &[Option<&OctreeSection>; 8],
     opacity: &dyn Fn(u32) -> u8,
 ) -> OctreeSection {
+    downsample_2x2x2_onto(parent_pos, None, children, opacity)
+}
+
+/// Like [`downsample_2x2x2`], but when `existing` is `Some`, preserves any octant whose child is
+/// `None` so partial detail-0 propagation never wipes coarse terrain in sibling octants.
+pub fn downsample_2x2x2_onto(
+    parent_pos: OctreeSectionPos,
+    existing: Option<&OctreeSection>,
+    children: &[Option<&OctreeSection>; 8],
+    opacity: &dyn Fn(u32) -> u8,
+) -> OctreeSection {
     let dense: Vec<Option<Vec<Voxel>>> = children.iter().map(|c| c.map(|s| s.to_dense())).collect();
-    let mut out = OctreeSection::new(parent_pos);
+    let mut out = existing
+        .cloned()
+        .unwrap_or_else(|| OctreeSection::new(parent_pos));
     for py in 0..SECTION_EDGE {
         for pz in 0..SECTION_EDGE {
             for px in 0..SECTION_EDGE {
@@ -661,7 +743,7 @@ pub fn downsample_2x2x2(
             }
         }
     }
-    out.revision = 0;
+    out.revision = existing.map_or(1, |e| e.revision.wrapping_add(1));
     out
 }
 
@@ -892,6 +974,21 @@ mod tests {
         kids[0b000] = Voxel::new(STONE, 0, 0, 0);
         kids[0b110] = Voxel::new(LOG, 0, 0, 0);
         assert_eq!(mip_voxels(kids, &opacity).block_id(), LOG);
+
+        // Surface-wins rule: upper Y (dy=1, idx=0b010) always beats lower Y (dy=0, idx=0b101)
+        // even when the lower voxel has a higher x index.
+        let mut slope = [Voxel::AIR; 8];
+        slope[0b101] = Voxel::new(STONE, 0, 15, 0);
+        slope[0b010] = Voxel::new(LOG, 0, 15, 0);
+        assert_eq!(mip_voxels(slope, &opacity).block_id(), LOG);
+
+        // Majority vote in the upper layer beats a single corner outlier.
+        let mut maj = [Voxel::AIR; 8];
+        maj[0b010] = Voxel::new(LOG, 0, 15, 0);
+        maj[0b011] = Voxel::new(LOG, 0, 15, 0);
+        maj[0b110] = Voxel::new(LOG, 0, 15, 0);
+        maj[0b111] = Voxel::new(STONE, 0, 15, 0);
+        assert_eq!(mip_voxels(maj, &opacity).block_id(), LOG);
 
         // Water wins over air.
         let mut kids = [Voxel::AIR; 8];
