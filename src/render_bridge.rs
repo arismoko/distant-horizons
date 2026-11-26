@@ -323,8 +323,9 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
         ComputePipeline::builder(id("distantsunrises:voxy_ssao"), id(SHADER_SSAO))
             .bind_group_layout(
                 BindGroupLayout::builder()
-                    .uniform_buffer("SsaoParams", 32)
+                    .uniform_buffer("SsaoParams", 48)
                     .sampler("WorldDepthTex", nearest())
+                    .entry(storage("SsaoStamp", false, STAMP_BYTES as u32))
                     .entry(mod_api::BindEntry::new(
                         "SsaoOut",
                         mod_api::BindingKind::StorageImage {
@@ -347,6 +348,8 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
         .cull(false)
         .bind_group_layout(
             BindGroupLayout::builder()
+                .uniform_buffer("SsaoApplyParams", 16)
+                .entry(storage("SsaoStamp", true, STAMP_BYTES as u32))
                 .sampler("SsaoTex", nearest())
                 .build()
                 .expect("static ssao_apply layout"),
@@ -497,18 +500,59 @@ fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<HizTarge
     Some(made)
 }
 
-/// Mod-owned `R32Float` SSAO output target, resized with the viewport.
+/// Bytes of a publication stamp: one serial as its low and high `u32` words.
+const STAMP_BYTES: u64 = 8;
+
+/// The next GPU publication serial. It starts at 1 (0 is a fresh or cleared stamp) and counts
+/// every submission that records a producer, as a `u64` that is never reused.
+static PUBLICATION_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+fn next_serial() -> [u32; 2] {
+    let serial = PUBLICATION_SERIAL.fetch_add(1, Ordering::Relaxed);
+    [serial as u32, (serial >> 32) as u32]
+}
+
+/// A zeroed retained buffer holding one publication stamp. A compute dispatch binds it
+/// read-write (`read_only: false`) and writes its serial; a draw's fragment stage binds it
+/// `read_only: true` (the engine allows one buffer to be read-write in a compute node and
+/// read-only in a draw pass, and refuses only both within one draw pass). The host never reads
+/// it back: the consuming shader compares it with the serial it was drawn with.
+fn create_stamp_buffer(host: &dyn mod_api::ClientHost) -> Option<mod_api::StorageBufferRef> {
+    let buffer = report(
+        "create stamp",
+        host.create_storage_buffer(&mod_api::StorageBufferDescriptor::new(STAMP_BYTES)),
+    )?;
+    // Queued writes land in call order before the frame's first pass.
+    if report(
+        "clear stamp",
+        buffer.write_range(host, 0, &[0; STAMP_BYTES as usize]),
+    )
+    .is_none()
+    {
+        report("release stamp", buffer.release(host));
+        return None;
+    }
+    Some(buffer)
+}
+
+/// Mod-owned `R32Float` SSAO output target and the stamp its producer publishes, both
+/// recreated with the viewport.
+#[derive(Clone, Copy)]
 struct SsaoTarget {
     target: mod_api::RenderTargetRef,
     size: [u32; 2],
+    stamp: mod_api::StorageBufferRef,
 }
 
 static SSAO: Mutex<Option<SsaoTarget>> = Mutex::new(None);
 
-/// Whether the SSAO compute pass has been added to the frame graph for the current target. False
-/// after (re)allocating the target and at the start of every `setup_compute`, so `ssao_apply`
-/// never multiplies the screen by an uninitialised or stale AO image.
-static SSAO_WRITTEN: AtomicBool = AtomicBool::new(false);
+/// What the SSAO compute node recorded by this submission's `setup_compute` publishes: its
+/// target (the one the apply draw must sample) and the serial one `voxy_ssao` invocation
+/// writes into that target's stamp. Admission to the frame graph is not execution: the graph
+/// may still drop every node (a cycle after `prepare_draws`), and a dispatch may be refused.
+/// So this only says which serial to expect; whether it was published is decided on the GPU by
+/// `voxy_ssao_apply.fsh`. `prepare_draws` takes it, so a serial is drawn at most once.
+static SSAO_PENDING: Mutex<Option<(SsaoTarget, [u32; 2])>> = Mutex::new(None);
 
 impl SsaoTarget {
     fn dest(&self) -> mod_api::StorageImageBinding {
@@ -523,23 +567,35 @@ impl SsaoTarget {
     }
 }
 
+/// The SSAO target for a `size` viewport, created or recreated on demand together with its
+/// stamp (a resize drops the old stamp, so nothing published for the old target can be read
+/// for the new one). Called only from `setup_compute`, where a resize replaces the handles
+/// before this submission records anything that binds them.
 fn ensure_ssao(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<SsaoTarget> {
     use mod_api::{RenderTargetDescriptor, RenderTargetFormat, StorageImageAccess};
     let mut slot = SSAO.lock().unwrap();
-    if let Some(s) = slot.as_ref().filter(|s| s.size == size) {
-        return Some(SsaoTarget { ..*s });
+    if let Some(s) = slot.filter(|s| s.size == size) {
+        return Some(s);
     }
     if let Some(old) = slot.take() {
         let _ = old.target.release(host);
+        let _ = old.stamp.release(host);
     }
-    SSAO_WRITTEN.store(false, Ordering::Release);
     let desc = RenderTargetDescriptor::new(size)
         .color_target(RenderTargetFormat::R32Float)
         .mip_levels(1)
         .storage(StorageImageAccess::WriteOnly);
     let target = host.create_render_target(&desc).ok()?;
-    let made = SsaoTarget { target, size };
-    *slot = Some(SsaoTarget { ..made });
+    let Some(stamp) = create_stamp_buffer(host) else {
+        let _ = target.release(host);
+        return None;
+    };
+    let made = SsaoTarget {
+        target,
+        size,
+        stamp,
+    };
+    *slot = Some(made);
     Some(made)
 }
 
@@ -797,8 +853,9 @@ pub fn setup_compute(
     use mod_api::{
         ComputePassDescriptor, DrawBindings, FrameTarget, RenderLevelStage, TextureSource,
     };
-    // Every early return below leaves SSAO unwritten for the next frame's `ssao_apply`.
-    SSAO_WRITTEN.store(false, Ordering::Release);
+    // Every early return below leaves no SSAO publication to expect: `prepare_draws` of this
+    // submission then draws no `ssao_apply`.
+    *SSAO_PENDING.lock().unwrap() = None;
     let Some(frame) = FRAME.lock().unwrap().clone() else {
         return;
     };
@@ -1032,8 +1089,9 @@ pub fn setup_compute(
     report("add_compute_pass", added);
 
     // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
-    // Uses the target ensured during `prepare_draws` so a resize never frees a handle already
-    // bound by this frame's `ssao_apply` draw.
+    // `frame_graph_setup` runs before `prepare_render_buffers` (sunrise `gfx/draw_frame.rs`), so
+    // the target is (re)created here and `prepare_draws` binds this exact target through
+    // `SSAO_PENDING`; the handles of a resized-away target are never bound by this submission.
     if frame.config.ssao_enabled
         && let (Ok(ssao_pipe), Some(ssao_target)) = (
             assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
@@ -1041,7 +1099,10 @@ pub fn setup_compute(
         )
     {
         let clip_dist = vanilla_clip_dist(&frame);
-        let ssao_params = Std140(Vec::with_capacity(32))
+        // The serial this submission's one publishing invocation writes into the target's stamp
+        // (`voxy_ssao.csh`).
+        let serial = next_serial();
+        let ssao_params = Std140(Vec::with_capacity(48))
             .f32s(&[
                 camera.projection[0].abs().max(1e-4),
                 camera.projection[5].abs().max(1e-4),
@@ -1049,6 +1110,7 @@ pub fn setup_compute(
                 clip_dist,
             ])
             .i32s(&[w as i32, h as i32, 0, 0])
+            .u32s(&[serial[0], serial[1], 0, 0])
             .0;
         let ssao_desc = ComputePassDescriptor::new("distantsunrises:ssao")
             .reads(FrameTarget::MainDepth)
@@ -1059,6 +1121,7 @@ pub fn setup_compute(
             let bindings = DrawBindings::new()
                 .inline_uniform("SsaoParams", &ssao_params)
                 .texture("WorldDepthTex", TextureSource::WorldDepth)
+                .storage_buffer("SsaoStamp", ssao_target.stamp.slice(0, STAMP_BYTES))
                 .storage_image("SsaoOut", ssao_target.dest());
             report(
                 "ssao dispatch",
@@ -1070,7 +1133,7 @@ pub fn setup_compute(
             );
         });
         if report("add_ssao_compute_pass", added_ssao).is_some() {
-            SSAO_WRITTEN.store(true, Ordering::Release);
+            *SSAO_PENDING.lock().unwrap() = Some((ssao_target, serial));
         }
     }
 }
@@ -1084,6 +1147,8 @@ pub fn prepare_draws(
     context: &mut dyn mod_api::PrepareRenderBuffersContext,
 ) {
     use mod_api::{DrawBindings, IndirectDraw, TextureSource};
+    // Taken before any early return: a submission's expectation is never carried to the next.
+    let ssao_expected = SSAO_PENDING.lock().unwrap().take();
     let Some(frame) = FRAME.lock().unwrap().clone() else {
         return;
     };
@@ -1143,20 +1208,23 @@ pub fn prepare_draws(
         .to_bytes()
     };
     let s = arena.slices;
-    // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws.
-    // Ensure the target for the current window size here (before `setup_compute`) so resize
-    // reallocations happen once per frame before any draw holds the handle.
+    // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws,
+    // for the target and serial this submission's `setup_compute` recorded. The draw is
+    // prepared whether or not the compute node will run (the graph may be dropped after this
+    // hook); `voxy_ssao_apply.fsh` draws only where the target's stamp holds the serial, so a
+    // dropped graph, a refused dispatch or a route that never runs the node before this stage
+    // darkens nothing. Under OIT the stage's draws are not issued at all.
     if frame.config.ssao_enabled
-        && let (Some(win_size), Ok(ssao_apply), Ok(_)) = (
-            host.window_size(),
-            assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
-            assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
-        )
-        && let Some(ssao_target) = ensure_ssao(host, win_size)
-        // Checked after `ensure_ssao`, which clears the flag when it reallocates the target.
-        && SSAO_WRITTEN.load(Ordering::Acquire)
+        && let Some((ssao_target, serial)) = ssao_expected
+        && let Ok(ssao_apply) = assets.render_pipeline(&id(PIPELINE_SSAO_APPLY))
     {
-        let bindings = DrawBindings::new().texture("SsaoTex", ssao_target.source());
+        let expected = Std140(Vec::with_capacity(16))
+            .u32s(&[serial[0], serial[1], 0, 0])
+            .0;
+        let bindings = DrawBindings::new()
+            .inline_uniform("SsaoApplyParams", &expected)
+            .storage_buffer("SsaoStamp", ssao_target.stamp.slice(0, STAMP_BYTES))
+            .texture("SsaoTex", ssao_target.source());
         if let Some(batch) = report(
             "ssao_apply draw",
             context.draw_mesh(
