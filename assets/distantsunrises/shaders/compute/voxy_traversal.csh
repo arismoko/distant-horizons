@@ -3,6 +3,8 @@
 // traversal_dev.comp). Dispatched via dispatch_indirect across 5 iterations (detail 4 -> 0):
 // frustum-culls and Hi-Z-culls subtrees in O(1), evaluates screen-space projected voxel error,
 // subdivides into existing children via ping-pong queues, and marks visible leaf/LOD sections.
+// A visible node that wants finer detail but lacks child octants records the missing children in
+// RequestBuffer; the CPU reads it back without blocking and loads those sections first.
 layout(local_size_x = 64) in;
 
 struct GpuNode {
@@ -15,7 +17,7 @@ layout(std140) uniform TraversalParams {
     ivec4 base_section;    // xyz = camera block >> 5, w = max_queue
     vec4 camera_sub_pos;   // xyz = camera - base_section*32, w = focal_px
     ivec4 hiz;             // xy = mip 0 size, z = mip count, w = hiz enabled (0/1)
-    vec4 lod_cfg;          // x = pixel error threshold, yzw = unused
+    vec4 lod_cfg;          // x = pixel error threshold, y = max requests (RequestBuffer capacity), zw = unused
 };
 
 layout(std430) readonly buffer NodeBuffer { GpuNode nodes[]; };
@@ -40,6 +42,13 @@ layout(std430) buffer DispatchOut {
     uint pad;
 } dispatch_out;
 layout(std430) buffer VisibilityBuffer { uint visible_flags[]; };
+layout(std430) buffer RequestBuffer {
+    uint count;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uvec2 items[];
+} req_out;
 uniform sampler2D HizPyramid;
 
 ivec3 section_pos(uvec2 p) {
@@ -48,6 +57,14 @@ ivec3 section_pos(uvec2 p) {
     int z = int(((p.x & 0xFFFFFu) << 4) | (p.y >> 28));
     z = (z << 8) >> 8;
     return ivec3(x, y, z);
+}
+
+// Inverse of `section_pos` (`gpu_arena::pack_section_pos`).
+uvec2 pack_section_pos(uint detail, ivec3 p) {
+    uint z24 = uint(p.z) & 0xFFFFFFu;
+    uint w0 = (detail << 28) | ((uint(p.y) & 0xFFu) << 20) | (z24 >> 4);
+    uint w1 = ((z24 & 0xFu) << 28) | ((uint(p.x) & 0xFFFFFFu) << 4);
+    return uvec2(w0, w1);
 }
 
 bool outside_frustum(vec3 mn, vec3 mx) {
@@ -125,6 +142,20 @@ void main() {
     vec3 closest = clamp(vec3(0.0), mn, mx);
     float dist = max(length(closest), 1.0);
     float voxel_px = (scale * camera_sub_pos.w) / dist;
+
+    // A visible node that wants finer detail asks for every child octant it does not have.
+    if (detail > 0u && voxel_px > lod_cfg.x) {
+        uint max_req = uint(lod_cfg.y);
+        for (uint ci = 0u; ci < 8u; ci++) {
+            if (!has_children || (child_mask & (1u << ci)) == 0u) {
+                uint slot = atomicAdd(req_out.count, 1u);
+                if (slot < max_req) {
+                    ivec3 child = ipos * 2 + ivec3(int(ci & 1u), int((ci >> 2) & 1u), int((ci >> 1) & 1u));
+                    req_out.items[slot] = pack_section_pos(detail - 1u, child);
+                }
+            }
+        }
+    }
 
     bool subdivide = detail > 0u && has_children && (voxel_px > lod_cfg.x || !has_geom);
     if (subdivide) {

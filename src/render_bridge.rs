@@ -223,6 +223,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     .entry(storage("RootBuffer", true, 4))
                     .entry(storage("VisibilityBuffer", false, 4))
                     .entry(storage("QueueA", false, 20))
+                    .entry(storage("RequestBuffer", false, 24))
                     .entry(storage("DispatchA", false, 16))
                     .build()
                     .expect("static trav_init layout"),
@@ -250,6 +251,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     .entry(storage("QueueOut", false, 20))
                     .entry(storage("DispatchOut", false, 16))
                     .entry(storage("VisibilityBuffer", false, 4))
+                    .entry(storage("RequestBuffer", false, 24))
                     .sampler("HizPyramid", nearest())
                     .build()
                     .expect("static traversal layout"),
@@ -565,6 +567,37 @@ pub fn queue_model_tables(
     *PENDING_TABLES.lock().unwrap() = Some((model_words, biome_tint_words, atlas_mips));
 }
 
+/// The traversal's request-buffer readback in flight (`voxy_traversal.csh` `RequestBuffer`).
+static PENDING_READBACK: Mutex<Option<mod_api::ReadbackTicket>> = Mutex::new(None);
+/// Most GPU node requests kept between two [`drain_gpu_node_requests`] calls.
+const MAX_GPU_NODE_REQUESTS: usize = 512;
+/// `(detail, section position)` the GPU traversal wanted but the arena lacked, newest readback last.
+static GPU_NODE_REQUESTS: Mutex<Vec<(u8, [i32; 3])>> = Mutex::new(Vec::new());
+
+/// Takes the octree sections the GPU traversal asked for (a visible node wanting finer detail
+/// whose child sections are not in the arena), for the pipeline to load ahead of its blind sweep.
+pub fn drain_gpu_node_requests() -> Vec<(u8, [i32; 3])> {
+    std::mem::take(&mut *GPU_NODE_REQUESTS.lock().unwrap())
+}
+
+/// Polls the in-flight request readback without blocking: a finished one is decoded into
+/// [`GPU_NODE_REQUESTS`], an unfinished one stays in flight and a failed one is dropped.
+fn poll_node_requests(host: &dyn mod_api::ClientHost) {
+    let mut pending = PENDING_READBACK.lock().unwrap();
+    let Some(ticket) = pending.take() else {
+        return;
+    };
+    match report("poll_readback", ticket.poll_readback(host)) {
+        Some(Some(bytes)) => {
+            let mut requests = GPU_NODE_REQUESTS.lock().unwrap();
+            requests.extend(crate::gpu_arena::decode_gpu_requests(&bytes));
+            requests.truncate(MAX_GPU_NODE_REQUESTS);
+        }
+        Some(None) => *pending = Some(ticket),
+        None => {}
+    }
+}
+
 /// Called by the pipeline's mesher for each finished section (empty = remove).
 pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
     PENDING_SECTIONS.lock().unwrap().push((key, section));
@@ -615,6 +648,7 @@ fn try_upload_pending(
         });
     }
     let state = guard.as_mut().unwrap();
+    poll_node_requests(&*host);
     if let Some((models, tints, atlas_mips)) = PENDING_TABLES.lock().unwrap().take() {
         let wrote_models = report("write models", state.arena.write_models(host, 0, &models));
         let wrote_tints = report(
@@ -785,6 +819,7 @@ pub fn setup_compute(
     let root_count = arena.root_count();
     let dispatch_a_ref = arena.dispatch_a;
     let dispatch_b_ref = arena.dispatch_b;
+    let requests_ref = arena.requests;
     let focal_px = (h as f32 * 0.5 * camera.projection[5].abs()).max(1.0);
     let lod_threshold = 2.0f32;
     let Some((hiz, _)) = ensure_hiz(host, [w, h]) else {
@@ -843,6 +878,7 @@ pub fn setup_compute(
             .storage_buffer("RootBuffer", slices.roots)
             .storage_buffer("VisibilityBuffer", slices.visibility)
             .storage_buffer("QueueA", slices.queue_a)
+            .storage_buffer("RequestBuffer", slices.requests)
             .storage_buffer("DispatchA", slices.dispatch_a);
         report(
             "trav_init dispatch",
@@ -863,7 +899,12 @@ pub fn setup_compute(
             ])
             .f32s(&[sub[0], sub[1], sub[2], focal_px])
             .i32s(&[w as i32, h as i32, mips as i32, 1])
-            .f32s(&[lod_threshold, 0.0, 0.0, 0.0])
+            .f32s(&[
+                lod_threshold,
+                crate::gpu_arena::GPU_MAX_REQUESTS as f32,
+                0.0,
+                0.0,
+            ])
             .0;
         for iter in 0..=crate::octree::MAX_OCTREE_DETAIL {
             let (q_in, q_out, d_in_ref, d_out) = if iter % 2 == 0 {
@@ -895,12 +936,23 @@ pub fn setup_compute(
                 .storage_buffer("QueueOut", q_out)
                 .storage_buffer("DispatchOut", d_out)
                 .storage_buffer("VisibilityBuffer", slices.visibility)
+                .storage_buffer("RequestBuffer", slices.requests)
                 .texture("HizPyramid", hiz.all_mips());
             report(
                 "traversal dispatch_indirect",
                 ctx.dispatch_indirect(traversal, &trav_bindings, d_in_ref, 0),
             );
         }
+        // The finished request buffer is read back without blocking; one readback is in flight at
+        // a time and `upload_pending` polls it.
+        let mut pending = PENDING_READBACK.lock().unwrap();
+        if pending.is_none() {
+            *pending = report(
+                "request_readback",
+                requests_ref.request_readback(host, 0, crate::gpu_arena::GPU_REQUEST_BUF_BYTES),
+            );
+        }
+        drop(pending);
         let clear_bindings =
             DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
         report(
