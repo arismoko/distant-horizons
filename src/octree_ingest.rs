@@ -243,25 +243,6 @@ impl OctreeIngestStore {
     ) -> Vec<OctreeSectionPos> {
         let edge = SECTION_EDGE as i32;
         let mut touched = HashSet::new();
-        let mut set = |store: &mut Self, vx: i32, vy: i32, vz: i32, voxel: Voxel| {
-            let pos = OctreeSectionPos::new(
-                level,
-                vx.div_euclid(edge),
-                vy.div_euclid(edge),
-                vz.div_euclid(edge),
-            );
-            let section = store
-                .sections
-                .entry(pos)
-                .or_insert_with(|| OctreeSection::new(pos));
-            section.set(
-                vx.rem_euclid(edge) as usize,
-                vy.rem_euclid(edge) as usize,
-                vz.rem_euclid(edge) as usize,
-                voxel,
-            );
-            touched.insert(pos);
-        };
         let mut fill_span = |store: &mut Self, vx: i32, vz: i32, y0: i32, y1: i32, voxel: Voxel| {
             if y0 >= y1 {
                 return;
@@ -325,7 +306,14 @@ impl OctreeIngestStore {
             if let Some(w) = water_top {
                 for y in (height + 1)..=w {
                     let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
-                    set(self, vx, y, vz, Voxel::new(water_block, biome, sky, 0));
+                    fill_span(
+                        self,
+                        vx,
+                        vz,
+                        y,
+                        y + 1,
+                        Voxel::new(water_block, biome, sky, 0),
+                    );
                 }
             }
             // Open sky above the surface (see `ingest_distant_columns`).
@@ -557,7 +545,7 @@ pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
         if let Some(w) = water_top {
             for y in (col.height + 1)..=w {
                 let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
-                store.set_voxel(col.x, y, col.z, Voxel::new(water_block, biome, sky, 0));
+                fill_d0(y, y + 1, Voxel::new(water_block, biome, sky, 0));
             }
         }
         // Open sky above the surface: coarser levels average the air's light, so one lit voxel

@@ -29,10 +29,10 @@ use std::sync::{LazyLock, Mutex};
 
 /// Block models baked per client tick (each bake reads sprite pixels on the CPU).
 const BAKES_PER_TICK: usize = 64;
-/// Maximum sections meshed per client tick (further bounded by [`MESH_TICK_BUDGET`]).
-const MESHES_PER_TICK: usize = 8;
-/// Hard wall-clock cap for synchronous client-tick meshing so the render thread never stalls.
-const MESH_TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+/// Maximum dirty sections handed off to the background mesher thread per client tick.
+const MESHES_PER_TICK: usize = 16;
+/// Backpressure cap on the background mesher queue so RAM stays bounded while flying fast.
+const MAX_PENDING_MESH_JOBS: usize = 64;
 
 /// Octree voxel ids: `0` is air, `n` is `states[n - 1]`; biome ids index `biomes`.
 #[derive(Default)]
@@ -173,11 +173,103 @@ impl Mapper {
     }
 }
 
+/// Compact immutable snapshot of `ModelMeta` by block id, shared with the background mesher
+/// thread so meshing never blocks the main render thread or holds `PIPELINE`.
+#[derive(Default)]
+struct MetaTable(Vec<crate::bakery::ModelMeta>);
+
+impl crate::bakery::ModelLookup for MetaTable {
+    fn meta(&self, block_id: u32) -> crate::bakery::ModelMeta {
+        self.0
+            .get(block_id as usize)
+            .copied()
+            .unwrap_or(crate::bakery::ModelMeta::EMPTY)
+    }
+}
+
+struct MeshJob {
+    dim: String,
+    pos: OctreeSectionPos,
+    section: OctreeSection,
+    borders: NeighborBorders,
+    covered: u8,
+    metas: Arc<MetaTable>,
+}
+
+struct MeshWorker {
+    queue: Arc<(Mutex<VecDeque<MeshJob>>, std::sync::Condvar)>,
+    done: Arc<Mutex<Vec<(String, OctreeSectionPos, bool)>>>,
+}
+
+impl MeshWorker {
+    fn new() -> Self {
+        let queue = Arc::new((
+            Mutex::new(VecDeque::<MeshJob>::new()),
+            std::sync::Condvar::new(),
+        ));
+        let done = Arc::new(Mutex::new(Vec::<(String, OctreeSectionPos, bool)>::new()));
+        let q_bg = Arc::clone(&queue);
+        let d_bg = Arc::clone(&done);
+        let _ = std::thread::Builder::new()
+            .name("dh-mesher".to_owned())
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let (lock, cv) = &*q_bg;
+                        let mut q = lock.lock().unwrap();
+                        while q.is_empty() {
+                            q = cv.wait(q).unwrap();
+                        }
+                        q.pop_front().unwrap()
+                    };
+                    let quads = mesh_octree_section_masked(
+                        &job.section,
+                        &job.borders,
+                        &*job.metas,
+                        job.covered,
+                    );
+                    let built = built_section(&quads);
+                    let has_quads = !built.is_empty();
+                    let key = (
+                        job.dim.clone(),
+                        job.pos.detail,
+                        [job.pos.x, job.pos.y, job.pos.z],
+                    );
+                    submit_built_section(key, built);
+                    d_bg.lock().unwrap().push((job.dim, job.pos, has_quads));
+                }
+            });
+        Self { queue, done }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.queue.0.lock().unwrap().len()
+    }
+
+    fn push(&self, job: MeshJob) {
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().push_back(job);
+        cv.notify_one();
+    }
+
+    fn clear_dim(&self, dim: &str) {
+        self.queue.0.lock().unwrap().retain(|j| j.dim != dim);
+        self.done.lock().unwrap().retain(|(d, _, _)| d != dim);
+    }
+
+    fn drain_done(&self) -> Vec<(String, OctreeSectionPos, bool)> {
+        std::mem::take(&mut *self.done.lock().unwrap())
+    }
+}
+
+static MESH_WORKER: LazyLock<MeshWorker> = LazyLock::new(MeshWorker::new);
+
 #[derive(Default)]
 struct Pipeline {
     stores: HashMap<String, OctreeIngestStore>,
     mapper: Mapper,
     models: BakedModelTable,
+    meta_snapshot: Arc<MetaTable>,
     baked: usize,
     models_dirty: bool,
     dirty: HashMap<String, VecDeque<OctreeSectionPos>>,
@@ -308,6 +400,7 @@ pub fn ingest_chunk(
 
 /// Drops every section of `dim` (level unload).
 pub fn clear_dimension(dim: &str) {
+    MESH_WORKER.clear_dim(dim);
     let mut p = PIPELINE.lock().unwrap();
     p.stores.remove(dim);
     p.dirty.remove(dim);
@@ -532,15 +625,29 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             .iter()
             .flat_map(|t| [t.grass, t.foliage, t.water])
             .collect();
+        let mut metas = Vec::with_capacity(p.mapper.states.len() + 1);
+        for id in 0..=p.mapper.states.len() {
+            metas.push(p.models.meta_for(id as u32));
+        }
+        p.meta_snapshot = Arc::new(MetaTable(metas));
         crate::render_bridge::queue_model_tables(words, tint_words, atlas);
     }
     if p.baked < p.mapper.states.len() {
         return;
     }
 
-    let mesh_start = std::time::Instant::now();
+    for (done_dim, pos, has_quads) in MESH_WORKER.drain_done() {
+        if has_quads {
+            p.rendered.entry(done_dim).or_default().insert(pos);
+        } else if let Some(live) = p.rendered.get_mut(&done_dim) {
+            live.remove(&pos);
+        }
+    }
+
+    let metas = Arc::clone(&p.meta_snapshot);
+    let mut pending = MESH_WORKER.pending_len();
     for _ in 0..MESHES_PER_TICK {
-        if mesh_start.elapsed() >= MESH_TICK_BUDGET {
+        if pending >= MAX_PENDING_MESH_JOBS {
             break;
         }
         let Some(pos) = p.dirty.get_mut(dim).and_then(VecDeque::pop_front) else {
@@ -575,19 +682,15 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         let neighbors: [Option<&OctreeSection>; 6] =
             Face::ALL.map(|face| store.section(pos.neighbor(face)));
         let borders = NeighborBorders::from_neighbors(neighbors);
-        let quads = mesh_octree_section_masked(section, &borders, &p.models, covered);
-        let built = built_section(&quads);
-        if built.is_empty() {
-            if p.rendered
-                .get_mut(dim)
-                .is_some_and(|live| live.remove(&pos))
-            {
-                submit_built_section(key, empty_section(pos));
-            }
-        } else {
-            p.rendered.entry(dim.to_owned()).or_default().insert(pos);
-            submit_built_section(key, built);
-        }
+        MESH_WORKER.push(MeshJob {
+            dim: dim.to_owned(),
+            pos,
+            section: section.clone(),
+            borders,
+            covered,
+            metas: Arc::clone(&metas),
+        });
+        pending += 1;
     }
 }
 
