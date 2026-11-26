@@ -89,7 +89,8 @@ struct Shared {
     global_epoch: AtomicU64,
     next_job_id: AtomicU64,
     stop: AtomicBool,
-    /// Desired worker count; workers with `idx >= target_threads` exit.
+    /// Workers with `idx >= target_threads` park before taking another job.
+    /// Changes are made under `queue` so a growing target cannot miss a waiter.
     target_threads: AtomicUsize,
     /// `ThreadPreset` discriminant (`threadRunTimeRatio` is derived from it).
     preset: AtomicU8,
@@ -97,6 +98,7 @@ struct Shared {
 
 pub struct GenWorkerPool {
     shared: Arc<Shared>,
+    /// A slot keeps its original worker until world close, even above the active target.
     handles: Mutex<Vec<JoinHandle<()>>>,
     max_in_flight: AtomicUsize,
 }
@@ -130,55 +132,55 @@ impl GenWorkerPool {
         }
     }
 
-    /// Spawn worker threads if not already running. Returns the number of live workers.
+    /// Spawn worker threads if not already running. Returns the number eligible for new work.
     pub fn ensure_started(&self) -> usize {
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
-        if !handles.is_empty() {
-            return handles.len();
-        }
-        self.shared.stop.store(false, Ordering::Release);
         let target = self.shared.target_threads.load(Ordering::Acquire);
-        spawn_workers(&self.shared, &mut handles, target);
-        let spawned = handles.len();
-        self.max_in_flight.store(
-            spawned * MAX_RETRIEVAL_REQUESTS_PER_THREAD,
-            Ordering::Release,
-        );
-        spawned
+        if handles.is_empty() {
+            spawn_workers(&self.shared, &mut handles, target);
+            self.max_in_flight.store(
+                handles.len() * MAX_RETRIEVAL_REQUESTS_PER_THREAD,
+                Ordering::Release,
+            );
+        }
+        target.min(handles.len())
     }
 
-    /// Apply a DH thread preset. Spawns extra workers or retires the highest-indexed ones
-    /// (they finish their current batch, then exit) and rescales the retrieval cap
-    /// (`GeneratedFullDataSourceProvider.getMaxRetrievalQueueCount()` = 20 * threads).
+    /// Apply a DH thread preset. Workers above the target finish their current batch, then
+    /// park in their original slots. Growing reuses those slots before spawning extra workers.
+    /// The retrieval cap follows the active count (DH's `getMaxRetrievalQueueCount()`).
     pub fn reconfigure(&self, preset: ThreadPreset) {
-        let target = preset.thread_count(logical_cpus());
-        if self.shared.preset.load(Ordering::Acquire) == preset as u8
-            && self.worker_count() == target
-        {
-            return;
-        }
-        self.shared.preset.store(preset as u8, Ordering::Release);
-        self.shared.target_threads.store(target, Ordering::Release);
+        self.apply_preset(preset, preset.thread_count(logical_cpus()));
+    }
+
+    fn apply_preset(&self, preset: ThreadPreset, target: usize) {
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared.preset.store(preset as u8, Ordering::Release);
+        let previous = self.shared.target_threads.load(Ordering::Acquire);
+        if target != previous {
+            let _queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            self.shared.target_threads.store(target, Ordering::Release);
+            if target > previous {
+                self.shared.cv.notify_all();
+            }
+        }
         if handles.is_empty() {
             return; // not running; `ensure_started` picks the new target up
         }
-        if handles.len() > target {
-            // Dropping a `JoinHandle` detaches; the worker sees `idx >= target` and exits.
-            handles.truncate(target);
-            self.shared.cv.notify_all();
-        } else {
-            spawn_workers(&self.shared, &mut handles, target);
-        }
+        spawn_workers(&self.shared, &mut handles, target);
         self.max_in_flight.store(
-            handles.len() * MAX_RETRIEVAL_REQUESTS_PER_THREAD,
+            target.min(handles.len()) * MAX_RETRIEVAL_REQUESTS_PER_THREAD,
             Ordering::Release,
         );
     }
 
-    /// Number of live worker threads.
+    /// Number of worker threads eligible for new work.
     pub fn worker_count(&self) -> usize {
-        self.handles.lock().unwrap_or_else(|e| e.into_inner()).len()
+        let handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared
+            .target_threads
+            .load(Ordering::Acquire)
+            .min(handles.len())
     }
 
     pub fn has_capacity(&self) -> bool {
@@ -288,7 +290,11 @@ impl GenWorkerPool {
             feature_stage,
             cells,
         });
-        self.shared.cv.notify_one();
+        // A single notification might go only to a parked slot. Wake all when work first
+        // arrives; eligible workers keep checking the queue until it is empty again.
+        if q.len() == 1 {
+            self.shared.cv.notify_all();
+        }
         true
     }
 
@@ -401,13 +407,15 @@ impl GenWorkerPool {
 
     /// Cancel all queued and running work and join every worker thread on world close.
     pub fn shutdown_and_join(&self) {
-        self.shared.global_epoch.fetch_add(1, Ordering::Release);
-        self.shared.stop.store(true, Ordering::Release);
-        self.shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        // Keep start and resize out until every slot has joined. Workers never take this lock.
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            self.shared.global_epoch.fetch_add(1, Ordering::Release);
+            self.shared.stop.store(true, Ordering::Release);
+            queue.clear();
+            self.shared.cv.notify_all();
+        }
         self.shared
             .done
             .lock()
@@ -418,13 +426,7 @@ impl GenWorkerPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.shared.cv.notify_all();
-
-        let to_join: Vec<JoinHandle<()>> = {
-            let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *handles)
-        };
-        for handle in to_join {
+        for handle in handles.drain(..) {
             let _ = handle.join();
         }
         self.max_in_flight.store(0, Ordering::Release);
@@ -482,15 +484,12 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
     loop {
         let job = {
             let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-            while q.is_empty()
-                && !shared.stop.load(Ordering::Acquire)
-                && idx < shared.target_threads.load(Ordering::Acquire)
+            while !shared.stop.load(Ordering::Acquire)
+                && (q.is_empty() || idx >= shared.target_threads.load(Ordering::Acquire))
             {
                 q = shared.cv.wait(q).unwrap_or_else(|e| e.into_inner());
             }
-            if shared.stop.load(Ordering::Acquire)
-                || idx >= shared.target_threads.load(Ordering::Acquire)
-            {
+            if shared.stop.load(Ordering::Acquire) {
                 return;
             }
             q.pop_front()
@@ -638,6 +637,85 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn busy_slot_survives_preset_changes_and_is_joined_on_close() {
+        let pool = GenWorkerPool::new();
+        pool.apply_preset(ThreadPreset::Balanced, 1);
+        assert_eq!(pool.ensure_started(), 1);
+
+        let (entered, busy) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let (completed, finished) = mpsc::channel();
+        // Stand in for a generator call already in progress at index 1. No SDK handles
+        // are needed to exercise the actual ownership, resize and shutdown paths.
+        let upper = thread::spawn(move || {
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+            completed.send(()).unwrap();
+        });
+        let upper_id = upper.thread().id();
+        pool.handles.lock().unwrap().push(upper);
+        busy.recv().unwrap();
+
+        let snapshot = || {
+            let active = pool.ensure_started();
+            let workers = pool.worker_count();
+            let cap = pool.max_in_flight.load(Ordering::Acquire);
+            let handles = pool.handles.lock().unwrap();
+            let upper = handles.get(1).map(|h| h.thread().id());
+            (active, workers, cap, handles.len(), upper)
+        };
+        pool.apply_preset(ThreadPreset::IPaidForTheWholeCpu, 2);
+        pool.apply_preset(ThreadPreset::Balanced, 1);
+        let shrunk = snapshot();
+        pool.apply_preset(ThreadPreset::IPaidForTheWholeCpu, 2);
+        let grown = snapshot();
+        // Close at the smaller preset: the still-busy upper slot must be joined too.
+        pool.apply_preset(ThreadPreset::Balanced, 1);
+        let epoch = pool.shared.global_epoch.load(Ordering::Acquire);
+        let (stopping, start_excluded) = thread::scope(|scope| {
+            let close = scope.spawn(|| pool.shutdown_and_join());
+            let queue = pool.shared.queue.lock().unwrap();
+            drop(
+                pool.shared
+                    .cv
+                    .wait_while(queue, |_| {
+                        pool.shared.global_epoch.load(Ordering::Acquire) == epoch
+                    })
+                    .unwrap(),
+            );
+            let stopping = pool.shared.stop.load(Ordering::Acquire);
+            // ensure_started must still be excluded while the busy slot cannot return.
+            let start_excluded = matches!(
+                pool.handles.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            release.send(()).unwrap();
+            close.join().unwrap();
+            (stopping, start_excluded)
+        });
+
+        assert_eq!(
+            shrunk,
+            (1, 1, MAX_RETRIEVAL_REQUESTS_PER_THREAD, 2, Some(upper_id))
+        );
+        assert_eq!(
+            grown,
+            (
+                2,
+                2,
+                2 * MAX_RETRIEVAL_REQUESTS_PER_THREAD,
+                2,
+                Some(upper_id)
+            )
+        );
+        assert!(stopping && start_excluded);
+        assert_eq!(finished.try_recv(), Ok(()));
+        assert!(pool.handles.lock().unwrap().is_empty());
+        assert!(!pool.has_capacity());
+    }
 
     #[test]
     fn cancelling_one_level_increments_only_its_epoch() {
