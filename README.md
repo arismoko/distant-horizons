@@ -36,8 +36,12 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
   published server to remote clients over one raw, optional play channel
   (`distantsunrises:octree_sync`) in Distant Horizons' wire layout: session-config negotiation,
   per-player rate and concurrency limiters, timestamp-based "up to date" replies, chunked payloads
-  (1,048,000-byte splits) and real-time partial updates. Receive buffers are size- and count-capped.
-  Clients without the mod, and servers without it, are never blocked from joining.
+  (1,048,000-byte splits). After a full section reply has been queued to a remote client, later
+  revisions of that section can arrive without another request. These partial updates require
+  negotiated real-time updates and a player in the same dimension and within the negotiated range;
+  they share the reply bandwidth limit. The integrated server's local window reads the shared
+  terrain store instead. Receive buffers are size- and count-capped. Clients without the mod,
+  and servers without it, are never blocked from joining.
 - **Public API.** `src/api.rs` offers `LodWorldGenerator` overrides, `RemoteLodProvider` clients,
   column and section submission, `FullDataSourceV2` decoding and cache queries.
 - **Client UI.** Mod settings (`Options > Mods`), `/ds` and `/distantsunrises` client commands,
@@ -56,7 +60,8 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
 
 - The GPU arena is 128 MiB of quads and has no distance-based eviction yet: once it is full, new
   sections are not stored (the failure is logged).
-- `octree_sync` serves the overworld only.
+- `octree_sync` serves sections by dimension. The server drains all dimensions' outgoing terrain
+  traffic on Overworld ticks.
 - Shader-pack shadows draw with the camera-culled command list, so casters outside the view are
   missing from shadow maps.
 
