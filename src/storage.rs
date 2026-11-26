@@ -1475,35 +1475,31 @@ impl RegionCache {
         mapping: &OctreeMapping,
         mode: DhV2CompressionMode,
     ) -> io::Result<()> {
-        self.write_octree(
-            world_dir,
-            dimension,
-            section.pos,
-            section.footprint.is_empty() && section.is_empty(),
-            || encode_octree_section(section, mapping, mode),
-        )
+        self.write_octree(world_dir, dimension, &section.into(), mapping, mode)
     }
 
     fn write_octree(
         &mut self,
         world_dir: &Path,
         dimension: &str,
-        pos: OctreeSectionPos,
-        untouched_air: bool,
-        encode: impl FnOnce() -> Result<Vec<u8>, OctreeCodecError>,
+        record: &OctreeRecord,
+        mapping: &OctreeMapping,
+        mode: DhV2CompressionMode,
     ) -> io::Result<()> {
+        let pos = record.rle.pos;
         let path = octree_region_path(world_dir, dimension, pos);
         self.check_write_allowed(&path)?;
         let (_, _, _, slot_idx) = octree_region_slot(pos);
         // Probe without creating a region, after queue coalescing and any in-flight write.
-        if untouched_air
+        if record.is_untouched_air()
             && !self
                 .get_region(&path, false)?
                 .is_some_and(|reg| reg.slots[slot_idx].len != 0)
         {
             return Ok(());
         }
-        let record = encode().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let record = encode_octree_record(record, mapping, mode)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crc = octree_record_crc(&record)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record too short"))?;
         let Some(reg) = self.get_region(&path, true)? else {
@@ -1905,11 +1901,13 @@ fn run_io_worker(shared: Arc<IoShared>, mut cache: RegionCache) {
         match task {
             Task::Exit => break,
             Task::OctreeSave((world_dir, dimension, pos), job) => {
-                let untouched_air = job.section.footprint.is_empty()
-                    && job.section.rle.palette.iter().all(|voxel| voxel.is_air());
-                let res = cache.write_octree(&world_dir, &dimension, pos, untouched_air, || {
-                    encode_octree_record(&job.section, &job.mapping, job.mode)
-                });
+                let res = cache.write_octree(
+                    &world_dir,
+                    &dimension,
+                    &job.section,
+                    &job.mapping,
+                    job.mode,
+                );
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
                 if let Err(cause) = res {
