@@ -1377,7 +1377,8 @@ impl RegionCache {
 
 impl RegionCache {
     /// Encode and store one octree section in its `.dhoct` region slot (copy-on-write append,
-    /// then header commit, as for column regions).
+    /// then header commit, as for column regions). All-air sections can clear existing data but
+    /// do not allocate a slot of their own.
     pub fn save_octree_section(
         &mut self,
         world_dir: &Path,
@@ -1386,12 +1387,20 @@ impl RegionCache {
         mapping: &OctreeMapping,
         mode: DhV2CompressionMode,
     ) -> io::Result<()> {
+        let path = octree_region_path(world_dir, dimension, section.pos);
+        let (_, _, _, slot_idx) = octree_region_slot(section.pos);
+        // Probe without creating a region, after queue coalescing and any in-flight write.
+        if section.is_empty()
+            && !self
+                .get_region(&path, false)?
+                .is_some_and(|reg| reg.slots[slot_idx].len != 0)
+        {
+            return Ok(());
+        }
         let record = encode_octree_section(section, mapping, mode)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crc = octree_record_crc(&record)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record too short"))?;
-        let path = octree_region_path(world_dir, dimension, section.pos);
-        let (_, _, _, slot_idx) = octree_region_slot(section.pos);
         let Some(reg) = self.get_region(&path, true)? else {
             return Err(io::Error::other("failed to open region file"));
         };
@@ -2227,6 +2236,81 @@ mod tests {
         assert!(bad.load_octree_section(&dir, dim, b_pos).is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn octree_worker_rewrites_existing_slots_with_air_without_allocating_new_ones() {
+        let dir = fresh_tmp_dir("octree-air");
+        let dim = "minecraft:overworld";
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let neighbor = pos.neighbor(crate::octree::Face::PosX);
+        let missing = OctreeSectionPos::new(0, 2, 0, 0);
+        let absent_region = OctreeSectionPos::new(0, 8, 0, 0);
+        let (old, mapping) = populated_octree(pos);
+        let (other, other_mapping) = populated_octree(neighbor);
+        let mut clear = OctreeSection::filled(pos, Voxel::air_with_light(15, 0));
+        clear.revision = old.revision + 1;
+
+        let worker = LodIoWorker::spawn();
+        worker.save_octree_section(dir.clone(), dim.into(), old, mapping);
+        worker.save_octree_section(dir.clone(), dim.into(), other.clone(), other_mapping);
+        worker.flush();
+        for section in [
+            clear.clone(),
+            OctreeSection::new(missing),
+            OctreeSection::new(absent_region),
+        ] {
+            worker.save_octree_section(dir.clone(), dim.into(), section, OctreeMapping::default());
+        }
+        worker.load_octree_section(dir.clone(), dim.into(), pos);
+        worker.flush();
+        let responses = worker.drain_octree_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].section.revision, clear.revision);
+        assert_eq!(responses[0].section.to_dense(), clear.to_dense());
+        drop(worker);
+
+        let mut fresh = RegionCache::default();
+        let (reopened, _) = fresh.load_octree_section(&dir, dim, pos).unwrap();
+        assert_eq!(reopened.revision, clear.revision);
+        assert_eq!(reopened.to_dense(), clear.to_dense());
+        let (reopened_neighbor, _) = fresh.load_octree_section(&dir, dim, neighbor).unwrap();
+        assert_eq!(reopened_neighbor.to_dense(), other.to_dense());
+        assert!(fresh.load_octree_section(&dir, dim, missing).is_none());
+        assert!(!octree_region_path(&dir, dim, absent_region).exists());
+        drop(fresh);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn octree_pending_clear_supersedes_nonempty_write_before_load() {
+        let dir = fresh_tmp_dir("octree-coalesced-air");
+        let dim = "minecraft:overworld";
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let (old, mapping) = populated_octree(pos);
+        // Stage operations before running the real I/O loop so coalescing is deterministic.
+        let worker = LodIoWorker {
+            shared: Arc::new(IoShared {
+                state: Mutex::new(IoQueueState::default()),
+                wake_worker: Condvar::new(),
+                wake_flusher: Condvar::new(),
+            }),
+            handle: Mutex::new(None),
+        };
+        worker.save_octree_section(dir.clone(), dim.into(), old, mapping);
+        worker.load_octree_section(dir.clone(), dim.into(), pos);
+        worker.save_octree_section(
+            dir.clone(),
+            dim.into(),
+            OctreeSection::new(pos),
+            OctreeMapping::default(),
+        );
+        worker.shared.state.lock().unwrap().shutdown = true;
+        run_io_worker(Arc::clone(&worker.shared));
+
+        assert!(worker.drain_octree_responses().is_empty());
+        assert!(!octree_region_path(&dir, dim, pos).exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
