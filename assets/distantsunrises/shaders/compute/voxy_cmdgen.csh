@@ -2,11 +2,16 @@
 // Per-section frustum + Hi-Z occlusion culling and indirect command generation
 // (behaviour: Voxy lod/gl46/cmdgen.comp + hierarchical/screenspace.glsl).
 //
-// One invocation per section id. Every (section, bucket) slot is rewritten every frame:
-// a culled / empty / back-facing bucket gets instance_count = 0 (ruling point 18), a visible one
-// gets {index_count = quads*6, 1, 0, base_vertex = first_quad*4, first_instance = section id}
-// (Voxy writeCmd). Slots: opaque = id*7 + k (k 0 = double-sided, 1..6 = down,up,north,south,
-// west,east), translucent = id.
+// One invocation per section id. A visible bucket gets
+// {index_count = quads*6, 1, 0, base_vertex = first_quad*4, first_instance = section id}
+// (Voxy writeCmd). Two opaque layouts, chosen by camera_sub_pos.w (compact_opaque):
+// - compact_opaque != 0 (multi_draw_indirect_count): each visible non-empty bucket takes a slot
+//   `atomicAdd(opaque_count, 1)`, so opaque_cmds[0..opaque_count) is dense and the draw reads
+//   opaque_count from TransSortMeta word 1 (no culled commands are written);
+// - compact_opaque == 0: every (section, bucket) slot is rewritten every frame, a culled / empty /
+//   back-facing bucket gets instance_count = 0 (ruling point 18). Slots: opaque = id*7 + k
+//   (k 0 = double-sided, 1..6 = down,up,north,south,west,east).
+// Translucent commands are compacted by voxy_trans_scatter.csh into translucent_cmds[0..visible_count).
 layout(local_size_x = 128) in;
 
 struct SectionMeta {
@@ -25,7 +30,7 @@ struct DrawCommand {
 layout(std140) uniform CmdgenParams {
     mat4 view_proj;        // camera-relative, same matrix the quad pass uses
     ivec4 base_section;    // xyz = camera block position >> 5, w = section count (id high-water)
-    vec4 camera_sub_pos;   // xyz = camera - base_section*32, w = unused
+    vec4 camera_sub_pos;   // xyz = camera - base_section*32, w = compact_opaque (0/1)
     ivec4 hiz;             // xy = mip 0 size, z = mip count, w = hiz enabled (0/1)
 };
 
@@ -35,7 +40,7 @@ layout(std430) buffer OpaqueCommands { DrawCommand opaque_cmds[]; };
 layout(std430) buffer TranslucentCommands { DrawCommand translucent_cmds[]; };
 layout(std430) buffer TransSortMeta {
     uint visible_count;
-    uint pad0;
+    uint opaque_count;
     uint bucket_counts[256];
     uint bucket_offsets[256];
 };
@@ -162,13 +167,27 @@ void main() {
     // Clear this translucent slot; visible translucent sections are compacted and sorted
     // back-to-front by Manhattan distance into translucent_cmds[0..visible_count] by
     // voxy_trans_prefix.csh + voxy_trans_scatter.csh.
-    translucent_cmds[id] = make(0u, 0u, 0u, false);
+    bool compact_opaque = camera_sub_pos.w != 0.0;
+    if (!compact_opaque) {
+        translucent_cmds[id] = make(0u, 0u, 0u, false);
+    }
     if (visible && c_trans != 0u) {
         uint dist = min((uint(abs(rel.x) + abs(rel.y) + abs(rel.z)) << detail), 255u);
         uint bucket = 255u - dist;
         uint slot = atomicAdd(visible_count, 1u);
         atomicAdd(bucket_counts[bucket], 1u);
         trans_entries[slot] = uvec2(id, bucket);
+    }
+    if (compact_opaque) {
+        if (!visible) return;
+        if (c_dbl != 0u) opaque_cmds[atomicAdd(opaque_count, 1u)] = make(s_dbl, c_dbl, id, true);
+        if (c_down != 0u && rel.y > -1) opaque_cmds[atomicAdd(opaque_count, 1u)] = make(s_down, c_down, id, true);
+        if (c_up != 0u && rel.y < 1) opaque_cmds[atomicAdd(opaque_count, 1u)] = make(s_up, c_up, id, true);
+        if (c_north != 0u && rel.z > -1) opaque_cmds[atomicAdd(opaque_count, 1u)] = make(s_north, c_north, id, true);
+        if (c_south != 0u && rel.z < 1) opaque_cmds[atomicAdd(opaque_count, 1u)] = make(s_south, c_south, id, true);
+        if (c_west != 0u && rel.x > -1) opaque_cmds[atomicAdd(opaque_count, 1u)] = make(s_west, c_west, id, true);
+        if (c_east != 0u && rel.x < 1) opaque_cmds[atomicAdd(opaque_count, 1u)] = make(s_east, c_east, id, true);
+        return;
     }
     uint o = id * 7u;
     opaque_cmds[o + 0u] = make(s_dbl, c_dbl, id, visible && c_dbl != 0u);

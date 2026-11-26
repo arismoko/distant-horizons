@@ -19,7 +19,10 @@
 //!
 //! Culled sections are drawn with `instance_count = 0` (ruling point 18): the command buffers use
 //! one fixed slot per `(section id, bucket)`, rewritten every frame by `voxy_cmdgen.csh`, so the
-//! draw count is simply the id high-water mark times the bucket count.
+//! draw count is simply the id high-water mark times the bucket count. With
+//! `multi_draw_indirect_count` the opaque commands are instead compacted on the GPU and both
+//! draws read their counts from `trans_sort_meta` (`OPAQUE_COUNT_OFFSET`,
+//! `TRANSLUCENT_COUNT_OFFSET`); the fixed-slot layout is the fallback.
 
 use mod_api::{
     BufferError, ClientHost, StorageBufferDescriptor, StorageBufferRef, StorageBufferSlice,
@@ -349,8 +352,12 @@ impl From<BufferError> for ArenaError {
     }
 }
 
-/// Size in bytes of `TransSortMeta` (`visible_count`, `pad0`, 256 counts, 256 offsets).
+/// Size in bytes of `TransSortMeta` (`visible_count`, `opaque_count`, 256 counts, 256 offsets).
 pub const TRANS_SORT_META_BYTES: u64 = (2 + 256 * 2) * 4;
+/// Byte offset in `trans_sort_meta` of the compacted opaque draw count (`opaque_count`).
+pub const OPAQUE_COUNT_OFFSET: u64 = 4;
+/// Byte offset in `trans_sort_meta` of the translucent draw count (`visible_count`).
+pub const TRANSLUCENT_COUNT_OFFSET: u64 = 0;
 /// Size in bytes of one `TransSortEntries` element (`uvec2(section_id, bucket)`).
 pub const TRANS_SORT_ENTRY_BYTES: u64 = 8;
 /// Size in bytes of one `GpuNode` record (`uvec4 a; uvec4 b;`).
@@ -544,6 +551,8 @@ pub struct GpuArena {
     /// `max_sections` commands, `indirect: true`, sorted back-to-front by `voxy_trans_scatter.csh`.
     pub translucent_commands: StorageBufferRef,
     /// 256-bucket Manhattan-distance sort histogram & prefix-summed offsets (`voxy_trans_*.csh`).
+    /// `indirect: true`: words 0 and 1 are the GPU draw counts ([`TRANSLUCENT_COUNT_OFFSET`],
+    /// [`OPAQUE_COUNT_OFFSET`]) read by `multi_draw_indirect_count`.
     pub trans_sort_meta: StorageBufferRef,
     /// Visible translucent `(section_id, bucket)` pairs written by `voxy_cmdgen.csh`.
     pub trans_sort_entries: StorageBufferRef,
@@ -638,7 +647,10 @@ impl GpuArena {
             host,
             StorageBufferDescriptor::new(tcmd_bytes).indirect(true),
         )?;
-        let trans_sort_meta = make(host, StorageBufferDescriptor::new(TRANS_SORT_META_BYTES))?;
+        let trans_sort_meta = make(
+            host,
+            StorageBufferDescriptor::new(TRANS_SORT_META_BYTES).indirect(true),
+        )?;
         let trans_sort_entries = make(host, StorageBufferDescriptor::new(tsort_entry_bytes))?;
         let node_bytes = GPU_MAX_NODES * GPU_NODE_BYTES;
         let root_bytes = GPU_TRAV_QUEUE_CAP as u64 * 4;
