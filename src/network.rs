@@ -1608,7 +1608,7 @@ pub mod octree_sync {
             kind: ExceptionKind,
             message: String,
         },
-        /// A response whose buffer never arrived (dropped chunk or expired).
+        /// A full response without a usable section.
         Lost {
             level: String,
             pos: OctreeSectionPos,
@@ -1676,63 +1676,88 @@ pub mod octree_sync {
             bytes: &[u8],
             now: Instant,
         ) -> Result<Vec<ClientEvent>, SyncError> {
-            Ok(match Message::decode(bytes)? {
+            let mut events = Vec::new();
+            self.receive_events(bytes, now, &mut events)?;
+            Ok(events)
+        }
+
+        fn receive_events(
+            &mut self,
+            bytes: &[u8],
+            now: Instant,
+            events: &mut Vec<ClientEvent>,
+        ) -> Result<(), SyncError> {
+            match Message::decode(bytes)? {
                 Message::SessionConfig(cfg) => {
                     self.config = Some(cfg);
-                    vec![ClientEvent::Config(cfg)]
+                    events.push(ClientEvent::Config(cfg));
                 }
-                Message::Split(split) => {
-                    self.receiver.receive(split, now)?;
-                    Vec::new()
-                }
-                Message::Exception(e) => match self.pending.remove(&e.future_id) {
-                    Some((level, pos)) => {
-                        vec![ClientEvent::Failed {
+                Message::Split(split) => self.receiver.receive(split, now)?,
+                Message::Exception(e) => {
+                    if let Some((level, pos)) = self.pending.remove(&e.future_id) {
+                        events.push(ClientEvent::Failed {
                             level,
                             pos,
                             kind: e.kind,
                             message: e.message,
-                        }]
+                        });
                     }
-                    None => Vec::new(),
-                },
+                }
                 Message::Response(resp) => {
                     let Some((level, pos)) = self.pending.remove(&resp.future_id) else {
-                        return Ok(Vec::new());
+                        return Ok(());
                     };
                     match resp.payload {
-                        None => vec![ClientEvent::UpToDate { level, pos }],
+                        None => events.push(ClientEvent::UpToDate { level, pos }),
                         Some(payload) => match self.receiver.take(payload.buffer_id) {
-                            None => vec![ClientEvent::Lost { level, pos }],
-                            Some(buffer) => {
-                                let (section, mapping) =
-                                    OctreeSectionDto::decode(&buffer)?.into_section()?;
-                                vec![ClientEvent::Section {
-                                    level,
-                                    section,
-                                    mapping,
-                                }]
-                            }
+                            None => events.push(ClientEvent::Lost { level, pos }),
+                            Some(buffer) => complete_full_response(
+                                events,
+                                level,
+                                pos,
+                                OctreeSectionDto::decode(&buffer)
+                                    .and_then(|dto| dto.into_section()),
+                            )?,
                         },
                     }
                 }
                 Message::PartialUpdate(update) => {
-                    match self.receiver.take(update.payload.buffer_id) {
-                        None => Vec::new(),
-                        Some(buffer) => {
-                            let (section, mapping) =
-                                OctreeSectionDto::decode(&buffer)?.into_section()?;
-                            vec![ClientEvent::PartialUpdate {
-                                level: update.level,
-                                section,
-                                mapping,
-                            }]
-                        }
+                    if let Some(buffer) = self.receiver.take(update.payload.buffer_id) {
+                        let (section, mapping) =
+                            OctreeSectionDto::decode(&buffer)?.into_section()?;
+                        events.push(ClientEvent::PartialUpdate {
+                            level: update.level,
+                            section,
+                            mapping,
+                        });
                     }
                 }
-                Message::Request(_) => Vec::new(),
-            })
+                Message::Request(_) => {}
+            }
+            Ok(())
         }
+    }
+
+    fn complete_full_response(
+        events: &mut Vec<ClientEvent>,
+        level: String,
+        pos: OctreeSectionPos,
+        decoded: Result<(OctreeSection, Vec<MappingEntry>), SyncError>,
+    ) -> Result<(), SyncError> {
+        match decoded {
+            Ok((section, mapping)) => events.push(ClientEvent::Section {
+                level,
+                section,
+                mapping,
+            }),
+            Err(err) => {
+                // The future is already retired. Queue completion even when returning the
+                // diagnostic to the payload handler so the pipeline can remove its marker.
+                events.push(ClientEvent::Lost { level, pos });
+                return Err(err);
+            }
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------ Sunrise payload glue
@@ -1767,7 +1792,7 @@ pub mod octree_sync {
         ) -> Result<(), SyncError> {
             // Check under the same lock as logout and rearm, before touching any protocol state.
             if self.open && epoch_live() {
-                self.events.extend(self.session.on_message(bytes, now)?);
+                self.session.receive_events(bytes, now, &mut self.events)?;
             }
             Ok(())
         }
@@ -1997,6 +2022,23 @@ pub mod octree_sync {
         use std::sync::atomic::AtomicUsize;
 
         const LEVEL: &str = "minecraft:overworld";
+
+        #[test]
+        fn unreadable_full_response_queues_lost_completion_and_preserves_error() {
+            let mut intake = ClientIntake::default();
+            let pos = OctreeSectionPos::new(0, 2, 1, -3);
+            let result = complete_full_response(
+                &mut intake.events,
+                LEVEL.into(),
+                pos,
+                Err(SyncError::ChecksumMismatch),
+            );
+            assert_eq!(result, Err(SyncError::ChecksumMismatch));
+            assert!(matches!(
+                intake.events.as_slice(),
+                [ClientEvent::Lost { level, pos: lost }] if level == LEVEL && *lost == pos
+            ));
+        }
 
         #[test]
         fn initial_remote_login_preserves_installed_dimension_and_configures_once() {
