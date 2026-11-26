@@ -19,9 +19,12 @@
 //!   is still empty, so lower-detail data never replaces real data; the source priority here
 //!   keeps the same guarantee for chunk-level provenance.
 //!
-//! A uniform-air vanilla section maps to one aligned octant. Open sky is stored as lit air,
-//! distinct from the dark/unwritten air around it, without allocating voxel indices. Covered
-//! uniform air clears an existing octant but doesn't create a new section.
+//! A uniform-air vanilla section maps to one aligned octant. Open sky is stored as lit air
+//! (`Voxel::air_with_light(15, 0)`), distinct from the dark/unwritten `Voxel::AIR` around it,
+//! without allocating voxel indices. `ChunkEdit::capture` emits lit air only when every column
+//! above is still open, and dark `Voxel::AIR` otherwise. In `ChunkEdit::apply`, uniform dark
+//! `Voxel::AIR` clears an existing section but never creates one, while uniform open-sky lit air
+//! can create a missing section.
 
 use crate::octree::{
     OctreeSection, OctreeSectionPos, SECTION_EDGE, Voxel, child_index, mip_voxels,
