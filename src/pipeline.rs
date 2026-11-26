@@ -14,10 +14,9 @@ use crate::mesh::{SectionQuads, mesh_octree_section_masked};
 use crate::network::octree_sync::{ClientEvent, MappingEntry, OctreeSectionDto, ServerSource};
 use crate::octree::Voxel;
 use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
-use crate::octree_ingest::DistantColumn;
-use crate::octree_ingest::{OctreeIngestStore, ingest_chunk_snapshot, ingest_saved_chunk};
+use crate::octree_ingest::{ChunkEdit, DistantColumn, IngestSource, OctreeIngestStore};
 use crate::render_bridge::submit_built_section;
-use crate::storage::{DEFAULT_OCTREE_COMPRESSION, LodIoWorker, OctreeMapping};
+use crate::storage::{DEFAULT_OCTREE_COMPRESSION, LodIoWorker, OctreeLoaded, OctreeMapping};
 use mod_api::{
     BlockKey, BlockState, ChunkSnapshot, ClientHost, Direction, Host, HostBlockStates, PlayerRef,
     ServerHost, TerrainColumn,
@@ -281,8 +280,10 @@ struct Pipeline {
     rendered: HashMap<String, HashSet<OctreeSectionPos>>,
     /// Sections changed since their last save.
     unsaved: HashMap<String, HashSet<OctreeSectionPos>>,
-    /// Sections already asked of disk or of the server, per dimension.
+    /// Sections already asked of a remote server, per dimension.
     requested: HashMap<String, HashSet<OctreeSectionPos>>,
+    disk: HashMap<String, DiskIntake>,
+    next_probe: u64,
 }
 
 static PIPELINE: LazyLock<Mutex<Pipeline>> = LazyLock::new(Default::default);
@@ -372,112 +373,228 @@ impl Pipeline {
     }
 }
 
-/// Which source a snapshot came from: G1 (live chunk), G3 (saved Anvil chunk), or G4 (detached
-/// full-chunk generation with trees/features).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SnapshotSource {
-    Loaded,
-    Saved,
-    Distant,
+#[derive(Default)]
+struct DiskIntake {
+    swept: HashSet<OctreeSectionPos>,
+    loading: HashMap<OctreeSectionPos, u64>,
+    // Misses are retained only as long as the incoming batch needs them.
+    missing: HashSet<OctreeSectionPos>,
+    failed: HashSet<OctreeSectionPos>,
+    pending: Vec<TerrainInput>,
 }
 
-/// Writes one chunk snapshot into `dim`'s store without propagating mips or queueing meshes.
-/// Returns whether the chunk was accepted; the caller runs [`propagate_and_queue`] afterwards.
-fn ingest_unpropagated(
-    p: &mut Pipeline,
-    host: &dyn ServerHost,
-    dim: &str,
-    chunk: [i32; 2],
-    snapshot: &ChunkSnapshot,
-    source: SnapshotSource,
-) -> bool {
-    let cave_cull = (source == SnapshotSource::Distant && dim != "minecraft:the_nether")
-        .then(|| (60, p.mapper.block_named(host, "minecraft:stone")));
-    let store = p.stores.entry(dim.to_owned()).or_default();
-    let mapper = std::cell::RefCell::new(&mut p.mapper);
-    match source {
-        SnapshotSource::Loaded => ingest_chunk_snapshot(
-            store,
-            chunk,
-            snapshot,
-            &mut |state| mapper.borrow_mut().block(host, state),
-            &mut |biome| mapper.borrow_mut().biome(biome),
-        ),
-        SnapshotSource::Saved => ingest_saved_chunk(
-            store,
-            chunk,
-            snapshot,
-            &mut |state| mapper.borrow_mut().block(host, state),
-            &mut |biome| mapper.borrow_mut().biome(biome),
-        ),
-        SnapshotSource::Distant => crate::octree_ingest::ingest_chunk_culled(
-            store,
-            chunk,
-            snapshot,
-            crate::octree_ingest::IngestSource::Distant,
-            cave_cull,
-            &mut |state| mapper.borrow_mut().block(host, state),
-            &mut |biome| mapper.borrow_mut().biome(biome),
-        ),
+enum TerrainInput {
+    Chunk(ChunkEdit),
+    Estimate {
+        detail: u8,
+        columns: Vec<DistantColumn>,
+        water: u32,
+        stone: u32,
+    },
+}
+
+impl DiskIntake {
+    fn probe(
+        &mut self,
+        next: &mut u64,
+        io: &LodIoWorker,
+        dir: &Path,
+        dim: &str,
+        pos: OctreeSectionPos,
+        for_write: bool,
+    ) -> bool {
+        if self.loading.contains_key(&pos)
+            || self.failed.contains(&pos)
+            || (!for_write && !self.swept.insert(pos))
+        {
+            return false;
+        }
+        self.swept.insert(pos);
+        *next = next.wrapping_add(1);
+        self.loading.insert(pos, *next);
+        io.load_octree_section(dir.to_owned(), dim.to_owned(), pos, *next, for_write);
+        true
     }
 }
 
-/// Propagates every dirty section of `dim`'s store up the octree once, then marks the touched
-/// sections unsaved and queues them for meshing.
-fn propagate_and_queue(p: &mut Pipeline, dim: &str) {
-    let mapper = &p.mapper;
-    let touched = p
-        .stores
-        .get_mut(dim)
-        .expect("store inserted by ingest")
-        .propagate_dirty(&|id| mapper.opacity(id));
-    p.unsaved
-        .entry(dim.to_owned())
-        .or_default()
-        .extend(touched.iter().copied());
-    p.queue(dim, touched);
+// The caller stops taking new source batches while this one is waiting. Chunk edits contain
+// resolved voxels, not raw snapshots borrowed from the generation pool's completed buffer.
+pub fn has_pending_intake(dim: &str) -> bool {
+    PIPELINE
+        .lock()
+        .unwrap()
+        .disk
+        .get(dim)
+        .is_some_and(|disk| !disk.pending.is_empty())
 }
 
-/// Ingest one chunk snapshot into `dim`'s octree store (server thread) and queue the touched
-/// sections for meshing. Returns whether the chunk was accepted (a higher-priority source owns it
-/// otherwise).
 pub fn ingest_chunk(
     host: &dyn ServerHost,
     dim: &str,
     chunk: [i32; 2],
     snapshot: &ChunkSnapshot,
-    source: SnapshotSource,
-) -> bool {
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
-    let accepted = ingest_unpropagated(p, host, dim, chunk, snapshot, source);
-    if accepted {
-        propagate_and_queue(p, dim);
-    }
-    accepted
+    source: IngestSource,
+) {
+    let mut p = PIPELINE.lock().unwrap();
+    let cull = (source == IngestSource::Distant && dim != "minecraft:the_nether")
+        .then(|| (60, p.mapper.block_named(host, "minecraft:stone")));
+    let mapper = std::cell::RefCell::new(&mut p.mapper);
+    let edit = ChunkEdit::capture(
+        chunk,
+        snapshot,
+        source,
+        cull,
+        &mut |state| mapper.borrow_mut().block(host, state),
+        &mut |biome| mapper.borrow_mut().biome(biome),
+    );
+    p.disk
+        .entry(dim.to_owned())
+        .or_default()
+        .pending
+        .push(TerrainInput::Chunk(edit));
 }
 
-/// Ingest several chunk snapshots (one finished distant job) under a single `PIPELINE` lock and
-/// run `propagate_dirty` once for all accepted chunks instead of once per chunk. Returns how many
-/// chunks were accepted.
-pub fn ingest_chunks_batch(
-    host: &dyn ServerHost,
-    dim: &str,
-    chunks: &[([i32; 2], &ChunkSnapshot)],
-    source: SnapshotSource,
-) -> usize {
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
-    let mut accepted = 0;
-    for &(chunk, snapshot) in chunks {
-        if ingest_unpropagated(p, host, dim, chunk, snapshot, source) {
-            accepted += 1;
+impl Pipeline {
+    fn accept_probes(
+        &mut self,
+        io: &LodIoWorker,
+        dir: &Path,
+        mut remap: impl FnMut(&mut Mapper, OctreeSection, OctreeMapping) -> OctreeSection,
+    ) {
+        for OctreeLoaded {
+            world_dir,
+            dimension,
+            pos,
+            request,
+            result,
+        } in io.drain_octree_responses()
+        {
+            if world_dir.as_path() != dir {
+                continue;
+            }
+            let Some(disk) = self.disk.get_mut(&dimension) else {
+                continue;
+            };
+            if disk.loading.get(&pos) != Some(&request) {
+                continue;
+            }
+            disk.loading.remove(&pos);
+            match result {
+                Ok(Some((section, mapping))) => {
+                    let section = remap(&mut self.mapper, section, mapping);
+                    if self
+                        .stores
+                        .entry(dimension.clone())
+                        .or_default()
+                        .adopt_cached(section)
+                    {
+                        self.queue(&dimension, [pos]);
+                    }
+                }
+                Ok(None) => {
+                    if !disk.pending.is_empty() {
+                        disk.missing.insert(pos);
+                    }
+                }
+                Err(e) => {
+                    disk.failed.insert(pos);
+                    eprintln!(
+                        "DH: octree slot {pos:?} in {dimension} ({}) was not read: {e}",
+                        dir.display()
+                    );
+                }
+            }
         }
     }
-    if accepted > 0 {
-        propagate_and_queue(p, dim);
+
+    fn advance_intake(&mut self, io: &LodIoWorker, dir: &Path, dim: &str, final_pass: bool) {
+        let Some(disk) = self.disk.get_mut(dim) else {
+            return;
+        };
+        if disk.pending.is_empty() {
+            return;
+        }
+        let store = self.stores.entry(dim.to_owned()).or_default();
+        let mut needed = HashSet::new();
+        for input in &disk.pending {
+            match input {
+                TerrainInput::Chunk(edit) => needed.extend(edit.positions()),
+                TerrainInput::Estimate {
+                    detail, columns, ..
+                } => {
+                    for col in columns {
+                        store.estimate_positions(
+                            *detail,
+                            col.x,
+                            col.z,
+                            col.height,
+                            col.water,
+                            |pos| {
+                                needed.insert(pos);
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        let mut waiting = false;
+        for &pos in &needed {
+            if store.section(pos).is_some()
+                || disk.missing.contains(&pos)
+                || disk.failed.contains(&pos)
+            {
+                continue;
+            }
+            if final_pass {
+                disk.failed.insert(pos);
+                eprintln!(
+                    "DH: octree slot {pos:?} in {dim} ({}) was not read before flush",
+                    dir.display()
+                );
+            } else {
+                disk.probe(&mut self.next_probe, io, dir, dim, pos, true);
+                waiting = true;
+            }
+        }
+        if waiting {
+            return;
+        }
+        let readable = |pos| needed.contains(&pos) && !disk.failed.contains(&pos);
+        let opacity = |id| self.mapper.opacity(id);
+        for input in std::mem::take(&mut disk.pending) {
+            match input {
+                TerrainInput::Chunk(edit) => {
+                    edit.apply(store, &readable, crate::octree::MAX_OCTREE_DETAIL, &opacity);
+                }
+                TerrainInput::Estimate {
+                    detail,
+                    columns,
+                    water,
+                    stone,
+                } => {
+                    let (_, projected) = crate::octree_ingest::ingest_estimates(
+                        store, detail, &columns, water, stone, &readable,
+                    );
+                    store.propagate_estimates(projected, &readable, &opacity);
+                }
+            }
+        }
+        disk.missing.clear();
+        let touched = store.take_dirty();
+        self.unsaved
+            .entry(dim.to_owned())
+            .or_default()
+            .extend(touched.iter().copied());
+        self.queue(dim, touched);
     }
-    accepted
+}
+
+/// Start a fresh server lifetime, including when the same path is reopened.
+pub fn reset_server_intake() {
+    let old_dimensions: Vec<_> = PIPELINE.lock().unwrap().disk.keys().cloned().collect();
+    for dim in old_dimensions {
+        clear_dimension(&dim);
+    }
 }
 
 /// Drops every section of `dim` (level unload).
@@ -491,6 +608,7 @@ pub fn clear_dimension(dim: &str) {
     p.rendered.remove(dim);
     p.unsaved.remove(dim);
     p.requested.remove(dim);
+    p.disk.remove(dim);
 }
 
 /// A resource reload, shader-pack change or `/ds remesh` invalidates every baked model: bake them
@@ -854,10 +972,9 @@ pub fn ingest_distant(
     cells: &[(usize, usize)],
     samples: &[Option<TerrainColumn>],
 ) {
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
+    let mut p = PIPELINE.lock().unwrap();
     let step = 1i32 << detail;
-    let columns: Vec<DistantColumn<'_, BlockKey>> = cells
+    let columns: Vec<_> = cells
         .iter()
         .zip(samples)
         .filter_map(|(&(cx, cz), sample)| {
@@ -867,8 +984,8 @@ pub fn ingest_distant(
                 z: origin.1 + cz as i32 * step,
                 height: col.height,
                 water: col.water,
-                block: col.block,
-                biome: &col.biome,
+                block: p.mapper.block_key(host, col.block),
+                biome: p.mapper.biome(&col.biome),
             })
         })
         .collect();
@@ -877,54 +994,47 @@ pub fn ingest_distant(
     }
     let water = p.mapper.block_named(host, "minecraft:water");
     let stone = p.mapper.block_named(host, "minecraft:stone");
-    let store = p.stores.entry(dim.to_owned()).or_default();
-    let mapper = std::cell::RefCell::new(&mut p.mapper);
-    let mut block = |key| mapper.borrow_mut().block_key(host, key);
-    let mut biome = |name: &str| mapper.borrow_mut().biome(name);
-    let touched = if detail == 0 {
-        crate::octree_ingest::ingest_distant_columns(
-            store, &columns, water, stone, &mut block, &mut biome,
-        );
-        let mapper = &p.mapper;
-        p.stores
-            .get_mut(dim)
-            .expect("store inserted above")
-            .propagate_dirty(&|id| mapper.opacity(id))
-    } else {
-        store.ingest_coarse_columns(detail, &columns, water, stone, &mut block, &mut biome)
-    };
-    p.unsaved
+    p.disk
         .entry(dim.to_owned())
         .or_default()
-        .extend(touched.iter().copied());
-    p.queue(dim, touched);
+        .pending
+        .push(TerrainInput::Estimate {
+            detail,
+            columns,
+            water,
+            stone,
+        });
 }
 
 /// Hand up to `limit` changed sections of every dimension to the I/O worker (it coalesces newer
 /// saves of one section). Returns how many were queued.
 pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
-    let mut queued = 0;
-    for (dim, set) in p.unsaved.iter_mut() {
-        let Some(store) = p.stores.get(dim) else {
-            set.clear();
-            continue;
-        };
-        while queued < limit {
-            let Some(&pos) = set.iter().next() else { break };
-            set.remove(&pos);
-            // A clear must supersede any pending save; only the I/O worker knows whether
-            // there is a disk slot to rewrite.
-            let Some(section) = store.section(pos) else {
+    PIPELINE.lock().unwrap().flush_saves(io, world_dir, limit)
+}
+
+impl Pipeline {
+    fn flush_saves(&mut self, io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
+        let mut queued = 0;
+        for (dim, set) in self.unsaved.iter_mut() {
+            let Some(store) = self.stores.get(dim) else {
+                set.clear();
                 continue;
             };
-            let (_, mapping) = p.mapper.mapping_of(section);
-            io.save_octree_section(world_dir.to_owned(), dim.clone(), section.clone(), mapping);
-            queued += 1;
+            while queued < limit {
+                let Some(&pos) = set.iter().next() else { break };
+                set.remove(&pos);
+                // A clear must supersede any pending save; only the I/O worker knows whether
+                // there is a disk slot to rewrite.
+                let Some(section) = store.section(pos) else {
+                    continue;
+                };
+                let (_, mapping) = self.mapper.mapping_of(section);
+                io.save_octree_section(world_dir.to_owned(), dim.clone(), section.clone(), mapping);
+                queued += 1;
+            }
         }
+        queued
     }
-    queued
 }
 
 /// Level-0 section rows (`y`) the sweeps cover; level `n` covers them shifted right by `n`.
@@ -970,12 +1080,15 @@ pub fn request_stored_sections(
 ) {
     let mut guard = PIPELINE.lock().unwrap();
     let p = &mut *guard;
-    let requested = p.requested.entry(dim.to_owned()).or_default();
+    let disk = p.disk.entry(dim.to_owned()).or_default();
     let store = p.stores.get(dim);
     let mut left = budget;
-    for pos in take_gpu_requested(store, requested, left) {
-        io.load_octree_section(world_dir.to_owned(), dim.to_owned(), pos);
-        left -= 1;
+    // take_gpu_requested uses the supplied set to dedupe within the sweep. The disk intake
+    // owns the authoritative outstanding request (warm and mutation probes share it).
+    for pos in take_gpu_requested(store, &mut HashSet::new(), left) {
+        if disk.probe(&mut p.next_probe, io, world_dir, dim, pos, false) {
+            left -= 1;
+        }
     }
     for level in 0..=crate::octree::MAX_OCTREE_DETAIL {
         let edge = (crate::octree::SECTION_EDGE as f64) * f64::from(1u32 << level);
@@ -986,41 +1099,52 @@ pub fn request_stored_sections(
         for sx in cx - radius..=cx + radius {
             for sz in cz - radius..=cz + radius {
                 for sy in (Y_SECTIONS.start() >> level)..=(Y_SECTIONS.end() >> level) {
-                    let pos = OctreeSectionPos::new(level, sx, sy, sz);
                     if left == 0 {
                         return;
                     }
-                    if store.is_some_and(|s| s.section(pos).is_some()) || !requested.insert(pos) {
+                    let pos = OctreeSectionPos::new(level, sx, sy, sz);
+                    if store.is_some_and(|s| s.section(pos).is_some()) {
                         continue;
                     }
-                    io.load_octree_section(world_dir.to_owned(), dim.to_owned(), pos);
-                    left -= 1;
+                    if disk.probe(&mut p.next_probe, io, world_dir, dim, pos, false) {
+                        left -= 1;
+                    }
                 }
             }
         }
     }
 }
 
-/// Adopt sections the I/O worker finished loading, translating their ids to this session's.
-pub fn adopt_loaded(host: &dyn Host, io: &LodIoWorker) {
-    let loaded = io.drain_octree_responses();
-    if loaded.is_empty() {
-        return;
+/// Adopt completed probes and advance only work with an explicit hit or miss for each slot.
+pub fn advance_intake(host: &dyn Host, io: &LodIoWorker, world_dir: Option<&Path>, dim: &str) {
+    let mut p = PIPELINE.lock().unwrap();
+    if let Some(dir) = world_dir {
+        p.accept_probes(io, dir, |mapper, section, mapping| {
+            mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
+        });
+        p.advance_intake(io, dir, dim, false);
     }
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
-    for l in loaded {
-        let section = p
-            .mapper
-            .remap(host, &l.section, &l.mapping.blocks, &l.mapping.biomes);
-        let pos = section.pos;
-        if p.stores
-            .entry(l.dimension.clone())
-            .or_default()
-            .adopt_section(section)
-        {
-            p.queue(&l.dimension, [pos]);
-        }
+}
+
+pub fn finish_intake(host: &dyn Host, io: &LodIoWorker, dir: &Path) {
+    let mut p = PIPELINE.lock().unwrap();
+    let dims: Vec<_> = p
+        .disk
+        .iter()
+        .filter(|(_, d)| !d.pending.is_empty())
+        .map(|(d, _)| d.clone())
+        .collect();
+    for dim in &dims {
+        p.advance_intake(io, dir, dim, false);
+    }
+    drop(p);
+    io.flush();
+    let mut p = PIPELINE.lock().unwrap();
+    p.accept_probes(io, dir, |mapper, section, mapping| {
+        mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
+    });
+    for dim in &dims {
+        p.advance_intake(io, dir, dim, true);
     }
 }
 
@@ -1149,6 +1273,198 @@ pub fn install_sync_source() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DIM: &str = "minecraft:overworld";
+
+    struct LiveChunk(u32);
+
+    impl crate::octree_ingest::ChunkVoxelSource for LiveChunk {
+        type Block = u32;
+        fn min_y(&self) -> i32 {
+            0
+        }
+        fn section_count(&self) -> usize {
+            1
+        }
+        fn section_uniform_block(&self, _: usize) -> Option<u32> {
+            (self.0 == 0).then_some(0)
+        }
+        fn block(&self, x: usize, y: i32, z: usize) -> Option<u32> {
+            (x == 0 && y == 0 && z == 0).then_some(self.0)
+        }
+        fn biome(&self, _: usize, _: i32, _: usize) -> Option<&str> {
+            None
+        }
+        fn light(&self, _: usize, _: i32, _: usize) -> (u8, u8) {
+            (15, 0)
+        }
+    }
+
+    fn fixture_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ds-cache-gate-{name}-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn stage_live(p: &mut Pipeline, chunk: [i32; 2], block: u32) {
+        let edit = ChunkEdit::capture(
+            chunk,
+            &LiveChunk(block),
+            IngestSource::Loaded,
+            None,
+            &mut |b| b,
+            &mut |_| 0,
+        );
+        p.disk
+            .entry(DIM.into())
+            .or_default()
+            .pending
+            .push(TerrainInput::Chunk(edit));
+    }
+
+    fn adopt_fixture(p: &mut Pipeline, io: &LodIoWorker, dir: &Path) {
+        p.accept_probes(io, dir, |_, section, _| section);
+        p.advance_intake(io, dir, DIM, true);
+    }
+
+    #[test]
+    fn cold_live_snapshots_merge_the_slot_and_only_their_aligned_ancestor_footprint() {
+        use crate::storage::{RegionCache, octree_region_path};
+        let dir = fixture_dir("snapshot");
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let parent = pos.parent().unwrap();
+        let air = Voxel::air_with_light(15, 0);
+        let stale = Voxel::new(1, 0, 12, 0);
+        let neighbor = Voxel::new(2, 0, 10, 0);
+        for (key, neighbor_x) in [(pos, 16), (parent, 8)] {
+            let mut section = OctreeSection::new(key);
+            section.set(0, 0, 0, stale);
+            section.set(neighbor_x, 0, 0, neighbor);
+            RegionCache::default()
+                .save_octree_section(
+                    &dir,
+                    DIM,
+                    &section,
+                    &OctreeMapping::default(),
+                    DEFAULT_OCTREE_COMPRESSION,
+                )
+                .unwrap();
+        }
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        p.disk
+            .entry(DIM.into())
+            .or_default()
+            .probe(&mut p.next_probe, &io, &dir, DIM, pos, false);
+        let request = p.next_probe;
+        p.disk
+            .get_mut(DIM)
+            .unwrap()
+            .pending
+            .push(TerrainInput::Estimate {
+                detail: 0,
+                columns: vec![DistantColumn {
+                    x: 16,
+                    z: 0,
+                    height: 0,
+                    water: None,
+                    block: 3,
+                    biome: 0,
+                }],
+                water: 0,
+                stone: 0,
+            });
+        stage_live(&mut p, [0, 0], 0);
+        stage_live(&mut p, [20, 0], 0);
+        p.advance_intake(&io, &dir, DIM, false);
+        assert_eq!(p.disk[DIM].loading[&pos], request, "reuse the warm probe");
+        assert!(p.stores[DIM].section(pos).is_none());
+        assert_eq!(p.flush_saves(&io, &dir, usize::MAX), 0);
+        io.flush();
+        adopt_fixture(&mut p, &io, &dir);
+        assert!(p.flush_saves(&io, &dir, usize::MAX) > 0);
+        io.flush();
+        for (key, neighbor_x) in [(pos, 16), (parent, 8)] {
+            let (section, _) = RegionCache::default()
+                .load_octree_section(&dir, DIM, key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(section.get(0, 0, 0), air);
+            assert_eq!(section.get(neighbor_x, 0, 0), neighbor);
+            assert!(section.revision > 2);
+        }
+        assert!(!octree_region_path(&dir, DIM, OctreeSectionPos::new(0, 10, 0, 0)).exists());
+
+        let mut cold = Pipeline::default();
+        stage_live(&mut cold, [0, 0], 3);
+        cold.advance_intake(&io, &dir, DIM, false);
+        io.flush();
+        adopt_fixture(&mut cold, &io, &dir);
+        assert!(cold.flush_saves(&io, &dir, usize::MAX) > 0);
+        io.flush();
+        drop(io);
+        let (section, _) = RegionCache::default()
+            .load_octree_section(&dir, DIM, pos)
+            .unwrap()
+            .unwrap();
+        assert_eq!(section.get(0, 0, 0).block_id(), 3);
+        assert_eq!(section.get(16, 0, 0), neighbor);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_probes_allow_rebuild_but_io_failure_does_not_block_valid_siblings() {
+        use crate::storage::{RegionCache, octree_region_path};
+        use std::fs;
+        let dir = fixture_dir("failed-probe");
+        let failed = OctreeSectionPos::new(0, 0, 0, 0);
+        let truncated = OctreeSectionPos::new(0, 8, 0, 0);
+        let corrupt = OctreeSectionPos::new(0, 16, 0, 0);
+        let sibling = OctreeSectionPos::new(0, 24, 0, 0);
+        let failed_path = octree_region_path(&dir, DIM, failed);
+        fs::create_dir_all(&failed_path).unwrap();
+        fs::write(failed_path.join("preserve"), b"unread bytes").unwrap();
+        fs::write(octree_region_path(&dir, DIM, truncated), b"truncated").unwrap();
+        let original = OctreeSection::filled(corrupt, Voxel::new(2, 0, 8, 0));
+        RegionCache::default()
+            .save_octree_section(
+                &dir,
+                DIM,
+                &original,
+                &OctreeMapping::default(),
+                DEFAULT_OCTREE_COMPRESSION,
+            )
+            .unwrap();
+        let corrupt_path = octree_region_path(&dir, DIM, corrupt);
+        let mut bytes = fs::read(&corrupt_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(corrupt_path, bytes).unwrap();
+
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        for pos in [failed, truncated, corrupt, sibling] {
+            stage_live(&mut p, [pos.x * 2, 0], 1);
+        }
+        p.advance_intake(&io, &dir, DIM, false);
+        io.flush();
+        adopt_fixture(&mut p, &io, &dir);
+        assert!(p.disk[DIM].failed.contains(&failed));
+        assert!(p.stores[DIM].section(failed).is_none());
+        p.flush_saves(&io, &dir, usize::MAX);
+        io.flush();
+        drop(io);
+        assert_eq!(
+            fs::read(failed_path.join("preserve")).unwrap(),
+            b"unread bytes"
+        );
+        let mut fresh = RegionCache::default();
+        for pos in [truncated, corrupt, sibling] {
+            let (section, _) = fresh.load_octree_section(&dir, DIM, pos).unwrap().unwrap();
+            assert_eq!(section.get(0, 0, 0).block_id(), 1);
+        }
+        drop(fresh);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn leaf_selection_never_renders_parent_alongside_non_empty_child() {

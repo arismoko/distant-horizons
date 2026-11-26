@@ -359,6 +359,7 @@ impl Hooks for DistantHorizonsMod {
         let world_dir = host.world_dir();
         let rt = runtime();
         rt.gen_pool.shutdown_and_join();
+        pipeline::reset_server_intake();
         rt.gen_pool.ensure_started();
         let mut st = rt.inner.lock().unwrap();
         st.world_dir = world_dir;
@@ -368,7 +369,7 @@ impl Hooks for DistantHorizonsMod {
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         let world_dir = host.world_dir();
         runtime().gen_pool.shutdown_and_join();
-        flush_dirty_sections(world_dir);
+        flush_dirty_sections(host, world_dir);
     }
 
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
@@ -382,10 +383,17 @@ impl Hooks for DistantHorizonsMod {
     }
 
     fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
-        let world_dir = host.world_dir();
-        runtime().gen_pool.reset_dimension(event.dimension);
+        let rt = runtime();
+        let world_dir = host
+            .world_dir()
+            .or_else(|| rt.inner.lock().unwrap().world_dir.clone());
+        rt.gen_pool.reset_dimension(event.dimension);
+        // Resolve accepted reads while this level still has a usable mapper/world context.
+        if let Some(dir) = world_dir.as_deref() {
+            pipeline::finish_intake(host, &rt.io, dir);
+        }
         pipeline::clear_dimension(event.dimension);
-        flush_dirty_sections(world_dir);
+        flush_dirty_sections(host, world_dir);
     }
 
     fn chunk_load(&self, host: &mut dyn ServerHost, event: &mut ChunkLoadEvent<'_>) {
@@ -480,7 +488,11 @@ const SAVES_PER_TICK: usize = 32;
 
 fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     let rt = runtime();
-    let world_dir = host.world_dir();
+    let world_dir = host
+        .world_dir()
+        .or_else(|| rt.inner.lock().unwrap().world_dir.clone());
+    pipeline::advance_intake(host, &rt.io, world_dir.as_deref(), dim);
+    let intake_ready = !pipeline::has_pending_intake(dim);
 
     // 1. Sample a small batch of newly loaded / modified chunks via `ChunkSnapshot`.
     let chunks_to_sample: Vec<[i32; 2]> = {
@@ -490,7 +502,7 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         }
         let mut batch = Vec::with_capacity(CHUNKS_PER_TICK);
         let st_ref = &mut *st;
-        if let Some(queue) = st_ref.pending_chunks.get_mut(dim) {
+        if intake_ready && let Some(queue) = st_ref.pending_chunks.get_mut(dim) {
             let mut set = st_ref.pending_chunk_set.get_mut(dim);
             for _ in 0..CHUNKS_PER_TICK {
                 let Some(c) = queue.pop_front() else {
@@ -510,8 +522,13 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         sample_loaded_chunks(host, dim, &chunks_to_sample, &mut dirty_sections);
     }
 
-    // 1b. Drain completed off-thread distant terrain generation results (fast O(1) ingest).
-    drain_gen_results(host, dim, &mut dirty_sections);
+    // 1b. Leave completed generation in the existing bounded pool while intake awaits disk.
+    if intake_ready {
+        drain_gen_results(host, dim, &mut dirty_sections);
+    }
+    if pipeline::has_pending_intake(dim) {
+        pipeline::advance_intake(host, &rt.io, world_dir.as_deref(), dim);
+    }
 
     // 2. If time remains and distant generation is on, sample distant terrain around connected
     //    players in `dim` (round-robin, supporting dedicated & LAN servers) or the local camera.
@@ -596,8 +613,7 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             .map(|&(p, pos)| (p, (pos[0] as i32, pos[2] as i32)))
             .collect(),
     );
-    if let Some(dir) = rt.inner.lock().unwrap().world_dir.clone() {
-        pipeline::adopt_loaded(host, &rt.io);
+    if let Some(dir) = world_dir {
         let center = players.first().map(|&(_, pos)| pos).or(cam);
         if let Some(center) = center {
             pipeline::request_stored_sections(
@@ -642,7 +658,7 @@ fn sample_loaded_chunks(
                 dim,
                 *chunk,
                 snapshot,
-                pipeline::SnapshotSource::Loaded,
+                octree_ingest::IngestSource::Loaded,
             );
         }
     }
@@ -1053,7 +1069,13 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
         .collect();
     for (chunk, snapshot) in &saved {
         if let Some(snapshot) = snapshot {
-            pipeline::ingest_chunk(host, dim, *chunk, snapshot, pipeline::SnapshotSource::Saved);
+            pipeline::ingest_chunk(
+                host,
+                dim,
+                *chunk,
+                snapshot,
+                octree_ingest::IngestSource::Saved,
+            );
         }
     }
     if !saved.is_empty() {
@@ -1061,17 +1083,16 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
     }
 
     // G4 full 3D chunks (trees & features in detail-0 near/mid ring).
-    // One batch per finished job (up to 16 chunks): a single `PIPELINE` lock and a single
-    // `propagate_dirty` instead of one per chunk.
+    // Prepare their authored octants now; the cache-first batch retains no raw snapshots.
     let mut generated: Vec<([i32; 2], Option<mod_api::ChunkSnapshot>)> = Vec::new();
     for r in results.iter_mut() {
         let chunks = std::mem::take(&mut r.generated_chunks);
         if chunks.is_empty() {
             continue;
         }
-        let batch: Vec<([i32; 2], &mod_api::ChunkSnapshot)> =
-            chunks.iter().map(|(pos, snap)| (*pos, snap)).collect();
-        pipeline::ingest_chunks_batch(host, dim, &batch, pipeline::SnapshotSource::Distant);
+        for (pos, snap) in &chunks {
+            pipeline::ingest_chunk(host, dim, *pos, snap, octree_ingest::IngestSource::Distant);
+        }
         generated.extend(chunks.into_iter().map(|(pos, snap)| (pos, Some(snap))));
     }
     if !generated.is_empty() {
@@ -1164,11 +1185,12 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
     }
 }
 
-fn flush_dirty_sections(world_dir: Option<std::path::PathBuf>) {
+fn flush_dirty_sections(host: &dyn ServerHost, world_dir: Option<std::path::PathBuf>) {
     let rt = runtime();
     let Some(dir) = world_dir.or_else(|| rt.inner.lock().unwrap().world_dir.clone()) else {
         return;
     };
+    pipeline::finish_intake(host, &rt.io, &dir);
     while pipeline::flush_saves(&rt.io, &dir, usize::MAX) > 0 {}
     rt.io.flush();
 }
