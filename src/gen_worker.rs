@@ -148,11 +148,12 @@ impl<Job> Shared<Job> {
         }
     }
 
-    fn wait_for_job(&self, idx: usize, mut before_wait: impl FnMut()) -> Option<Job> {
+    fn wait_for_job(&self, idx: usize, #[cfg(test)] mut before_wait: impl FnMut()) -> Option<Job> {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         while !self.stop.load(Ordering::Acquire)
             && (q.is_empty() || idx >= self.target_threads.load(Ordering::Acquire))
         {
+            #[cfg(test)]
             before_wait();
             q = self.cv.wait(q).unwrap_or_else(|e| e.into_inner());
         }
@@ -522,7 +523,11 @@ fn spawn_workers(shared: &Arc<Shared>, handles: &mut Vec<JoinHandle<()>>, target
 }
 
 fn worker_loop(shared: Arc<Shared>, idx: usize) {
-    while let Some(job) = shared.wait_for_job(idx, || {}) {
+    while let Some(job) = shared.wait_for_job(
+        idx,
+        #[cfg(test)]
+        || {},
+    ) {
         if !is_job_valid(&shared, &job) {
             clear_in_flight_if_matching(&shared, &job.dimension, job.pos, job.job_id);
             continue;
