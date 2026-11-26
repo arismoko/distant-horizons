@@ -154,58 +154,6 @@ pub fn invert_mat4(m: Mat4) -> Option<Mat4> {
     Some(out)
 }
 
-/// Per-frame shader-pack uniforms supplied by Distant Sunrises (`#5371`).
-#[derive(Clone, Copy, Debug)]
-pub struct DhPackFrameUniforms {
-    pub dh_projection: Mat4,
-    pub dh_projection_inverse: Mat4,
-    pub dh_previous_projection: Mat4,
-    pub dh_near_plane: f32,
-    pub dh_far_plane: f32,
-    pub dh_render_distance: i32,
-}
-
-impl Default for DhPackFrameUniforms {
-    fn default() -> Self {
-        Self {
-            dh_projection: IDENTITY_MAT4,
-            dh_projection_inverse: IDENTITY_MAT4,
-            dh_previous_projection: IDENTITY_MAT4,
-            dh_near_plane: 16.0,
-            dh_far_plane: 4096.0,
-            dh_render_distance: 2048,
-        }
-    }
-}
-
-impl DhPackFrameUniforms {
-    /// Advance uniforms by one frame, latching the previous frame's `dhProjection` into
-    /// `dhPreviousProjection` (initializing both on the first frame so temporal shaders do not
-    /// sample identity on frame 0).
-    pub fn update(
-        &mut self,
-        fov_y_rad: f32,
-        aspect: f32,
-        dh_near_plane: f32,
-        dh_far_plane: f32,
-        dh_render_distance_blocks: i32,
-        is_first_frame: bool,
-    ) {
-        let proj = gl_perspective_rh(fov_y_rad, aspect, dh_near_plane, dh_far_plane);
-        let proj_inv = invert_mat4(proj).unwrap_or(IDENTITY_MAT4);
-        self.dh_previous_projection = if is_first_frame {
-            proj
-        } else {
-            self.dh_projection
-        };
-        self.dh_projection = proj;
-        self.dh_projection_inverse = proj_inv;
-        self.dh_near_plane = dh_near_plane;
-        self.dh_far_plane = dh_far_plane;
-        self.dh_render_distance = dh_render_distance_blocks.max(16);
-    }
-}
-
 /// Multiply column-major 4x4 matrix by a vec4.
 #[inline]
 pub fn mul_mat4_vec4(m: Mat4, v: [f32; 4]) -> [f32; 4] {
@@ -222,82 +170,6 @@ pub fn mul_mat4_vec4(m: Mat4, v: [f32; 4]) -> [f32; 4] {
 pub const VOXY_PACK_TERRAIN_VSH: &str = "distantsunrises:core/voxy_pack_terrain";
 pub const VOXY_PACK_WATER_VSH: &str = "distantsunrises:core/voxy_pack_water";
 pub const VOXY_PACK_SHADOW_VSH: &str = "distantsunrises:core/voxy_pack_shadow";
-
-/// Voxy `PackedQuad` bit layout (`lod/quad_format.glsl`, 64-bit / `ivec2` path, little endian).
-/// The `.vsh` files decode exactly these fields from an `uvec2` (`x` = bits 0..31).
-pub mod packed_quad {
-    pub const FACE_SHIFT: u32 = 0; // 3 bits
-    pub const WIDTH_SHIFT: u32 = 3; // 4 bits, stored minus one
-    pub const HEIGHT_SHIFT: u32 = 7; // 4 bits, stored minus one
-    pub const POS_Z_SHIFT: u32 = 11; // 5 bits
-    pub const POS_Y_SHIFT: u32 = 16; // 5 bits
-    pub const POS_X_SHIFT: u32 = 21; // 5 bits
-    pub const STATE_SHIFT: u32 = 26; // 20 bits (`extractStateId`, `ivec2` path)
-    pub const BIOME_SHIFT: u32 = 46; // 9 bits
-    pub const LIGHT_SHIFT: u32 = 55; // 8 bits (block light in the high nibble, sky in the low)
-
-    /// Decoded fields of one quad.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Decoded {
-        pub face: u8,
-        pub width: u8,
-        pub height: u8,
-        pub pos: [u8; 3],
-        pub state: u32,
-        pub biome: u16,
-        pub light: u8,
-    }
-
-    const fn bits(q: u64, shift: u32, n: u32) -> u64 {
-        (q >> shift) & ((1u64 << n) - 1)
-    }
-
-    /// Rust mirror of the GLSL decode in `voxy_pack_*.vsh`.
-    pub const fn decode(q: u64) -> Decoded {
-        Decoded {
-            face: bits(q, FACE_SHIFT, 3) as u8,
-            width: bits(q, WIDTH_SHIFT, 4) as u8 + 1,
-            height: bits(q, HEIGHT_SHIFT, 4) as u8 + 1,
-            pos: [
-                bits(q, POS_X_SHIFT, 5) as u8,
-                bits(q, POS_Y_SHIFT, 5) as u8,
-                bits(q, POS_Z_SHIFT, 5) as u8,
-            ],
-            state: bits(q, STATE_SHIFT, 20) as u32,
-            biome: bits(q, BIOME_SHIFT, 9) as u16,
-            light: bits(q, LIGHT_SHIFT, 8) as u8,
-        }
-    }
-
-    /// Inverse of [`decode`]; `width` / `height` are `1..=16`.
-    pub const fn encode(d: Decoded) -> u64 {
-        (d.face as u64 & 7) << FACE_SHIFT
-            | ((d.width as u64 - 1) & 15) << WIDTH_SHIFT
-            | ((d.height as u64 - 1) & 15) << HEIGHT_SHIFT
-            | (d.pos[2] as u64 & 31) << POS_Z_SHIFT
-            | (d.pos[1] as u64 & 31) << POS_Y_SHIFT
-            | (d.pos[0] as u64 & 31) << POS_X_SHIFT
-            | (d.state as u64 & 0xF_FFFF) << STATE_SHIFT
-            | (d.biome as u64 & 0x1FF) << BIOME_SHIFT
-            | (d.light as u64) << LIGHT_SHIFT
-    }
-}
-
-/// Model-buffer word offsets (`voxy block_model.glsl` `BlockModel`, 16 `uint`s per model).
-pub const MODEL_STRIDE_WORDS: usize = 16;
-pub const MODEL_FLAGS_WORD: usize = 6;
-pub const MODEL_CUSTOM_ID_WORD: usize = 8;
-/// `flagsA` bits 8..11 carry the `DH_BLOCK_*` material id read as `dhMaterialId` by the `.vsh`.
-pub const MODEL_FLAGS_DH_MATERIAL_SHIFT: u32 = 8;
-
-/// `flagsA` word for a baked model: Voxy's low flags (`2` biome LUT, `4` translucent, `8` shaded)
-/// plus the `DH_BLOCK_*` material in bits 8..11.
-pub const fn model_flags(biome_lut: bool, translucent: bool, shaded: bool, dh_material: u8) -> u32 {
-    (biome_lut as u32) << 1
-        | (translucent as u32) << 2
-        | (shaded as u32) << 3
-        | ((dh_material as u32) & 0xF) << MODEL_FLAGS_DH_MATERIAL_SHIFT
-}
 
 /// std140 `SceneUniform` shared by the three `.vsh` files (176 bytes).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -611,21 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_uniforms_latch_previous_projection_after_first_frame() {
-        let mut u = DhPackFrameUniforms::default();
-        u.update(70.0f32.to_radians(), 16.0 / 9.0, 32.0, 2048.0, 2048, true);
-        assert_eq!(u.dh_previous_projection, u.dh_projection);
-        let first = u.dh_projection;
-
-        u.update(90.0f32.to_radians(), 16.0 / 9.0, 64.0, 4096.0, 4096, false);
-        assert_eq!(u.dh_previous_projection, first);
-        assert_ne!(u.dh_projection, first);
-        assert_eq!(u.dh_near_plane, 64.0);
-        assert_eq!(u.dh_far_plane, 4096.0);
-        assert_eq!(u.dh_render_distance, 4096);
-    }
-
-    #[test]
     fn pack_defines_cover_distant_sunrises_and_all_16_material_ids() {
         assert_eq!(DH_PACK_DEFINES.len(), 17);
         assert_eq!(DH_PACK_DEFINES[0], ("DISTANT_HORIZONS", None));
@@ -633,42 +490,6 @@ mod tests {
         assert_eq!(DH_PACK_DEFINES[14], ("DH_BLOCK_GRASS", Some("13")));
         assert_eq!(DH_PACK_DEFINES[15], ("DH_BLOCK_AIR", Some("14")));
         assert_eq!(DH_PACK_DEFINES[16], ("DH_BLOCK_ILLUMINATED", Some("15")));
-    }
-
-    #[test]
-    fn packed_quad_roundtrips_voxy_layout() {
-        let d = packed_quad::Decoded {
-            face: 5,
-            width: 16,
-            height: 3,
-            pos: [31, 0, 17],
-            state: 0xA_BCDE,
-            biome: 0x1FF,
-            light: 0xF1,
-        };
-        assert_eq!(packed_quad::decode(packed_quad::encode(d)), d);
-        // x = bits 21..25 per voxy `extractPos`
-        assert_eq!(
-            packed_quad::encode(packed_quad::Decoded {
-                pos: [1, 0, 0],
-                width: 1,
-                height: 1,
-                ..d_zero()
-            }),
-            1 << 21
-        );
-    }
-
-    fn d_zero() -> packed_quad::Decoded {
-        packed_quad::Decoded {
-            face: 0,
-            width: 1,
-            height: 1,
-            pos: [0; 3],
-            state: 0,
-            biome: 0,
-            light: 0,
-        }
     }
 
     #[test]
@@ -699,16 +520,6 @@ mod tests {
         assert!(((r[0] + r[1] * w) / w - near / w).abs() < 1e-7);
         let s = DepthRemap::standard(near);
         assert!(((s[0] + s[1] * w) / w - (1.0 - near / w)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn model_flags_place_material_above_voxy_flags() {
-        let f = model_flags(true, false, true, DH_BLOCK_WATER);
-        assert_eq!(f & 0xF, 0b1010);
-        assert_eq!(
-            (f >> MODEL_FLAGS_DH_MATERIAL_SHIFT) & 0xF,
-            DH_BLOCK_WATER as u32
-        );
     }
 
     #[test]

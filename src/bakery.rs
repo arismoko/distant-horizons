@@ -183,34 +183,6 @@ impl BakedFace {
         avg: [0; 4],
         texels: [0; FACE_TEXELS],
     };
-
-    fn gpu_flags(&self) -> u32 {
-        let mut f = self.tint_mask as u32;
-        if self.exists {
-            f |= FACE_EXISTS;
-        }
-        if self.occludes {
-            f |= FACE_OCCLUDES;
-        }
-        if self.can_be_occluded {
-            f |= FACE_CAN_BE_OCCLUDED;
-        }
-        if self.cutout {
-            f |= FACE_CUTOUT;
-        }
-        if self.self_lighting {
-            f |= FACE_SELF_LIGHTING;
-        }
-        f | ((self.tint_state as u32) << FACE_TINT_SHIFT)
-            | ((self.depth as u32 & 0x3F) << FACE_DEPTH_SHIFT)
-    }
-
-    fn gpu_rect(&self) -> u32 {
-        (self.rect[0] as u32 & 15)
-            | ((self.rect[1] as u32 & 15) << 4)
-            | ((self.rect[2] as u32 & 15) << 8)
-            | ((self.rect[3] as u32 & 15) << 12)
-    }
 }
 
 /// One baked model: six faces plus model metadata and the shader-pack ids.
@@ -300,22 +272,6 @@ impl<F: Fn(u32) -> ModelMeta> ModelLookup for F {
     fn meta(&self, block_id: u32) -> ModelMeta {
         self(block_id)
     }
-}
-
-/// GPU model entry, 112 bytes (`std430`-friendly, 16-byte multiple): per face average colour,
-/// flags, covered rectangle and texel offset implied as `(model_id * 6 + face) * 16` into the
-/// texel buffer.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct GpuModelEntry {
-    pub face_avg: [u32; 6],
-    pub face_flags: [u32; 6],
-    pub face_rect: [u32; 6],
-    pub face_pad: [u32; 6],
-    pub flags: u32,
-    pub mc_entity: i32,
-    pub dh_material_id: u32,
-    pub light_emission: u32,
 }
 
 #[inline]
@@ -480,27 +436,6 @@ impl BakedModelTable {
             face_occludes: occ,
             light_emission: m.light_emission,
         }
-    }
-
-    pub fn gpu_models(&self) -> Vec<GpuModelEntry> {
-        self.models
-            .iter()
-            .map(|m| {
-                let mut e = GpuModelEntry {
-                    flags: m.flags as u32,
-                    mc_entity: m.mc_entity,
-                    dh_material_id: m.dh_material_id as u32,
-                    light_emission: m.light_emission as u32,
-                    ..Default::default()
-                };
-                for (i, f) in m.faces.iter().enumerate() {
-                    e.face_avg[i] = pack_rgba(f.avg);
-                    e.face_flags[i] = f.gpu_flags();
-                    e.face_rect[i] = f.gpu_rect();
-                }
-                e
-            })
-            .collect()
     }
 
     /// Texel buffer: `(model * 6 + face) * FACE_TEXELS` is a face's first texel.
@@ -929,9 +864,6 @@ mod tests {
         );
         let meta = t.meta_for(1);
         assert!(meta.fully_opaque() && !meta.translucent() && meta.face_occludes(Face::NegX));
-        let gpu = t.gpu_models();
-        assert_eq!(gpu[1].mc_entity, 10020);
-        assert_eq!(gpu[1].dh_material_id, m.dh_material_id as u32);
         assert_eq!(t.gpu_texels().len(), 2 * 6 * FACE_TEXELS);
     }
 
@@ -1081,10 +1013,7 @@ mod tests {
 
     #[test]
     fn gpu_layouts_are_pod_sized() {
-        assert_eq!(std::mem::size_of::<GpuModelEntry>(), 112);
         assert_eq!(std::mem::size_of::<GpuBiomeTint>(), 16);
-        let t = BakedModelTable::new();
-        assert!(!bytemuck::cast_slice::<GpuModelEntry, u8>(&t.gpu_models()).is_empty());
     }
 
     #[test]

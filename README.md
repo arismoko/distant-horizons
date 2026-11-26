@@ -1,52 +1,64 @@
 # Distant Sunrises for Sunrise
 
-A work-in-progress native Sunrise port of
-[Distant Sunrises](https://gitlab.com/distant-sunrises-team/distant-sunrises/)
-(originally by James Seibel and contributors), targeting Sunrise's general mod API with no
-Distant Sunrises–specific engine seams and no `[native.*]` mixins once the underlying mod API
-primitives land.
+A native Sunrise port of [Distant Sunrises](https://gitlab.com/distant-sunrises-team/distant-sunrises/)
+(originally by James Seibel and contributors) with a Voxy-style renderer. It runs entirely on
+Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and no other
+`[native.*]` table, and there are no WGSL shaders. All shaders are GLSL.
 
-## Status
+## Architecture
 
-| Stage | Scope | Status |
-|---|---|---|
-| **Stage 1** | End-to-end LOD prototype on Sunrise: multi-layer LOD store, background meshing, per-world crash-safe region storage (`DHREG002`), reversed-Z offscreen rendering & sky-masked HDR composite, settings UI, and F3 debug telemetry (using two temporary `[[native.mixin]]` render hooks) | **Done** (pinned to Sunrise Dev `3d34bbe6`) |
-| **Stage 2a** | Public mod-to-mod LOD API (`src/api.rs`), `FullDataSourceV2DTO` wire decoder with LZ4/Zstd/LZMA2 (`src/dh_v2.rs`), optional droppable multiplayer LOD sync (`distantsunrises:lod_sync`, `SessionConfig`, active `PartialColumnUpdate` broadcast, per-server disk cache, `src/network.rs`), client `/ds` commands, Controls keybinds, spiral SSAO, CAS sharpening, full DH far/height/environmental fog, debug render modes, generic box renderer (`GenericObjectRenderer`), distant beacon beams, procedural 3D LOD clouds, active resource-pack block/colormap colors (`src/resource_colors.rs`), and GLSL shaders (`assets/distantsunrises/shaders/core/`) | **Done** (on `sunrise`, Dev `3d34bbe6`) |
-| **Stage 2b** | Full data & worldgen parity: zero-copy `ChunkSnapshot` (client & server), non-blocking `LevelRef::request_chunk` queue, saved Anvil `.mca` `SavedChunkReader` import, and off-thread `DetachedChunkGenerator` worldgen | **Staged on branch `stage2-data-gaps`** (`#5339`–`#5341`, `#5347` merged on `sunrise-org/sunrise` `main`; waiting on Dev SDK cut) |
-| **Stage 3** | Pure general mod-API renderer in GLSL: delete both temporary `[[native.mixin]]` hooks (`render_needs`, `world_drawn`) so `sunrise-mod.toml` has zero `[native.*]` entries | **In progress** (`#4758`, `#5185`, `#5252` merged; `#5426`–`#5430` / `#2005` pipeline stack next) |
-| **Stage 4** | Native drawing under translated Iris/OptiFine shader packs (`dh_terrain`, `dh_water`, `dh_shadow`, auxiliary depth planes, and pack uniforms) | **In progress** (`#5386` & `#5387` merged on `main`; translator/runtime `#5490` open) |
+- **32³ octree sections.** Terrain is stored and meshed as 32×32×32 voxel sections (`src/octree.rs`,
+  `src/octree_ingest.rs`). Loaded chunks and distant ungenerated terrain (sampled off-thread with
+  `DetachedChunkGenerator`) are ingested into per-dimension octree stores by `src/pipeline.rs`.
+- **8-byte packed quads.** A greedy mesher (`src/mesh.rs`) merges faces of the same model, biome and
+  light into quads of at most 16×16 voxels, packed into one `u64` in Voxy's `quad_format` layout.
+  `PackedQuad` is defined once, in `mesh.rs`, and re-exported by `gpu_arena`.
+- **4×4 baked atlas.** `src/bakery.rs` bakes each block model into six faces of 4×4 texels. The
+  texels go into one 1024×1024 dynamic texture; a 16-word model record per block state and a biome
+  tint table go into storage buffers.
+- **GPU arena.** `src/gpu_arena.rs` keeps every section's quads in one persistent storage-buffer
+  arena (free-list sub-allocation, 32-byte section metadata, 8 quad buckets per section: translucent,
+  double-sided and the six faces). A section that cannot be stored keeps its previous mesh.
+- **GLSL Hi-Z compute and GPU indirect draws.** Each frame a compute node (`voxy_hiz.csh`) builds a
+  Hi-Z depth pyramid from the world depth, `voxy_cmdgen.csh` frustum, Hi-Z and back-face culls every
+  section and rewrites its indirect draw commands, and two `draw_indirect` calls (opaque after the
+  opaque features, translucent after the translucent blocks) pull quads from the arena in
+  `voxy_quads.vsh/fsh`. Settings that tune the look (fog, shading, overdraw prevention) feed its
+  uniform block.
+- **Shader packs.** When the active Iris/OptiFine shader pack compiles `dh_terrain`, `dh_water` or
+  `dh_shadow`, the mod's vertex stages `voxy_pack_*.vsh` link against the pack's fragment shader and
+  the pack-linked pipelines draw instead (`src/shader_pack.rs`).
+- **Storage.** Octree sections are stored as `DHLOD003` records (DH-exact palette and run layout with a
+  CRC32) in crash-safe `.dhoct` region files under `<world_dir>/distant_sunrises/<dimension>/`
+  (`src/storage.rs`), written and loaded on a background IO worker. `src/dh_v2.rs` decodes Distant
+  Horizons' `FullDataSourceV2` payloads (LZ4, Zstd, LZMA2) for the public API.
+- **Multiplayer: `octree_sync`.** `src/network.rs` (`octree_sync`) streams octree sections from a
+  published server to remote clients over one raw, optional play channel
+  (`distantsunrises:octree_sync`) in Distant Horizons' wire layout: session-config negotiation,
+  per-player rate and concurrency limiters, timestamp-based "up to date" replies, chunked payloads
+  (1,048,000-byte splits) and real-time partial updates. Receive buffers are size- and count-capped.
+  Clients without the mod, and servers without it, are never blocked from joining.
+- **Public API.** `src/api.rs` offers `LodWorldGenerator` overrides, `RemoteLodProvider` clients,
+  column and section submission, `FullDataSourceV2` decoding and cache queries.
+- **Client UI.** Mod settings (`Options > Mods`), `/ds` and `/distantsunrises` client commands,
+  controls keybinds, and F3 debug entries.
 
 ## Differences from the original
 
-- **LOD storage format (`DHREG002`):** Stores LOD data in region-packed Zstd-compressed binary files (`16×16` sections per `.dhreg` file, double-buffered CRC32-checksummed headers, copy-on-write append with streaming atomic compaction) rather than Java Distant Sunrises' `DistantHorizons.sqlite` database. Existing Java DH SQLite databases are not shared or read directly.
+- Sections are 32³ voxel octree nodes, not 64×64 column quadtree cells, and the renderer is a
+  Voxy-style GPU-driven one rather than Distant Horizons' OpenGL one.
+- Existing Java Distant Horizons `.sqlite` databases are not read; the mod keeps its own `.dhoct`
+  region files.
+- The multiplayer protocol follows Distant Horizons' message layout but is a different channel and
+  is not compatible with Java DH servers or clients.
 
-## What works today
+## Known limits
 
-- **LOD data & storage:** Multi-layer vertical column spans (overhangs, arches, caves, Nether ceilings) with cave culling, detail levels `0`–`6` (up to 512 chunks), crash-safe region-packed Zstd disk persistence (`DHREG002` with double-buffered CRC32 headers, streaming atomic compaction, and legacy `.dhlod` fallback), and automatic quadtree parent mipmapping.
-- **Meshing & rendering:** Background section mesher with neighbor face culling, side-plane frustum culling, active resource-pack block/grass/foliage color extraction, independent reversed-Z projection and depth buffer, sky-masked HDR-preserving compositing, Contrast-Adaptive Sharpening (CAS), spiral depth-buffer SSAO, configurable dithering fade, noise texture, brightness/saturation grading, weather- and time-aware lighting, full far/height/environmental fog, debug render modes, generic box-group rendering (`GenericObjectRenderer`), distant tinted beacon beams, and drifting 3D LOD clouds.
-- **Public mod-to-mod API & multiplayer sync:** Public Rust API (`distantsunrises::api`) for custom `LodWorldGenerator` overrides, `RemoteLodProvider` clients, `GenericObjectRenderer` custom geometry, column/chunk submission, and `FullDataSourceV2DTO` wire decoding (LZ4/Zstd/LZMA2), plus an optional droppable `distantsunrises:lod_sync` play payload channel with `SessionConfig` negotiation, rate-limited section streaming, active `PartialColumnUpdate` delta broadcasts, dedicated/LAN per-player distant generation, and per-server local disk caching.
-- **Data capture (on Dev `f8aa80e4`):** Single-player/integrated-server capture of loaded chunks via `read_columns` and surface preview sampling via `terrain_surface`. Full-height zero-copy snapshots (`#5339`), async chunk requests (`#5340`), saved Anvil region import (`#5341`), and detached off-thread worldgen (`#5347`) are wired on branch `stage2-data-gaps` ready to merge as soon as those PRs hit a Dev SDK.
-- **UI, controls, commands & telemetry:** Mod settings screen (render distance, horizontal/vertical quality, cave culling, fog/fade/noise/shading/brightness/saturation, distant generation mode), `/ds` and `/distantsunrises` client commands, Controls keybinds (toggle rendering, cycle quality, clear cache), and F3 debug overlay entries.
-
-## What does not work yet
-
-- **Full-height background chunk snapshots, saved region import & detached worldgen on `sunrise` branch:** Wired on branch `stage2-data-gaps`; merges to `sunrise` once `#5339`–`#5341` and `#5347` land in a Sunrise Dev SDK.
-- **Typed mod-to-mod event bus:** Public trait/function API (`src/api.rs`) is in place; typed `#[derive(mod_api::Event)]` events wait on `#5137`/`#5136`.
-- **Zero-mixin rendering:** Rendering still relies on two temporary `[[native.mixin]]` hooks (`sunrise_mod_render::render::render_needs` and `world_drawn`) with WGSL shaders until Sunrise's `#4758` + `#1161` + `#2005` GLSL mod render pipeline APIs land (GLSL shaders are already staged in `assets/distantsunrises/shaders/core/`).
-- **Translated Iris/OptiFine shader packs:** When an Iris/OptiFine shader pack is active, Distant Sunrises currently draws in its own standalone world-composite pass after vanilla world rendering rather than participating in the shader pack's gbuffer, shadow, deferred, or composite passes. Shader-pack shadows, water reflections, and pack fog do not apply to distant LOD terrain yet.
-
-## Known Sunrise mod-API gaps
-
-Progress on Stages 2–4 tracks these open issues on `sunrise-org/sunrise`:
-
-- **Immutable column snapshots (`ChunkSnapshot`, client & server):** [sunrise-org/sunrise#5233](https://github.com/sunrise-org/sunrise/issues/5233)
-- **Non-blocking server chunk requests (`LevelRef::request_chunk`):** [sunrise-org/sunrise#5234](https://github.com/sunrise-org/sunrise/issues/5234)
-- **Read-only saved Anvil chunk inspection (`SavedChunkReader`):** [sunrise-org/sunrise#5235](https://github.com/sunrise-org/sunrise/issues/5235)
-- **Off-thread detached world generation (`DetachedChunkGenerator`):** [sunrise-org/sunrise#5236](https://github.com/sunrise-org/sunrise/issues/5236)
-- **World render stages & camera matrices (`RenderLevelStage` / `WorldRenderView`):** [sunrise-org/sunrise#1161](https://github.com/sunrise-org/sunrise/issues/1161)
-- **General mod render pipelines, retained meshes, uniforms & render targets:** [sunrise-org/sunrise#2005](https://github.com/sunrise-org/sunrise/issues/2005)
-- **Typed mod-to-mod events & library dependency identity:** [sunrise-org/sunrise#5137](https://github.com/sunrise-org/sunrise/issues/5137), [sunrise-org/sunrise#5136](https://github.com/sunrise-org/sunrise/issues/5136), and [sunrise-org/sunrise#3885](https://github.com/sunrise-org/sunrise/issues/3885)
-- **Shader-pack geometry binding for mod pipelines (Stage 4):** General geometry-layer binding proposal pending alignment with Sunrise's shader-pack runtime refactor.
+- The GPU arena is 128 MiB of quads and has no distance-based eviction yet: once it is full, new
+  sections are not stored (the failure is logged).
+- `octree_sync` serves the overworld only.
+- Shader-pack shadows draw with the camera-culled command list, so casters outside the view are
+  missing from shadow maps.
 
 ## Building
 
@@ -56,6 +68,9 @@ Requires `cargo-sunrise-mod` matching the pinned Sunrise Dev/SDK commit in `sunr
 cargo sunrise-mod check
 cargo sunrise-mod build
 ```
+
+`tools/bench_far_terrain.py` runs the like-for-like far-terrain benchmark against a baseline
+Sunrise.
 
 ## License
 

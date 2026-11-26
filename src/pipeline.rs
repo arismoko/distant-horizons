@@ -256,18 +256,21 @@ pub fn clear_dimension(dim: &str) {
     p.requested.remove(dim);
 }
 
-/// A resource reload or shader-pack change invalidates every baked model: bake them all again and
-/// mesh everything once the models exist.
-pub fn invalidate_models() {
+/// A resource reload, shader-pack change or `/ds remesh` invalidates every baked model: bake them
+/// all again and mesh everything once the models exist. Returns how many sections were queued.
+pub fn invalidate_models() -> usize {
     let mut p = PIPELINE.lock().unwrap();
     p.models.clear();
     p.baked = 0;
     p.models_dirty = true;
     let dims: Vec<String> = p.stores.keys().cloned().collect();
+    let mut queued = 0;
     for dim in dims {
         let positions = p.stores[&dim].section_positions();
+        queued += positions.len();
         p.queue(&dim, positions);
     }
+    queued
 }
 
 const fn face_of(direction: Direction) -> Face {
@@ -400,10 +403,6 @@ fn model_words(index: usize, m: &BakedModel, atlas: &mut [u8]) -> [u32; MODEL_WO
     w
 }
 
-fn arena_quad(q: crate::mesh::PackedQuad) -> crate::gpu_arena::PackedQuad {
-    crate::gpu_arena::PackedQuad(q.0)
-}
-
 /// Buckets a mesh for the arena: bucket 0 translucent, 1 double-sided (unused), `2 + face` opaque.
 fn built_section(quads: &SectionQuads) -> BuiltSection {
     let mut by_bucket: [Vec<_>; BUCKETS] = Default::default();
@@ -415,7 +414,7 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
     let mut all = Vec::with_capacity(quads.quad_count() as usize);
     for (i, bucket) in by_bucket.into_iter().enumerate() {
         counts[i] = bucket.len() as u16;
-        all.extend(bucket.into_iter().map(arena_quad));
+        all.extend(bucket);
     }
     let size = |i: usize| {
         quads.aabb_max[i]

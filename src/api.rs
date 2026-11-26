@@ -17,8 +17,6 @@ use crate::dh_v2::{
     DH_SECTION_MIN_DETAIL, DecodedDhV2Section, DhV2Error, DhV2FullDataDto, pack_dh_section_pos,
     unpack_dh_section_pos,
 };
-use crate::generic_render::build_box_group_mesh;
-pub use crate::generic_render::{BoxGroupShading, RenderableBox, RenderableBoxGroup};
 use crate::lod::{
     ExtraSpan, LodColumn, MAX_DETAIL, SECTION_CELLS, SECTION_SIZE, SOURCE_LOADED_CHUNK, SectionPos,
 };
@@ -39,34 +37,6 @@ pub const fn api_version() -> (u32, u32, u32) {
 /// Returns `true` when Distant Sunrises LOD rendering is currently enabled.
 pub fn is_active() -> bool {
     runtime().enabled_flag.load(Ordering::Relaxed)
-}
-
-/// Register or update a named generic [`RenderableBoxGroup`] rendered in Distant Sunrises'
-/// reversed-Z LOD pass for `dimension` (matches upstream `IDhApiCustomRenderRegister.add`).
-pub fn register_box_group(dimension: &str, group: RenderableBoxGroup) {
-    let mesh = build_box_group_mesh(&group);
-    let rt = runtime();
-    let mut st = rt.inner.lock().unwrap();
-    st.generic_groups
-        .entry(dimension.to_owned())
-        .or_default()
-        .insert(group.id.clone(), mesh);
-    st.generic_groups_revision = st.generic_groups_revision.wrapping_add(1);
-}
-
-/// Remove a previously registered generic [`RenderableBoxGroup`] from `dimension`.
-pub fn unregister_box_group(dimension: &str, group_id: &str) -> bool {
-    let rt = runtime();
-    let mut st = rt.inner.lock().unwrap();
-    let removed = st
-        .generic_groups
-        .get_mut(dimension)
-        .map(|m| m.remove(group_id).is_some())
-        .unwrap_or(false);
-    if removed {
-        st.generic_groups_revision = st.generic_groups_revision.wrapping_add(1);
-    }
-    removed
 }
 
 /// Default build minimum Y for standard Minecraft dimensions when a caller does not know the
@@ -494,7 +464,7 @@ pub fn submit_lod_section(dimension: &str, section: LodSectionData) -> Result<us
         for parent in store.propagate_up_with_quality(pos, max_extra) {
             dirty.insert(parent);
         }
-        queue_mesh_and_save(rt, dimension, save_root.as_ref(), store, &dirty);
+        queue_save(rt, dimension, save_root.as_ref(), store, &dirty);
     }
     Ok(modified)
 }
@@ -547,7 +517,7 @@ pub fn submit_lod_chunk(dimension: &str, chunk: LodChunk) -> Result<usize, DhApi
                 all_dirty.insert(parent);
             }
         }
-        queue_mesh_and_save(rt, dimension, save_root.as_ref(), store, &all_dirty);
+        queue_save(rt, dimension, save_root.as_ref(), store, &all_dirty);
     }
     Ok(modified)
 }
@@ -572,7 +542,7 @@ pub fn submit_dh_v2_bytes(
     submit_dh_v2_dto(dimension, &dto, level_min_y)
 }
 
-/// Removes a cached section and its mesh from `dimension` so it can be regenerated or re-requested.
+/// Removes a cached section from `dimension` so it can be regenerated or re-requested.
 pub fn invalidate_lod_section(dimension: &str, pos: LodSectionPos) -> bool {
     let sec_pos = SectionPos::from(pos);
     let rt = runtime();
@@ -590,14 +560,8 @@ pub fn invalidate_lod_section(dimension: &str, pos: LodSectionPos) -> bool {
             cache.sample_cursor = 0;
         }
     }
-    if let Some(meshed) = st.meshed_sections.get_mut(dimension) {
-        meshed.remove(&sec_pos);
-    }
     if let Some(requested) = st.remote_requested.get_mut(dimension) {
         requested.remove(&sec_pos);
-    }
-    if removed && st.active_dimension == dimension {
-        st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
     }
     removed
 }
@@ -793,7 +757,7 @@ fn datapoints_to_lod_column(
     (primary, extra)
 }
 
-fn queue_mesh_and_save(
+fn queue_save(
     rt: &Arc<crate::render_bridge::DhRuntime>,
     dimension: &str,
     save_root: Option<&std::path::PathBuf>,
@@ -802,10 +766,6 @@ fn queue_mesh_and_save(
 ) {
     for &pos in dirty {
         if let Some(sec) = store.sections.get_mut(&pos) {
-            if sec.dirty_mesh && sec.populated > 0 {
-                sec.dirty_mesh = false;
-                rt.mesher.submit(dimension.to_owned(), sec.clone());
-            }
             if sec.dirty_save
                 && sec.populated > 0
                 && let Some(dir) = save_root

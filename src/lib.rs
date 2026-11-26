@@ -1,15 +1,16 @@
 //! Distant Sunrises native mod for Sunrise.
 //!
-//! Stage 1 architecture:
-//! - Server side samples loaded chunks (`ChunkSnapshot`) and distant ungenerated terrain
-//!   (`DetachedChunkGenerator::sample_surface_columns`) during `level_tick_post` under `host.server_has_time()` budgeting,
-//!   downsamples into the multi-detail-level quadtree, and persists RLE-compressed sections to
-//!   `<world_dir>/distant_sunrises/<dimension>/` on a background IO worker.
-//! - Background meshing worker generates greedy-merged, face-culled solid and fluid meshes.
-//! - Client side tracks camera, day-time lighting, settings (`Options > Mods`), fog colors
-//!   (`render_fog`), and F3 debug telemetry (`register_debug_entries`).
-//! - A GPU-driven renderer (`gpu_arena` + GLSL compute/indirect pipelines, no `[native.*]`) renders LOD geometry with an
-//!   independent reversed-Z depth buffer and sky-masked atmospheric fog compositing.
+//! Architecture (Voxy-style 32³ octree renderer on Sunrise's general mod API, zero `[native.*]`):
+//! - The server ingests loaded chunks (`ChunkSnapshot`) and distant ungenerated terrain
+//!   (`DetachedChunkGenerator::sample_surface_columns`) during `level_tick_post` under
+//!   `host.server_has_time()` budgeting into 32³ octree sections (`octree`, `pipeline`), and
+//!   persists them (`DHLOD003` / `.dhoct`, `storage`) on a background IO worker.
+//! - `pipeline` greedy-meshes each section into 8-byte packed quads (`mesh`) using the baked
+//!   per-block models and 4x4 face atlas (`bakery`) and hands them to the GPU arena.
+//! - `network::octree_sync` streams sections to remote clients over one raw play channel.
+//! - The client tracks camera, day-time lighting, settings (`Options > Mods`), fog colors
+//!   (`render_fog`) and F3 telemetry. `gpu_arena` + GLSL compute (Hi-Z, command generation) and
+//!   GPU indirect draws render the LODs; shader packs draw them through pack-linked pipelines.
 
 pub mod api;
 pub mod bakery;
@@ -18,7 +19,6 @@ pub mod commands;
 pub mod config;
 pub mod dh_v2;
 pub mod gen_worker;
-pub mod generic_render;
 pub mod gpu_arena;
 pub mod lod;
 pub mod mesh;
@@ -38,10 +38,6 @@ use crate::colors::{
 };
 use crate::commands::DhKeybinds;
 use crate::config::{DhConfig, MOD_ID};
-use crate::generic_render::{
-    BeaconBeam, GROUP_ID_BEACONS, GROUP_ID_CLOUDS, blend_beacon_tint, build_box_group_mesh,
-    stained_glass_tint,
-};
 use crate::lod::{
     DimensionLodStore, LodColumn, SECTION_SIZE, SOURCE_DISTANT_SURFACE, SOURCE_LOADED_CHUNK,
     SectionPos,
@@ -141,7 +137,6 @@ impl Hooks for DistantHorizonsMod {
     ) {
         let _ = resource_colors::reload_from_resources(host);
         pipeline::invalidate_models();
-        let _ = commands::remesh_active_dimension();
     }
 
     fn register_client_commands(
@@ -164,9 +159,8 @@ impl Hooks for DistantHorizonsMod {
                 |_host, lines| {
                     let s = stats();
                     lines.push(format!(
-                        "DH: sec={} ready={} drawn={} quads={} gen={} saved={}",
+                        "DH: sec={} drawn={} quads={} gen={} saved={}",
                         s.active_sections,
-                        s.ready_meshes,
                         s.rendered_sections,
                         s.rendered_quads,
                         s.generated_columns,
@@ -184,29 +178,9 @@ impl Hooks for DistantHorizonsMod {
 
     fn client_level_load(&self, host: &mut dyn ClientHost, event: &mut ClientLevelLoadEvent<'_>) {
         sync_client_config(host);
-        let remote_cache = host
-            .client_session()
-            .client_server()
-            .filter(|s| !s.integrated_local)
-            .map(|s| {
-                let key = s.address.or(s.name).unwrap_or("remote");
-                network::remote_cache_root(&host.instance_dir(), key)
-            });
-        let rt = runtime();
-        let mut st = rt.inner.lock().unwrap();
+        let mut st = runtime().inner.lock().unwrap();
         st.active_dimension = event.dimension.to_owned();
-        st.remote_cache_dir = remote_cache;
         st.client_loaded_chunks.clear();
-        st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
-        // Re-submit any already-known sections in this dimension to the mesher so the GPU cache
-        // immediately populates after switching dimensions or rejoining a world.
-        if let Some(dim) = st.dimensions.get(event.dimension) {
-            for sec in dim.sections.values() {
-                if sec.populated > 0 {
-                    rt.mesher.submit(event.dimension.to_owned(), sec.clone());
-                }
-            }
-        }
     }
 
     fn client_level_unload(
@@ -216,18 +190,9 @@ impl Hooks for DistantHorizonsMod {
     ) {
         let _ = render_bridge::clear_dimension(event.dimension);
         network::octree_sync::client_reset();
-        let remote_cache = {
-            let mut st = runtime().inner.lock().unwrap();
-            st.remote_requested.remove(event.dimension);
-            st.remote_session_config = None;
-            st.remote_config_requested = false;
-            st.client_loaded_chunks.clear();
-            if st.active_dimension == event.dimension {
-                st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
-            }
-            st.remote_cache_dir.take()
-        };
-        let _ = remote_cache;
+        let mut st = runtime().inner.lock().unwrap();
+        st.remote_requested.remove(event.dimension);
+        st.client_loaded_chunks.clear();
     }
 
     fn client_chunk_load(&self, host: &mut dyn ClientHost, event: &mut ClientChunkLoadEvent<'_>) {
@@ -267,7 +232,7 @@ impl Hooks for DistantHorizonsMod {
         if host.on(MOD_ID) {
             let dim = runtime().inner.lock().unwrap().active_dimension.clone();
             pipeline::client_tick(host, &dim);
-            let _ = render_bridge::upload_pending(
+            render_bridge::upload_pending(
                 host,
                 gpu_arena::ArenaConfig {
                     max_sections: gpu_arena::VOXY_MAX_SECTIONS,
@@ -315,53 +280,6 @@ impl Hooks for DistantHorizonsMod {
             }
 
             let active_dim = st.active_dimension.clone();
-            if st.has_camera {
-                let cam_pos = st.camera_pos;
-                let v_far = st.vanilla_far_blocks;
-                let dh_far = cfg.render_distance_blocks().max(256.0);
-                let elapsed = st.start_instant.elapsed().as_secs_f64();
-                let rain = st.rain_level;
-
-                // Update procedural 3D LOD clouds (drifts smoothly every tick; only re-meshes on cell/config change).
-                let (cloud_group, cloud_origin) =
-                    st.cloud_field
-                        .update(&active_dim, cam_pos, v_far, cfg, rain, elapsed);
-                if let Some(group) = cloud_group {
-                    let mesh = build_box_group_mesh(&group);
-                    st.generic_groups
-                        .entry(active_dim.clone())
-                        .or_default()
-                        .insert(GROUP_ID_CLOUDS.to_owned(), mesh);
-                    st.generic_groups_revision = st.generic_groups_revision.wrapping_add(1);
-                } else if let Some(existing) = st
-                    .generic_groups
-                    .get_mut(&active_dim)
-                    .and_then(|m| m.get_mut(GROUP_ID_CLOUDS))
-                {
-                    existing.origin = cloud_origin;
-                }
-
-                // Update distant beacon beams (only rebuilds when beacons, origin grid, or render distance change).
-                let beacon_group = st
-                    .beacons
-                    .entry(active_dim.clone())
-                    .or_default()
-                    .maybe_build_group(
-                        cam_pos,
-                        v_far,
-                        dh_far,
-                        cfg.enabled && cfg.beacon_beams_enabled,
-                    );
-                if let Some(group) = beacon_group {
-                    let mesh = build_box_group_mesh(&group);
-                    st.generic_groups
-                        .entry(active_dim.clone())
-                        .or_default()
-                        .insert(GROUP_ID_BEACONS.to_owned(), mesh);
-                    st.generic_groups_revision = st.generic_groups_revision.wrapping_add(1);
-                }
-            }
-
             if cfg.enabled && st.has_camera {
                 if let Some(provider) = st.remote_providers.get(&active_dim).cloned() {
                     let desired = DimensionLodStore::desired_sections_coarse_to_fine(
@@ -417,14 +335,6 @@ impl Hooks for DistantHorizonsMod {
         let rt = runtime();
         let mut st = rt.inner.lock().unwrap();
         st.fog_color = event.fog.color;
-        st.fog_type = match event.fog_type {
-            FogType::Atmospheric => 0,
-            FogType::Water => 1,
-            FogType::Lava => 2,
-            FogType::PowderSnow => 3,
-        };
-        st.env_fog_start = event.fog.environmental_start;
-        st.env_fog_end = event.fog.environmental_end;
         // Vanilla render distance in blocks (matches DH `MinecraftClientWrapper.getRenderDistance()` * 16).
         // Do NOT read `event.fog.render_distance_end`, which becomes `2e9` when Sunrise fog is disabled
         // and would push `clip_dist` to ~1e9 (discarding all DS chunks).
@@ -596,15 +506,8 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     };
 
     let mut dirty_sections: HashSet<SectionPos> = HashSet::new();
-    let collect_deltas = host.server_is_published();
     if !chunks_to_sample.is_empty() {
-        sample_loaded_chunks(
-            host,
-            dim,
-            &chunks_to_sample,
-            &mut dirty_sections,
-            collect_deltas,
-        );
+        sample_loaded_chunks(host, dim, &chunks_to_sample, &mut dirty_sections);
     }
 
     // 1b. Drain completed off-thread distant terrain generation results (fast O(1) ingest).
@@ -670,24 +573,12 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         }
     }
 
-    // 3. Propagate dirty sections up the quadtree, queue meshing, and persist dirty sections.
+    // 3. Propagate dirty sections up the quadtree of the column store.
     if !dirty_sections.is_empty() {
         let mut st = rt.inner.lock().unwrap();
         let store = st.dimensions.entry(dim.to_owned()).or_default();
-        let mut to_mesh: HashSet<SectionPos> = dirty_sections.clone();
         for &pos in &dirty_sections {
-            for parent_pos in store.propagate_up(pos) {
-                to_mesh.insert(parent_pos);
-            }
-        }
-        for pos in to_mesh {
-            if let Some(sec) = store.sections.get_mut(&pos)
-                && sec.dirty_mesh
-                && sec.populated > 0
-            {
-                sec.dirty_mesh = false;
-                rt.mesher.submit(dim.to_owned(), sec.clone());
-            }
+            store.propagate_up(pos);
         }
     }
 
@@ -730,10 +621,9 @@ fn sample_loaded_chunks(
     dim: &str,
     chunks: &[[i32; 2]],
     dirty_sections: &mut HashSet<SectionPos>,
-    collect_deltas: bool,
-) -> HashMap<SectionPos, network::SectionColumnDelta> {
+) {
     let Some(level) = host.level(dim) else {
-        return HashMap::new();
+        return;
     };
 
     let snapshots: Vec<([i32; 2], Option<mod_api::ChunkSnapshot>)> = chunks
@@ -756,29 +646,24 @@ fn sample_loaded_chunks(
             );
         }
     }
-    ingest_chunk_snapshots(host, dim, &snapshots, dirty_sections, collect_deltas)
+    ingest_chunk_snapshots(host, dim, &snapshots, dirty_sections);
 }
 
-/// Converts chunk snapshots (live G1 or saved G3) into LOD columns, spans and beacons.
+/// Converts chunk snapshots (live G1 or saved G3) into LOD columns and spans.
 fn ingest_chunk_snapshots(
     host: &dyn ServerHost,
     dim: &str,
     snapshots: &[([i32; 2], Option<mod_api::ChunkSnapshot>)],
     dirty_sections: &mut HashSet<SectionPos>,
-    collect_deltas: bool,
-) -> HashMap<SectionPos, network::SectionColumnDelta> {
-    let mut deltas: HashMap<SectionPos, network::SectionColumnDelta> = HashMap::new();
-    let chunks: Vec<[i32; 2]> = snapshots.iter().map(|(p, _)| *p).collect();
-
+) {
     let mut block_id_cache: HashMap<mod_api::BlockState, &str> = HashMap::new();
-    let mut chunk_beacons: Vec<Vec<BeaconBeam>> = vec![Vec::new(); chunks.len()];
 
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
     let max_spans = st.config.vertical_quality.clamp(1, 8) as usize;
     let store = st.dimensions.entry(dim.to_owned()).or_default();
 
-    for (ci, ([cx, cz], snap_opt)) in snapshots.iter().enumerate() {
+    for ([cx, cz], snap_opt) in snapshots {
         let Some(snap) = snap_opt else {
             continue;
         };
@@ -805,10 +690,8 @@ fn ingest_chunk_snapshots(
                 // tree canopies, overhangs, and ground underneath (DH `EDhApiVerticalQuality`).
                 let mut solid_spans: Vec<(i32, i32, &str)> = Vec::with_capacity(max_spans);
                 let mut in_solid_span = false;
-                let mut beacon_y: Option<i32> = None;
-                let mut beacon_tint: Option<[u8; 3]> = None;
 
-                // Scan top-down through the sampled band for surface + vertical spans + beacons.
+                // Scan top-down through the sampled band for surface + vertical spans.
                 for y in (y_min..=y_max).rev() {
                     let block_id = match snap.block_state(lx, y, lz) {
                         Some(state) => *block_id_cache
@@ -816,9 +699,6 @@ fn ingest_chunk_snapshots(
                             .or_insert_with(|| state.block().id(host).unwrap_or("minecraft:stone")),
                         None => "minecraft:air",
                     };
-                    if block_id == "minecraft:beacon" {
-                        beacon_y = Some(y);
-                    }
                     if is_water_block(block_id) {
                         in_solid_span = false;
                         if fluid_top.is_none() {
@@ -837,26 +717,6 @@ fn ingest_chunk_snapshots(
                     } else if solid_spans.len() < max_spans {
                         solid_spans.push((y, y, block_id));
                         in_solid_span = true;
-                    }
-                }
-
-                if let Some(by) = beacon_y {
-                    for y in (by + 1)..=y_max {
-                        let block_id = match snap.block_state(lx, y, lz) {
-                            Some(state) => *block_id_cache.entry(state).or_insert_with(|| {
-                                state.block().id(host).unwrap_or("minecraft:stone")
-                            }),
-                            None => "minecraft:air",
-                        };
-                        if let Some(glass_rgb) = stained_glass_tint(block_id) {
-                            beacon_tint = Some(blend_beacon_tint(beacon_tint, glass_rgb));
-                        }
-                    }
-                    if let Some(list) = chunk_beacons.get_mut(ci) {
-                        list.push(BeaconBeam {
-                            pos: [bx, by, bz],
-                            color: beacon_tint.unwrap_or([255, 255, 255]),
-                        });
                     }
                 }
 
@@ -948,23 +808,10 @@ fn ingest_chunk_snapshots(
                 };
                 if changed {
                     dirty_sections.insert(sec_pos);
-                    if collect_deltas {
-                        let entry = deltas.entry(sec_pos).or_default();
-                        entry.revision = sec.revision;
-                        entry.columns.push((cell_x as u8, cell_z as u8, lod_col));
-                    }
                 }
             }
         }
     }
-
-    let tracker = st.beacons.entry(dim.to_owned()).or_default();
-    for (ci, &chunk) in chunks.iter().enumerate() {
-        if let Some(found) = chunk_beacons.get(ci) {
-            tracker.replace_chunk_beacons(chunk, found);
-        }
-    }
-    deltas
 }
 
 enum SampleOutcome {
@@ -1201,7 +1048,7 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
         }
     }
     if !saved.is_empty() {
-        ingest_chunk_snapshots(host, dim, &saved, dirty_sections, false);
+        ingest_chunk_snapshots(host, dim, &saved, dirty_sections);
     }
 
     for res in &results {
