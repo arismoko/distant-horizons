@@ -302,7 +302,7 @@ impl DhConfig {
                     "distantsunrises.setting.gen_mode.features",
                     "distantsunrises.setting.gen_mode.full",
                 ],
-                1,
+                2,
             )
             .tooltip("distantsunrises.setting.distant_generation_mode.tooltip"),
             SettingSpec::toggle(
