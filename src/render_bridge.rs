@@ -630,7 +630,7 @@ trait TerrainGpu {
 
     fn create_arena(&mut self, config: ArenaConfig) -> Result<Self::Arena, ArenaError>;
     fn create_quad_mesh(&mut self) -> Result<Self::Mesh, ArenaError>;
-    fn requests_live(&self, arena: &Self::Arena) -> bool;
+    fn request_buffer_size(&self, arena: &Self::Arena) -> Result<u64, mod_api::BufferError>;
     fn poll_readback(&self, ticket: Self::Ticket) -> Result<Option<Vec<u8>>, mod_api::BufferError>;
     fn release_readback(&self, ticket: Self::Ticket) -> Result<(), mod_api::BufferError>;
 }
@@ -699,7 +699,7 @@ impl<Ticket: Copy> NodeRequests<Ticket> {
     fn service<G: TerrainGpu<Ticket = Ticket> + ?Sized>(&mut self, gpu: &G, arena: &G::Arena) {
         // In #6138 the host can exist without mod GPU resources. A ticket operation would
         // return the same Unavailable as a spent ticket; probe the retained request buffer.
-        if self.pending.is_none() || !gpu.requests_live(arena) {
+        if self.pending.is_none() || gpu.request_buffer_size(arena).is_err() {
             return;
         }
         let pending = self.pending.take().unwrap();
@@ -767,8 +767,8 @@ impl TerrainGpu for dyn mod_api::ClientHost + '_ {
             .map_err(|_| ArenaError::Buffer(mod_api::BufferError::Unavailable))
     }
 
-    fn requests_live(&self, arena: &Self::Arena) -> bool {
-        arena.requests.size(self).is_ok()
+    fn request_buffer_size(&self, arena: &Self::Arena) -> Result<u64, mod_api::BufferError> {
+        arena.requests.size(self)
     }
 
     fn poll_readback(&self, ticket: Self::Ticket) -> Result<Option<Vec<u8>>, mod_api::BufferError> {
@@ -812,6 +812,35 @@ fn try_upload_pending(
     config: ArenaConfig,
 ) -> Result<(), crate::gpu_arena::ArenaError> {
     let mut guard = ARENA.lock().unwrap();
+    if ArenaState::discard_if_retired(&mut guard, host)? {
+        // These storage, target, mesh and ticket handles were retired together by Sunrise.
+        // Drop their mod-side state without reading or releasing the dead handles.
+        PENDING_SECTIONS.lock().unwrap().clear();
+        *PENDING_TABLES.lock().unwrap() = None;
+        *NODE_REQUESTS.lock().unwrap() = NodeRequests::new();
+        *FRAME.lock().unwrap() = None;
+        PREPARED.lock().unwrap().clear();
+        *HIZ.lock().unwrap() = None;
+        *SSAO.lock().unwrap() = None;
+        *SSAO_PENDING.lock().unwrap() = None;
+        // The named texture is retired separately at the frame boundary. If it is still
+        // registered, retire our atlas before rebaking so its name can be created again.
+        if ATLAS_CREATED.load(Ordering::Relaxed) {
+            match host.release_dynamic_texture(&id(ATLAS_TEXTURE)) {
+                Ok(()) | Err(mod_api::DynamicTextureError::Unknown) => {
+                    ATLAS_CREATED.store(false, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    report::<(), _>("release retired atlas", Err(error));
+                }
+            }
+        }
+        // Reset/requeue old mesh generations with PIPELINE unlocked from ARENA; server-side
+        // cleanup acquires those locks in the opposite direction.
+        drop(guard);
+        crate::pipeline::recover_retired_arena();
+        guard = ARENA.lock().unwrap();
+    }
     let state = ensure_arena(&mut guard, host, config)?;
     let pending_tables = PENDING_TABLES.lock().unwrap().take();
     if let Some((models, tints, atlas_mips)) = pending_tables {
@@ -912,6 +941,23 @@ pub(crate) fn invalidate_quad_mesh() {
 }
 
 impl<Arena, Mesh> ArenaState<Arena, Mesh> {
+    fn discard_if_retired(
+        slot: &mut Option<Self>,
+        gpu: &(impl TerrainGpu<Arena = Arena> + ?Sized),
+    ) -> Result<bool, ArenaError> {
+        let Some(state) = slot else { return Ok(false) };
+        // Unlike a generic unavailable context, Stale proves this retained generation is gone.
+        // Storage survives ordinary reload, resize and world close on the renderer contract.
+        match gpu.request_buffer_size(&state.arena) {
+            Ok(_) => Ok(false),
+            Err(mod_api::BufferError::Stale) => {
+                *slot = None;
+                Ok(true)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn invalidate_quad_mesh(slot: &mut Option<Self>) {
         if let Some(state) = slot {
             state.quad_mesh = None;
@@ -1735,6 +1781,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingGpu {
         available: bool,
+        retired_arena: Option<u32>,
         arenas: u32,
         meshes: u32,
         ready: RefCell<Option<Vec<u8>>>,
@@ -1757,8 +1804,14 @@ mod tests {
             Ok(self.meshes)
         }
 
-        fn requests_live(&self, _: &Self::Arena) -> bool {
-            self.available
+        fn request_buffer_size(&self, arena: &Self::Arena) -> Result<u64, BufferError> {
+            if !self.available {
+                Err(BufferError::Unavailable)
+            } else if self.retired_arena == Some(*arena) {
+                Err(BufferError::Stale)
+            } else {
+                Ok(4)
+            }
         }
 
         fn poll_readback(&self, ticket: Self::Ticket) -> Result<Option<Vec<u8>>, BufferError> {
@@ -1822,6 +1875,46 @@ mod tests {
         requests.service(&host, &arena);
         assert_eq!(requests.ready, [(1, [31, 0, 0])]);
         assert_eq!(*host.polled.borrow(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn only_typed_staleness_retires_an_arena_and_its_installed_ids() {
+        let mut host = RecordingGpu {
+            available: true,
+            ..Default::default()
+        };
+        let config = ArenaConfig {
+            max_sections: 4,
+            geometry_bytes: 0,
+        };
+        let mut slot = None;
+        let live = ensure_arena(&mut slot, &mut host, config).unwrap();
+        let old_arena = live.arena;
+        let key = ("minecraft:overworld".into(), 0, [2, 0, -2]);
+        live.ids.insert(key, 3);
+        assert!(!ArenaState::discard_if_retired(&mut slot, &host).unwrap());
+        host.available = false;
+        assert!(matches!(
+            ArenaState::discard_if_retired(&mut slot, &host),
+            Err(ArenaError::Buffer(BufferError::Unavailable))
+        ));
+        assert_eq!(slot.as_ref().unwrap().ids.len(), 1);
+
+        host.available = true;
+        host.retired_arena = Some(old_arena);
+        let mut requests = NodeRequests::new();
+        requests.start(|| Some(71));
+        *host.ready.borrow_mut() = Some(single_node_request(17));
+        requests.service(&host, &old_arena);
+        assert!(host.polled.borrow().is_empty());
+        assert!(host.released.borrow().is_empty());
+        assert!(ArenaState::discard_if_retired(&mut slot, &host).unwrap());
+        assert!(slot.is_none());
+        let new = ensure_arena(&mut slot, &mut host, config).unwrap();
+        assert_ne!(new.arena, old_arena);
+        assert!(new.ids.is_empty());
+        assert_eq!(host.arenas, 2);
+        assert_eq!(host.meshes, 2);
     }
 
     #[test]

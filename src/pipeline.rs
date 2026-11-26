@@ -675,18 +675,36 @@ impl Pipeline {
 /// A resource reload, shader-pack change or `/ds remesh` invalidates every baked model: bake them
 /// all again and mesh everything once the models exist. Returns how many sections were queued.
 pub fn invalidate_models() -> usize {
+    PIPELINE.lock().unwrap().invalidate_models()
+}
+
+/// Schedule a replacement GPU arena from the retained CPU terrain, without changing worlds.
+pub(crate) fn recover_retired_arena() {
     let mut p = PIPELINE.lock().unwrap();
-    p.models.clear();
-    p.baked = 0;
-    p.models_dirty = true;
-    let dims: Vec<String> = p.stores.keys().cloned().collect();
-    let mut queued = 0;
-    for dim in dims {
-        let positions = p.stores[&dim].section_positions();
-        queued += positions.len();
-        p.queue(&dim, positions);
+    MESH_WORKER.clear();
+    p.recover_retired_arena();
+}
+
+impl Pipeline {
+    fn recover_retired_arena(&mut self) {
+        self.section_epoch.clear();
+        self.rendered.clear();
+        self.invalidate_models();
     }
-    queued
+
+    fn invalidate_models(&mut self) -> usize {
+        self.models.clear();
+        self.baked = 0;
+        self.models_dirty = true;
+        let dims: Vec<String> = self.stores.keys().cloned().collect();
+        let mut queued = 0;
+        for dim in dims {
+            let positions = self.stores[&dim].section_positions();
+            queued += positions.len();
+            self.queue(&dim, positions);
+        }
+        queued
+    }
 }
 
 const fn face_of(direction: Direction) -> Face {
@@ -1658,6 +1676,35 @@ mod tests {
         assert_eq!(reopened.get(0, 0, 0).block_id(), 1);
         assert_eq!(reopened.get(17, 0, 0), sibling);
         assert!(reopened.to_dense().into_iter().all(|v| v != remote));
+    }
+
+    #[test]
+    fn arena_retirement_requeues_resident_sections_without_retiring_terrain() {
+        let mut p = Pipeline::default();
+        let pos = OctreeSectionPos::new(0, -2, 0, 7);
+        let stone = Voxel::new(1, 0, 12, 0);
+        p.stores
+            .entry(DIM.into())
+            .or_default()
+            .replace_section(OctreeSection::filled(pos, stone));
+        p.unsaved.entry(DIM.into()).or_default().insert(pos);
+        p.disk.entry(DIM.into()).or_default().hits.insert(pos);
+        p.requested.entry(DIM.into()).or_default().insert(pos);
+        p.section_epoch.insert((DIM.into(), pos), 63);
+        p.next_epoch = 63;
+        p.rendered.entry(DIM.into()).or_default().insert(pos);
+        p.baked = 1;
+        p.recover_retired_arena();
+        assert!(p.rendered.is_empty());
+        assert!(p.section_epoch.is_empty());
+        assert_eq!(p.next_epoch, 63);
+        assert_eq!(p.baked, 0);
+        assert!(p.models_dirty);
+        assert_eq!(p.dirty[DIM].front(), Some(&pos));
+        assert_eq!(p.stores[DIM].section(pos).unwrap().get(0, 0, 0), stone);
+        assert!(p.unsaved[DIM].contains(&pos));
+        assert!(p.disk[DIM].hits.contains(&pos));
+        assert!(p.requested[DIM].contains(&pos));
     }
 
     #[test]
