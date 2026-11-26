@@ -641,7 +641,8 @@ fn try_upload_pending(
         });
     }
     let state = guard.as_mut().unwrap();
-    if let Some((models, tints, atlas)) = PENDING_TABLES.lock().unwrap().take() {
+    let pending_tables = PENDING_TABLES.lock().unwrap().take();
+    if let Some((models, tints, atlas)) = pending_tables {
         let wrote_models = report("write models", state.arena.write_models(host, 0, &models));
         let wrote_tints = report(
             "write biome tints",
