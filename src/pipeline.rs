@@ -197,9 +197,11 @@ struct MeshJob {
     metas: Arc<MetaTable>,
 }
 
+type MeshDone = (String, OctreeSectionPos, u64, BuiltSection);
+
 struct MeshWorker {
     queue: Arc<(Mutex<VecDeque<MeshJob>>, std::sync::Condvar)>,
-    done: Arc<Mutex<Vec<(String, OctreeSectionPos, u64, BuiltSection)>>>,
+    done: Arc<Mutex<Vec<MeshDone>>>,
 }
 
 impl MeshWorker {
@@ -208,12 +210,7 @@ impl MeshWorker {
             Mutex::new(VecDeque::<MeshJob>::new()),
             std::sync::Condvar::new(),
         ));
-        let done = Arc::new(Mutex::new(Vec::<(
-            String,
-            OctreeSectionPos,
-            u64,
-            BuiltSection,
-        )>::new()));
+        let done = Arc::new(Mutex::new(Vec::<MeshDone>::new()));
         let q_bg = Arc::clone(&queue);
         let d_bg = Arc::clone(&done);
         let _ = std::thread::Builder::new()
@@ -258,7 +255,7 @@ impl MeshWorker {
         self.done.lock().unwrap().retain(|(d, _, _, _)| d != dim);
     }
 
-    fn drain_done(&self) -> Vec<(String, OctreeSectionPos, u64, BuiltSection)> {
+    fn drain_done(&self) -> Vec<MeshDone> {
         std::mem::take(&mut *self.done.lock().unwrap())
     }
 }
