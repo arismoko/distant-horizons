@@ -304,6 +304,89 @@ pub struct RleSection {
 const OCTANT_EDGE: usize = SECTION_EDGE / 2;
 const OCTANT_VOLUME: usize = OCTANT_EDGE * OCTANT_EDGE * OCTANT_EDGE;
 
+/// Known full-height columns of a 32³ section, including authored air. Bit `z * 32 + x`
+/// is stored least-significant bit first in each byte, with bytes in increasing bit order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnFootprint([u8; Self::BYTE_LEN]);
+
+impl Default for ColumnFootprint {
+    fn default() -> Self {
+        Self([0; Self::BYTE_LEN])
+    }
+}
+
+impl ColumnFootprint {
+    pub(crate) const BYTE_LEN: usize = SECTION_EDGE * SECTION_EDGE / 8;
+
+    pub(crate) fn as_bytes(&self) -> &[u8; Self::BYTE_LEN] {
+        &self.0
+    }
+
+    pub(crate) fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    fn address(x: usize, z: usize) -> Option<(usize, u8)> {
+        if x >= SECTION_EDGE || z >= SECTION_EDGE {
+            return None;
+        }
+        let bit = z * SECTION_EDGE + x;
+        Some((bit / 8, 1 << (bit % 8)))
+    }
+
+    /// Whether the local column `(x, z)` is known. Out-of-range columns are unknown.
+    pub fn contains(&self, x: usize, z: usize) -> bool {
+        Self::address(x, z).is_some_and(|(byte, bit)| self.0[byte] & bit != 0)
+    }
+
+    /// Mark a local column known. Returns whether an in-range bit was newly set.
+    pub fn set(&mut self, x: usize, z: usize) -> bool {
+        let Some((byte, bit)) = Self::address(x, z) else {
+            return false;
+        };
+        let was_clear = self.0[byte] & bit == 0;
+        self.0[byte] |= bit;
+        was_clear
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|&byte| byte == 0)
+    }
+
+    /// Union footprints in the same section coordinates. Returns whether any bit was added.
+    pub fn merge(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+        for (byte, &bits) in self.0.iter_mut().zip(other.0.iter()) {
+            let previous = *byte;
+            *byte |= bits;
+            changed |= *byte != previous;
+        }
+        changed
+    }
+
+    /// Project complete 2×2 groups of child columns to the child's quadrant in the parent.
+    /// This covers only the child's vertical half; setting a full parent-column bit also
+    /// requires coverage of the other half.
+    pub fn project_to_parent(&self, child: OctreeSectionPos) -> Self {
+        let x0 = (child.x & 1) as usize * OCTANT_EDGE;
+        let z0 = (child.z & 1) as usize * OCTANT_EDGE;
+        let mut projected = Self::default();
+        for z in 0..OCTANT_EDGE {
+            for x in 0..OCTANT_EDGE {
+                let (cx, cz) = (x * 2, z * 2);
+                if self.contains(cx, cz)
+                    && self.contains(cx + 1, cz)
+                    && self.contains(cx, cz + 1)
+                    && self.contains(cx + 1, cz + 1)
+                {
+                    projected.set(x0 + x, z0 + z);
+                }
+            }
+        }
+        projected
+    }
+}
+
 #[derive(Clone, Debug)]
 enum OctantIndices {
     Uniform(u16),
@@ -339,6 +422,7 @@ pub struct OctreeSection {
     lookup: HashMap<Voxel, u16>,
     octants: [OctantIndices; 8],
     pub revision: u64,
+    pub footprint: ColumnFootprint,
 }
 
 impl OctreeSection {
@@ -355,6 +439,7 @@ impl OctreeSection {
             lookup: HashMap::from([(voxel, 0)]),
             octants: std::array::from_fn(|_| OctantIndices::Uniform(0)),
             revision: 0,
+            footprint: ColumnFootprint::default(),
         }
     }
 
@@ -1007,6 +1092,47 @@ mod tests {
     }
 
     #[test]
+    fn footprint_sets_and_merges_local_columns() {
+        let mut footprint = ColumnFootprint::default();
+        assert!(footprint.is_empty());
+        assert!(footprint.set(31, 0));
+        assert!(!footprint.set(31, 0));
+        assert!(!footprint.set(32, 0));
+        assert!(!footprint.set(0, 32));
+        assert!(footprint.contains(31, 0));
+        assert!(!footprint.contains(0, 1));
+        assert!(!footprint.contains(32, 0));
+        assert!(!footprint.is_empty());
+
+        let mut other = ColumnFootprint::default();
+        other.set(0, 1);
+        assert!(footprint.merge(&other));
+        assert!(!footprint.merge(&other));
+        assert!(footprint.contains(31, 0));
+        assert!(footprint.contains(0, 1));
+        assert!(!footprint.contains(1, 0));
+    }
+
+    #[test]
+    fn footprint_projects_complete_cells_into_the_childs_parent_quadrant() {
+        let mut footprint = ColumnFootprint::default();
+        for (x, z) in [(2, 30), (3, 30), (2, 31), (3, 31), (4, 0), (5, 0), (4, 1)] {
+            footprint.set(x, z);
+        }
+        let parent = OctreeSectionPos::new(1, -1, -1, -1);
+        let children = parent.children().unwrap();
+        for (child, x, z) in [
+            (children[child_index(1, 0, 0)], 17, 15),
+            (children[child_index(0, 1, 1)], 1, 31),
+        ] {
+            assert_eq!(child.parent(), Some(parent));
+            let mut expected = ColumnFootprint::default();
+            expected.set(x, z);
+            assert_eq!(footprint.project_to_parent(child), expected);
+        }
+    }
+
+    #[test]
     fn uniform_then_paletted_storage() {
         let mut s = OctreeSection::new(OctreeSectionPos::new(0, 0, 0, 0));
         assert!(s.is_empty());
@@ -1017,6 +1143,10 @@ mod tests {
         assert_eq!(s.non_air_count(), 1);
         assert!(!s.set(32, 0, 0, Voxel::new(STONE, 0, 0, 0)));
         assert!(s.get(40, 0, 0).is_air());
+        assert!(
+            s.footprint.is_empty(),
+            "voxel writes alone do not author coverage"
+        );
     }
 
     #[test]
