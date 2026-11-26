@@ -128,7 +128,7 @@ impl Mapper {
     }
 
     /// Translate a section whose ids come from another mapping (a file, a server) into this
-    /// session's ids by name.
+    /// session's ids by name, without changing its footprint or revision.
     fn remap(
         &mut self,
         host: &dyn Host,
@@ -160,6 +160,7 @@ impl Mapper {
             .collect();
         let mut out = OctreeSection::from_dense(section.pos, &dense);
         out.revision = section.revision;
+        out.footprint = section.footprint;
         out
     }
 
