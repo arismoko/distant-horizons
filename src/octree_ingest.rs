@@ -285,7 +285,10 @@ impl OctreeIngestStore {
                     set(self, vx, y, vz, Voxel::new(water_block, biome, sky, 0));
                 }
             }
-            set(self, vx, top + 1, vz, Voxel::air_with_light(15, 0));
+            // Open sky above the surface (see `ingest_distant_columns`).
+            for y in top + 1..=top + SECTION_EDGE as i32 {
+                set(self, vx, y, vz, Voxel::air_with_light(15, 0));
+            }
         }
         touched.into_iter().collect()
     }
