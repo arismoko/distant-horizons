@@ -25,7 +25,7 @@ pub mod mesh;
 pub mod network;
 pub mod octree;
 pub mod octree_ingest;
-pub mod pipeline;
+pub(crate) mod pipeline;
 pub mod render_bridge;
 pub mod resource_colors;
 pub mod shader_pack;
