@@ -255,6 +255,11 @@ impl MeshWorker {
         self.done.lock().unwrap().retain(|(d, _, _, _)| d != dim);
     }
 
+    fn clear(&self) {
+        self.queue.0.lock().unwrap().clear();
+        self.done.lock().unwrap().clear();
+    }
+
     fn drain_done(&self) -> Vec<MeshDone> {
         std::mem::take(&mut *self.done.lock().unwrap())
     }
@@ -375,9 +380,9 @@ impl Pipeline {
 
 #[derive(Default)]
 struct DiskIntake {
-    swept: HashSet<OctreeSectionPos>,
+    hits: HashSet<OctreeSectionPos>,
     loading: HashMap<OctreeSectionPos, u64>,
-    // Misses are retained only as long as the incoming batch needs them.
+    // A later edit may use a recorded miss, including one completed by the warm sweep.
     missing: HashSet<OctreeSectionPos>,
     failed: HashSet<OctreeSectionPos>,
     pending: Vec<TerrainInput>,
@@ -394,6 +399,10 @@ enum TerrainInput {
 }
 
 impl DiskIntake {
+    fn probed(&self, pos: &OctreeSectionPos) -> bool {
+        self.hits.contains(pos) || self.missing.contains(pos) || self.failed.contains(pos)
+    }
+
     fn needed(&self, store: &OctreeIngestStore) -> HashSet<OctreeSectionPos> {
         let mut needed = HashSet::new();
         for input in &self.pending {
@@ -429,13 +438,9 @@ impl DiskIntake {
         pos: OctreeSectionPos,
         for_write: bool,
     ) -> bool {
-        if self.loading.contains_key(&pos)
-            || self.failed.contains(&pos)
-            || (!for_write && !self.swept.insert(pos))
-        {
+        if self.loading.contains_key(&pos) || self.probed(&pos) {
             return false;
         }
-        self.swept.insert(pos);
         *next = next.wrapping_add(1);
         self.loading.insert(pos, *next);
         io.load_octree_section(dir.to_owned(), dim.to_owned(), pos, *next, for_write);
@@ -462,14 +467,13 @@ pub fn ingest_chunk(
     source: IngestSource,
 ) {
     let mut p = PIPELINE.lock().unwrap();
-    let cull = (source == IngestSource::Distant && dim != "minecraft:the_nether")
-        .then(|| (60, p.mapper.block_named(host, "minecraft:stone")));
+    let skip_below_floor = source == IngestSource::Distant && dim != "minecraft:the_nether";
     let mapper = std::cell::RefCell::new(&mut p.mapper);
     let edit = ChunkEdit::capture(
         chunk,
         snapshot,
         source,
-        cull,
+        skip_below_floor,
         &mut |state| mapper.borrow_mut().block(host, state),
         &mut |biome| mapper.borrow_mut().biome(biome),
     );
@@ -507,20 +511,16 @@ impl Pipeline {
             disk.loading.remove(&pos);
             match result {
                 Ok(Some((section, mapping))) => {
+                    disk.hits.insert(pos);
                     let section = remap(&mut self.mapper, section, mapping);
-                    if self
-                        .stores
+                    self.stores
                         .entry(dimension.clone())
                         .or_default()
-                        .adopt_cached(section)
-                    {
-                        self.queue(&dimension, [pos]);
-                    }
+                        .adopt_cached(section);
+                    self.queue(&dimension, [pos]);
                 }
                 Ok(None) => {
-                    if !disk.pending.is_empty() {
-                        disk.missing.insert(pos);
-                    }
+                    disk.missing.insert(pos);
                 }
                 Err(e) => {
                     disk.failed.insert(pos);
@@ -544,10 +544,7 @@ impl Pipeline {
         let needed = disk.needed(store);
         let mut waiting = false;
         for &pos in &needed {
-            if store.section(pos).is_some()
-                || disk.missing.contains(&pos)
-                || disk.failed.contains(&pos)
-            {
+            if disk.probed(&pos) {
                 continue;
             }
             if final_pass {
@@ -584,7 +581,6 @@ impl Pipeline {
                 }
             }
         }
-        disk.missing.clear();
         let touched = store.take_dirty();
         self.unsaved
             .entry(dim.to_owned())
@@ -594,21 +590,29 @@ impl Pipeline {
     }
 }
 
-/// Start a fresh server lifetime, including when the same path is reopened.
-pub fn reset_server_intake() {
-    let old_dimensions: Vec<_> = PIPELINE.lock().unwrap().disk.keys().cloned().collect();
-    for dim in old_dimensions {
-        clear_dimension(&dim);
-    }
-}
-
-/// Drops every section of `dim` at the start of a fresh server lifetime.
-fn clear_dimension(dim: &str) {
-    MESH_WORKER.clear_dim(dim);
-    PIPELINE.lock().unwrap().clear_dimension(dim);
+/// Retire all terrain from the last connection or server, retaining resource assets and the
+/// monotonically increasing mesh/probe IDs. No client tick can enqueue uploads during this reset.
+pub(crate) fn reset_world(io: &LodIoWorker) {
+    let mut p = PIPELINE.lock().unwrap();
+    p.reset_world(io);
+    MESH_WORKER.clear();
+    PLAYER_XZ.lock().unwrap().clear();
+    crate::render_bridge::clear_sections(None);
 }
 
 impl Pipeline {
+    fn reset_world(&mut self, io: &LodIoWorker) {
+        io.reset_world();
+        self.stores.clear();
+        self.dirty.clear();
+        self.queued.clear();
+        self.section_epoch.clear();
+        self.rendered.clear();
+        self.unsaved.clear();
+        self.requested.clear();
+        self.disk.clear();
+    }
+
     fn clear_dimension(&mut self, dim: &str) {
         self.stores.remove(dim);
         self.dirty.remove(dim);
@@ -619,6 +623,18 @@ impl Pipeline {
         self.requested.remove(dim);
         self.disk.remove(dim);
     }
+}
+
+/// A client level change retires that level's rendering, not its terrain or the session.
+pub(crate) fn client_level_unload(dim: &str) {
+    let mut p = PIPELINE.lock().unwrap();
+    MESH_WORKER.clear_dim(dim);
+    p.section_epoch.retain(|(d, _), _| d != dim);
+    p.rendered.remove(dim);
+    if let Some(positions) = p.stores.get(dim).map(OctreeIngestStore::section_positions) {
+        p.queue(dim, positions);
+    }
+    crate::render_bridge::clear_sections(Some(dim));
 }
 
 /// A resource reload, shader-pack change or `/ds remesh` invalidates every baked model: bake them
@@ -1144,15 +1160,14 @@ pub fn finish_server_io(
     dir: Option<&Path>,
     unloading: Option<&str>,
 ) {
+    let mut p = PIPELINE.lock().unwrap();
+    p.finish_server_io(io, dir, unloading, |mapper, section, mapping| {
+        mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
+    });
     if let Some(dim) = unloading {
         MESH_WORKER.clear_dim(dim);
+        crate::render_bridge::clear_sections(Some(dim));
     }
-    PIPELINE
-        .lock()
-        .unwrap()
-        .finish_server_io(io, dir, unloading, |mapper, section, mapping| {
-            mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
-        });
 }
 
 impl Pipeline {
@@ -1166,7 +1181,9 @@ impl Pipeline {
         let dims: Vec<_> = self
             .disk
             .iter()
-            .filter(|(_, disk)| !disk.pending.is_empty())
+            .filter(|(dim, disk)| {
+                !disk.pending.is_empty() && unloading.is_none_or(|level| dim.as_str() == level)
+            })
             .map(|(dim, _)| dim.clone())
             .collect();
         if let Some(dir) = dir {
@@ -1181,10 +1198,7 @@ impl Pipeline {
             self.flush_saves(io, dir, usize::MAX);
             io.flush();
         } else {
-            for dim in dims
-                .into_iter()
-                .filter(|d| unloading.is_none_or(|level| d.as_str() == level))
-            {
+            for dim in dims {
                 let disk = self.disk.get_mut(&dim).unwrap();
                 let store = self.stores.entry(dim.clone()).or_default();
                 for pos in disk.needed(store) {
@@ -1328,6 +1342,7 @@ pub fn install_sync_source() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::TestTempDir;
 
     const DIM: &str = "minecraft:overworld";
 
@@ -1355,18 +1370,12 @@ mod tests {
         }
     }
 
-    fn fixture_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ds-cache-gate-{name}-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        dir
-    }
-
     fn stage_live(p: &mut Pipeline, chunk: [i32; 2], block: u32) {
         let edit = ChunkEdit::capture(
             chunk,
             &LiveChunk(block),
             IngestSource::Loaded,
-            None,
+            false,
             &mut |b| b,
             &mut |_| 0,
         );
@@ -1383,9 +1392,98 @@ mod tests {
     }
 
     #[test]
+    fn resident_unprobed_sections_never_substitute_for_a_cache_read() {
+        use crate::storage::RegionCache;
+        let dir = TestTempDir::new("resident-unprobed");
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let remote = Voxel::new(3, 0, 6, 0);
+        let sibling = Voxel::new(2, 0, 10, 0);
+        let mut cache = OctreeSection::new(pos);
+        cache.set(17, 0, 0, sibling);
+        RegionCache::default()
+            .save_octree_section(
+                &dir,
+                DIM,
+                &cache,
+                &OctreeMapping::default(),
+                DEFAULT_OCTREE_COMPRESSION,
+            )
+            .unwrap();
+        p.stores
+            .entry(DIM.into())
+            .or_default()
+            .replace_section(OctreeSection::filled(pos, remote));
+        stage_live(&mut p, [0, 0], 1);
+        p.advance_intake(&io, &dir, DIM, false);
+        assert!(p.disk[DIM].loading.contains_key(&pos));
+        assert_eq!(p.flush_saves(&io, &dir, usize::MAX), 0);
+        io.flush();
+        adopt_fixture(&mut p, &io, &dir);
+        let merged = p.stores[DIM].section(pos).unwrap();
+        assert_eq!(merged.get(0, 0, 0).block_id(), 1);
+        assert_eq!(merged.get(17, 0, 0), sibling);
+        assert!(merged.to_dense().into_iter().all(|v| v != remote));
+    }
+
+    #[test]
+    fn remote_residency_in_any_dimension_is_not_saved_into_a_new_local_world() {
+        use crate::storage::RegionCache;
+        let dir = TestTempDir::new("remote-then-local");
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let remote = Voxel::new(3, 0, 6, 0);
+        for dim in [DIM, "minecraft:the_nether"] {
+            p.stores
+                .entry(dim.into())
+                .or_default()
+                .replace_section(OctreeSection::filled(pos, remote));
+        }
+        p.requested.entry(DIM.into()).or_default().insert(pos);
+        p.section_epoch.insert((DIM.into(), pos), 8);
+        p.next_epoch = 8;
+        assert!(
+            p.disk.is_empty(),
+            "remote residency did not create a disk entry"
+        );
+        p.reset_world(&io);
+        assert!(p.stores.is_empty());
+        assert!(p.requested.is_empty());
+        assert!(p.section_epoch.is_empty());
+        assert_eq!(
+            p.next_epoch, 8,
+            "new meshes cannot reuse old epoch identities"
+        );
+
+        let sibling = Voxel::new(2, 0, 10, 0);
+        let mut disk = OctreeSection::new(pos);
+        disk.set(17, 0, 0, sibling);
+        RegionCache::default()
+            .save_octree_section(
+                &dir,
+                DIM,
+                &disk,
+                &OctreeMapping::default(),
+                DEFAULT_OCTREE_COMPRESSION,
+            )
+            .unwrap();
+        stage_live(&mut p, [0, 0], 1);
+        p.finish_server_io(&io, Some(&dir), Some(DIM), |_, section, _| section);
+        let (reopened, _) = RegionCache::default()
+            .load_octree_section(&dir, DIM, pos)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.get(0, 0, 0).block_id(), 1);
+        assert_eq!(reopened.get(17, 0, 0), sibling);
+        assert!(reopened.to_dense().into_iter().all(|v| v != remote));
+    }
+
+    #[test]
     fn cold_live_snapshots_merge_the_slot_and_only_their_aligned_ancestor_footprint() {
         use crate::storage::{RegionCache, octree_region_path};
-        let dir = fixture_dir("snapshot");
+        let dir = TestTempDir::new("snapshot");
         let pos = OctreeSectionPos::new(0, 0, 0, 0);
         let parent = pos.parent().unwrap();
         let air = Voxel::air_with_light(15, 0);
@@ -1464,14 +1562,13 @@ mod tests {
             .unwrap();
         assert_eq!(section.get(0, 0, 0).block_id(), 3);
         assert_eq!(section.get(16, 0, 0), neighbor);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn malformed_probes_allow_rebuild_but_io_failure_does_not_block_valid_siblings() {
         use crate::storage::{RegionCache, octree_region_path};
         use std::fs;
-        let dir = fixture_dir("failed-probe");
+        let dir = TestTempDir::new("failed-probe");
         let failed = OctreeSectionPos::new(0, 0, 0, 0);
         let truncated = OctreeSectionPos::new(0, 8, 0, 0);
         let corrupt = OctreeSectionPos::new(0, 16, 0, 0);
@@ -1524,7 +1621,7 @@ mod tests {
     #[test]
     fn level_unload_saves_unqueued_dirty_sections_and_applies_waiting_edits() {
         use crate::storage::RegionCache;
-        let dir = fixture_dir("unload");
+        let dir = TestTempDir::new("unload");
         let io = LodIoWorker::spawn();
         let mut p = Pipeline::default();
         let dirty = OctreeSectionPos::new(0, 0, 0, 0);
@@ -1576,7 +1673,6 @@ mod tests {
         assert_eq!(merged.get(0, 0, 0), Voxel::air_with_light(15, 0));
         assert_eq!(merged.get(16, 0, 0), sibling);
         drop(fresh);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

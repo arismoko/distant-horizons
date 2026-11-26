@@ -618,7 +618,7 @@ pub type SectionKey = (String, u8, [i32; 3]);
 struct ArenaState {
     arena: GpuArena,
     /// Shared quad index pattern (`0,1,2,2,1,3` per quad) the indirect commands index into.
-    quad_mesh: mod_api::MeshRef,
+    quad_mesh: Option<mod_api::MeshRef>,
     ids: HashMap<SectionKey, u32>,
 }
 
@@ -718,11 +718,14 @@ fn try_upload_pending(
         let quad_mesh = create_quad_mesh(host)?;
         *guard = Some(ArenaState {
             arena: GpuArena::new(host, config)?,
-            quad_mesh,
+            quad_mesh: Some(quad_mesh),
             ids: HashMap::new(),
         });
     }
     let state = guard.as_mut().unwrap();
+    if state.quad_mesh.is_none() {
+        state.quad_mesh = Some(create_quad_mesh(host)?);
+    }
     poll_node_requests(&*host);
     if let Some((models, tints, atlas_mips)) = PENDING_TABLES.lock().unwrap().take() {
         let wrote_models = report("write models", state.arena.write_models(host, 0, &models));
@@ -795,26 +798,33 @@ fn try_upload_pending(
     state.arena.flush(host)
 }
 
-/// Drops every section of `dimension` (world / dimension change); the buffers stay.
-pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaError> {
+/// Retire terrain content, not GPU allocations or the baked asset tables.
+pub(crate) fn clear_sections(dimension: Option<&str>) {
     let mut guard = ARENA.lock().unwrap();
-    let Some(state) = guard.as_mut() else {
-        return Ok(());
-    };
-    let doomed: Vec<_> = state
-        .ids
-        .keys()
-        .filter(|k| k.0 == dimension)
-        .cloned()
-        .collect();
-    let mut result = Ok(());
-    for key in doomed {
-        let id = state.ids.remove(&key).unwrap();
-        if let Err(e) = state.arena.remove(id) {
-            result = Err(e);
-        }
+    let keep = |key: &SectionKey| dimension.is_some_and(|dim| key.0 != dim);
+    PENDING_SECTIONS
+        .lock()
+        .unwrap()
+        .retain(|(key, _)| keep(key));
+    *PENDING_READBACK.lock().unwrap() = None;
+    GPU_NODE_REQUESTS.lock().unwrap().clear();
+    PREPARED.lock().unwrap().clear();
+    if let Some(state) = guard.as_mut() {
+        state.ids.retain(|key, id| {
+            if keep(key) {
+                return true;
+            }
+            report("remove section", state.arena.remove(*id));
+            false
+        });
     }
-    result
+}
+
+/// Sunrise retires mesh handles on world close and asset reload. The terrain arena survives.
+pub(crate) fn invalidate_quad_mesh() {
+    if let Some(state) = ARENA.lock().unwrap().as_mut() {
+        state.quad_mesh = None;
+    }
 }
 
 static FRAME_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1153,6 +1163,9 @@ pub fn prepare_draws(
     };
     let guard = ARENA.lock().unwrap();
     let Some(state) = guard.as_ref() else { return };
+    let Some(quad_mesh) = state.quad_mesh else {
+        return;
+    };
     let arena = &state.arena;
     let sections = arena.section_high_water();
     if !frame.enabled || sections == 0 {
@@ -1229,7 +1242,7 @@ pub fn prepare_draws(
             context.draw_mesh(
                 TRANSLUCENT_STAGE,
                 ssao_apply,
-                state.quad_mesh,
+                quad_mesh,
                 mod_api::MeshDraw::indexed(0..3, 0),
                 &bindings,
             ),
@@ -1284,8 +1297,7 @@ pub fn prepare_draws(
                 .storage_buffer("BiomeTintBuffer", s.biome_tints)
                 .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
         };
-        let mut draw =
-            IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(state.quad_mesh);
+        let mut draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(quad_mesh);
         if use_count_buf {
             draw = draw.with_count_buffer(arena.trans_sort_meta, count_offset);
         }
@@ -1326,7 +1338,7 @@ pub fn prepare_draws(
             arena.opaque_command_count(),
             &bindings,
         )
-        .with_mesh(state.quad_mesh);
+        .with_mesh(quad_mesh);
         if use_count_buf {
             draw = draw.with_count_buffer(arena.trans_sort_meta, OPAQUE_COUNT_OFFSET);
         }
@@ -1392,6 +1404,8 @@ pub struct DhRuntime {
 pub struct DhState {
     pub config: DhConfig,
     pub world_dir: Option<PathBuf>,
+    pub server_open: bool,
+    pub live_levels: HashSet<String>,
     pub active_dimension: String,
     pub camera: Option<CameraMatrices>,
     pub camera_pos: [f64; 3],
@@ -1444,6 +1458,8 @@ impl Default for DhState {
         Self {
             config: DhConfig::default(),
             world_dir: None,
+            server_open: false,
+            live_levels: HashSet::new(),
             active_dimension: "minecraft:overworld".to_owned(),
             camera: None,
             camera_pos: [0.0, 64.0, 0.0],
@@ -1490,9 +1506,8 @@ pub fn runtime() -> &'static Arc<DhRuntime> {
 /// Drains background IO results into the section store and returns this frame's parameters.
 pub fn begin_render_frame(camera: [f64; 3]) -> RenderFrameParams {
     let rt = runtime();
-    let io_responses = rt.io.drain_responses();
-
     let mut st = rt.inner.lock().unwrap();
+    let io_responses = rt.io.drain_responses();
     st.camera_pos = camera;
     st.has_camera = true;
 
@@ -1502,6 +1517,9 @@ pub fn begin_render_frame(camera: [f64; 3]) -> RenderFrameParams {
                 rt.saved_sections.fetch_add(1, Ordering::Relaxed);
             }
             IoResponse::Loaded { dimension, section } => {
+                if !st.live_levels.contains(&dimension) {
+                    continue;
+                }
                 let dim = st.dimensions.entry(dimension).or_default();
                 let newer = dim
                     .sections

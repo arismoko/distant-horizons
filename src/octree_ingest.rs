@@ -215,13 +215,9 @@ impl OctreeIngestStore {
         std::mem::take(&mut self.dirty)
     }
 
-    pub(crate) fn adopt_cached(&mut self, section: OctreeSection) -> bool {
-        let pos = section.pos;
-        if !self.adopt_section(section) {
-            return false;
-        }
-        self.restored.insert(pos);
-        true
+    pub(crate) fn adopt_cached(&mut self, section: OctreeSection) {
+        self.restored.insert(section.pos);
+        self.replace_section(section);
     }
 
     /// Replace a section with a newer copy from the server. Not marked dirty.
@@ -331,7 +327,7 @@ impl ChunkEdit {
         chunk: [i32; 2],
         snap: &S,
         source: IngestSource,
-        cave_cull: Option<(i32, u32)>,
+        skip_below_floor: bool,
         block_id: &mut dyn FnMut(S::Block) -> u32,
         biome_id: &mut dyn FnMut(&str) -> u16,
     ) -> Self {
@@ -339,7 +335,7 @@ impl ChunkEdit {
         let mut open = [true; VANILLA_SECTION * VANILLA_SECTION];
         for index in (0..snap.section_count()).rev() {
             let y0 = snap.min_y() + (index * VANILLA_SECTION) as i32;
-            if cave_cull.is_some() && y0 + VANILLA_SECTION as i32 <= DISTANT_SOLID_FLOOR {
+            if skip_below_floor && y0 + VANILLA_SECTION as i32 <= DISTANT_SOLID_FLOOR {
                 continue;
             }
             let uniform_id = snap.section_uniform_block(index).map(&mut *block_id);
@@ -368,7 +364,7 @@ impl ChunkEdit {
                 let y = y0 + ly as i32;
                 for lz in 0..VANILLA_SECTION {
                     for lx in 0..VANILLA_SECTION {
-                        let mut id = match uniform_id {
+                        let id = match uniform_id {
                             Some(id) => id,
                             None => snap.block(lx, y, lz).map_or(0, &mut *block_id),
                         };
@@ -377,11 +373,6 @@ impl ChunkEdit {
                         if id == 0 {
                             if *column_open {
                                 sky = 15;
-                            } else if let Some((cull_y, fill_id)) = cave_cull
-                                && fill_id != 0
-                                && y < cull_y
-                            {
-                                id = fill_id;
                             }
                         } else {
                             *column_open = false;
@@ -610,6 +601,7 @@ mod tests {
     struct MockChunk {
         blocks: HashMap<(usize, i32, usize), u32>,
         block_calls: Cell<usize>,
+        light: (u8, u8),
     }
 
     impl MockChunk {
@@ -617,6 +609,7 @@ mod tests {
             Self {
                 blocks: HashMap::new(),
                 block_calls: Cell::new(0),
+                light: (15, 0),
             }
         }
         fn put(&mut self, x: usize, y: i32, z: usize, b: u32) {
@@ -645,7 +638,7 @@ mod tests {
             Some("minecraft:plains")
         }
         fn light(&self, _: usize, _: i32, _: usize) -> (u8, u8) {
-            (15, 0)
+            self.light
         }
     }
 
@@ -655,7 +648,7 @@ mod tests {
         c: &MockChunk,
         src: IngestSource,
     ) -> bool {
-        ChunkEdit::capture(chunk, c, src, None, &mut |b| b, &mut |_| 7).apply(
+        ChunkEdit::capture(chunk, c, src, false, &mut |b| b, &mut |_| 7).apply(
             store,
             &|_| true,
             0,
@@ -710,6 +703,26 @@ mod tests {
         // Chunk (0,0) occupies the +x/+z corner half of octree section (0, y, 0).
         assert!(store.section(OctreeSectionPos::new(0, 0, 0, 0)).is_some());
         assert!(store.section(OctreeSectionPos::new(0, 0, 1, 0)).is_some());
+    }
+
+    #[test]
+    fn detached_air_below_an_overhang_keeps_snapshot_light() {
+        let mut chunk = MockChunk::new();
+        chunk.put(0, 55, 0, STONE);
+        chunk.light = (4, 7);
+        let mut store = OctreeIngestStore::new();
+        ChunkEdit::capture(
+            [0, 0],
+            &chunk,
+            IngestSource::Distant,
+            true,
+            &mut |b| b,
+            &mut |_| 7,
+        )
+        .apply(&mut store, &|_| true, 0, &|_| 15);
+        assert_eq!(store.voxel_at(0, 55, 0).block_id(), STONE);
+        assert_eq!(store.voxel_at(0, 54, 0), Voxel::air_with_light(4, 7));
+        assert_eq!(store.voxel_at(0, 56, 0), Voxel::air_with_light(15, 7));
     }
 
     #[test]
@@ -890,7 +903,7 @@ mod tests {
                     chunk,
                     &c,
                     IngestSource::Loaded,
-                    None,
+                    false,
                     &mut |b| b,
                     &mut |_| 7
                 )
@@ -921,7 +934,7 @@ mod tests {
             [0, 0],
             &c,
             IngestSource::Loaded,
-            None,
+            false,
             &mut |b| b,
             &mut |_| 7,
         )
