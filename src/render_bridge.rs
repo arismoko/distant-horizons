@@ -298,7 +298,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
             id(PIPELINE_SSAO_APPLY),
             id(SHADER_SSAO_APPLY),
             mod_api::PipelineBlend::Translucent,
-            mod_api::WorldDepth::Ignored,
+            mod_api::WorldDepth::ThroughWalls,
         )
         .topology(mod_api::PrimitiveTopology::Triangles)
         .cull(false)
