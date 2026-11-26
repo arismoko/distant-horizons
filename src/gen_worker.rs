@@ -438,10 +438,13 @@ impl GenWorkerPool {
 
     /// Cancel all queued and running work and join every worker thread on world close.
     pub fn shutdown_and_join(&self) {
-        self.shutdown_and_join_with(|| {});
+        self.shutdown_and_join_inner(
+            #[cfg(test)]
+            || {},
+        );
     }
 
-    fn shutdown_and_join_with(&self, before_join: impl FnOnce()) {
+    fn shutdown_and_join_inner(&self, #[cfg(test)] before_join: impl FnOnce()) {
         // Keep start and resize out until every slot has joined. Workers never take this lock.
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         {
@@ -461,6 +464,7 @@ impl GenWorkerPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        #[cfg(test)]
         before_join();
         for handle in handles.drain(..) {
             let _ = handle.join();
@@ -820,7 +824,7 @@ mod tests {
         pool.handles.lock().unwrap().push(worker);
 
         // Release the final batch only after the pre-join clears and stop publication.
-        pool.shutdown_and_join_with(|| release.send(()).unwrap());
+        pool.shutdown_and_join_inner(|| release.send(()).unwrap());
         assert_eq!(finished.try_recv(), Ok(()));
         // Inspect the buffer directly: drain_for_dim would hide stale output via its epoch check.
         assert!(pool.shared.done.lock().unwrap().is_empty());
