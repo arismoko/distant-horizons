@@ -179,7 +179,7 @@ impl Default for DhConfig {
             horizontal_quality: 1,
             vertical_quality: 1,
             distant_generation: true,
-            distant_generation_mode: 2,
+            distant_generation_mode: 1,
             cave_culling_enabled: true,
             cave_culling_height: 60,
             fog_enabled: true,
@@ -302,7 +302,7 @@ impl DhConfig {
                     "distantsunrises.setting.gen_mode.features",
                     "distantsunrises.setting.gen_mode.full",
                 ],
-                2,
+                1,
             )
             .tooltip("distantsunrises.setting.distant_generation_mode.tooltip"),
             SettingSpec::toggle(
