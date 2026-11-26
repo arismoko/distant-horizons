@@ -308,6 +308,14 @@ pub(crate) struct OctreeRecord {
     pub(crate) footprint: ColumnFootprint,
 }
 
+impl OctreeRecord {
+    /// No authored column and only air (light may differ): nothing worth allocating a slot for.
+    /// The canonical palette lists only voxels in use, so this covers every voxel.
+    pub(crate) fn is_untouched_air(&self) -> bool {
+        self.footprint.is_empty() && self.rle.palette.iter().all(|voxel| voxel.is_air())
+    }
+}
+
 impl From<&OctreeSection> for OctreeRecord {
     fn from(section: &OctreeSection) -> Self {
         Self {
