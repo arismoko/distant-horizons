@@ -925,8 +925,39 @@ pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
     queued
 }
 
+/// Level-0 section rows (`y`) the sweeps cover; level `n` covers them shifted right by `n`.
+const Y_SECTIONS: std::ops::RangeInclusive<i32> = -2..=9;
+
+/// The sections the GPU traversal asked for (`render_bridge::drain_gpu_node_requests`: finer
+/// children of visible nodes) that the store lacks and nobody asked for yet, at most `budget`,
+/// marked as requested. Positions outside the vertical range the sweeps cover are ignored.
+fn take_gpu_requested(
+    store: Option<&OctreeIngestStore>,
+    requested: &mut HashSet<OctreeSectionPos>,
+    budget: usize,
+) -> Vec<OctreeSectionPos> {
+    let mut out = Vec::new();
+    for (detail, [x, y, z]) in crate::render_bridge::drain_gpu_node_requests() {
+        if out.len() >= budget {
+            break;
+        }
+        if detail > crate::octree::MAX_OCTREE_DETAIL
+            || !(Y_SECTIONS.start() >> detail..=Y_SECTIONS.end() >> detail).contains(&y)
+        {
+            continue;
+        }
+        let pos = OctreeSectionPos::new(detail, x, y, z);
+        if store.is_some_and(|s| s.section(pos).is_some()) || !requested.insert(pos) {
+            continue;
+        }
+        out.push(pos);
+    }
+    out
+}
+
 /// Ask disk (single player and server) for stored sections around `center` that the store does not
-/// hold yet: every level from fine to coarse, `radius` sections out, at most `budget` requests.
+/// hold yet: first what the GPU traversal asked for, then every level from fine to coarse,
+/// `radius` sections out, at most `budget` requests.
 pub fn request_stored_sections(
     io: &LodIoWorker,
     world_dir: &Path,
@@ -935,12 +966,15 @@ pub fn request_stored_sections(
     radius: i32,
     budget: usize,
 ) {
-    const Y_SECTIONS: std::ops::RangeInclusive<i32> = -2..=9;
     let mut guard = PIPELINE.lock().unwrap();
     let p = &mut *guard;
     let requested = p.requested.entry(dim.to_owned()).or_default();
     let store = p.stores.get(dim);
     let mut left = budget;
+    for pos in take_gpu_requested(store, requested, left) {
+        io.load_octree_section(world_dir.to_owned(), dim.to_owned(), pos);
+        left -= 1;
+    }
     for level in 0..=crate::octree::MAX_OCTREE_DETAIL {
         let edge = (crate::octree::SECTION_EDGE as f64) * f64::from(1u32 << level);
         let (cx, cz) = (
@@ -1046,6 +1080,7 @@ pub fn client_sync(
         let p = &mut *guard;
         let requested = p.requested.entry(dim.to_owned()).or_default();
         let store = p.stores.get(dim);
+        want.extend(take_gpu_requested(store, requested, budget));
         let edge = crate::octree::SECTION_EDGE as f64;
         let (cx, cz) = (
             (center[0] / edge).floor() as i32,
@@ -1054,14 +1089,14 @@ pub fn client_sync(
         'scan: for sx in cx - radius..=cx + radius {
             for sz in cz - radius..=cz + radius {
                 for sy in -2..=9 {
+                    if want.len() >= budget {
+                        break 'scan;
+                    }
                     let pos = OctreeSectionPos::new(0, sx, sy, sz);
                     if store.is_some_and(|s| s.section(pos).is_some()) || !requested.insert(pos) {
                         continue;
                     }
                     want.push(pos);
-                    if want.len() >= budget {
-                        break 'scan;
-                    }
                 }
             }
         }
