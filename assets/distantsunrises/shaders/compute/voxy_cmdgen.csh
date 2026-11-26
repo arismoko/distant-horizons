@@ -30,6 +30,7 @@ layout(std140) uniform CmdgenParams {
 };
 
 layout(std430) readonly buffer SectionBuffer { SectionMeta sections[]; };
+layout(std430) readonly buffer VisibilityBuffer { uint visible_flags[]; };
 layout(std430) buffer OpaqueCommands { DrawCommand opaque_cmds[]; };
 layout(std430) buffer TranslucentCommands { DrawCommand translucent_cmds[]; };
 layout(std430) buffer TransSortMeta {
@@ -133,7 +134,7 @@ void main() {
     vec3 mn = corner + vec3(aabb_off) * scale;
     vec3 mx = mn + vec3(aabb_size) * scale;
 
-    bool visible = live && !outside_frustum(mn, mx) && !occluded_by_hiz(mn, mx);
+    bool visible = live && visible_flags[id] != 0u && !outside_frustum(mn, mx) && !occluded_by_hiz(mn, mx);
 
     // Face bucket visibility from the section's position relative to the camera section
     // (a face pointing away from the camera cannot be seen), per Voxy cmdgen's `msk`.

@@ -287,13 +287,11 @@ pub fn mesh_octree_section_masked(
                         }
                     } else if neighbor.is_none()
                         && ((face == Face::NegY && section.pos.y == 0)
-                            || (section.pos.detail >= 3 && face != Face::PosY))
+                            || (section.pos.detail >= 1 && face != Face::PosY))
                     {
                         // Never emit underside faces into unloaded void below the solid floor
-                        // (`y = 0`), and at the outermost horizon rings (`detail >= 3`) never emit
-                        // giant vertical side walls along the unloaded edge of the generated world.
-                        // Keep side faces at `detail <= 2` so mountain cliffs beside empty air
-                        // sections never open horizontal sky gaps.
+                        // (`y = 0`), and at coarse LODs (`detail >= 1`) never emit giant vertical
+                        // side walls along the unloaded edge of the generated world.
                         continue;
                     }
                     if let Some(nv) = neighbor

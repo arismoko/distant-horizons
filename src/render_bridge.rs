@@ -33,6 +33,9 @@ use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
 pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
 pub const SHADER_HIZ: &str = "distantsunrises:voxy_hiz";
+pub const SHADER_TRAV_INIT: &str = "distantsunrises:voxy_trav_init";
+pub const SHADER_TRAV_CLEAR: &str = "distantsunrises:voxy_trav_clear";
+pub const SHADER_TRAVERSAL: &str = "distantsunrises:voxy_traversal";
 pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
 pub const SHADER_TRANS_CLEAR: &str = "distantsunrises:voxy_trans_clear";
 pub const SHADER_TRANS_PREFIX: &str = "distantsunrises:voxy_trans_prefix";
@@ -49,6 +52,7 @@ pub const PIPELINE_PACK_SHADOW: &str = "distantsunrises:voxy_pack_shadow";
 
 /// Compute workgroup sizes; must match `local_size_*` in the `.csh` files.
 pub const CMDGEN_WORKGROUP: u32 = 128;
+pub const TRAV_WORKGROUP: u32 = 64;
 pub const HIZ_WORKGROUP: u32 = 8;
 
 fn id(text: &str) -> mod_api::Identifier {
@@ -211,6 +215,51 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
             .build(),
     );
     event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_trav_init"), id(SHADER_TRAV_INIT))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .uniform_buffer("TravInitParams", 16)
+                    .entry(storage("RootBuffer", true, 4))
+                    .entry(storage("VisibilityBuffer", false, 4))
+                    .entry(storage("QueueA", false, 20))
+                    .entry(storage("DispatchA", false, 16))
+                    .build()
+                    .expect("static trav_init layout"),
+            )
+            .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_trav_clear"), id(SHADER_TRAV_CLEAR))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .entry(storage("QueueOut", false, 20))
+                    .entry(storage("DispatchOut", false, 16))
+                    .build()
+                    .expect("static trav_clear layout"),
+            )
+            .build(),
+    );
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_traversal"), id(SHADER_TRAVERSAL))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .uniform_buffer("TraversalParams", 128)
+                    .entry(storage("NodeBuffer", true, 32))
+                    .entry(storage("QueueIn", true, 20))
+                    .entry(storage("QueueOut", false, 20))
+                    .entry(storage("DispatchOut", false, 16))
+                    .entry(storage("VisibilityBuffer", false, 4))
+                    .sampler(
+                        "HizPyramid",
+                        SamplerFilter::Nearest,
+                        SamplerAddress::ClampToEdge,
+                    )
+                    .build()
+                    .expect("static traversal layout"),
+            )
+            .build(),
+    );
+    event.compute_pipeline(
         ComputePipeline::builder(
             id("distantsunrises:voxy_trans_clear"),
             id(SHADER_TRANS_CLEAR),
@@ -229,6 +278,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                 BindGroupLayout::builder()
                     .uniform_buffer("CmdgenParams", 112)
                     .entry(storage("SectionBuffer", true, 32))
+                    .entry(storage("VisibilityBuffer", true, 4))
                     .entry(storage("OpaqueCommands", false, 20))
                     .entry(storage("TranslucentCommands", false, 20))
                     .entry(storage("TransSortMeta", false, 2056))
@@ -697,6 +747,9 @@ pub fn setup_compute(
     let ids = [
         "voxy_hiz_copy",
         "voxy_hiz_reduce",
+        "voxy_trav_init",
+        "voxy_trav_clear",
+        "voxy_traversal",
         "voxy_trans_clear",
         "voxy_cmdgen",
         "voxy_trans_prefix",
@@ -706,6 +759,9 @@ pub fn setup_compute(
     let [
         Ok(copy),
         Ok(reduce),
+        Ok(trav_init),
+        Ok(trav_clear),
+        Ok(traversal),
         Ok(trans_clear),
         Ok(cmdgen),
         Ok(trans_prefix),
@@ -714,6 +770,11 @@ pub fn setup_compute(
     else {
         return;
     };
+    let root_count = arena.root_count();
+    let dispatch_a_ref = arena.dispatch_a;
+    let dispatch_b_ref = arena.dispatch_b;
+    let focal_px = (h as f32 * 0.5 * camera.projection[5].abs()).max(1.0);
+    let lod_threshold = 2.0f32;
     let Some((hiz, _)) = ensure_hiz(host, [w, h]) else {
         return;
     };
@@ -756,6 +817,78 @@ pub fn setup_compute(
             );
             (sw, sh) = (dw, dh);
         }
+        let init_threads = sections.max(root_count).max(1);
+        let init_params = Std140(Vec::with_capacity(16))
+            .u32s(&[
+                sections,
+                root_count,
+                crate::gpu_arena::GPU_TRAV_QUEUE_CAP,
+                0,
+            ])
+            .0;
+        let init_bindings = DrawBindings::new()
+            .inline_uniform("TravInitParams", &init_params)
+            .storage_buffer("RootBuffer", slices.roots)
+            .storage_buffer("VisibilityBuffer", slices.visibility)
+            .storage_buffer("QueueA", slices.queue_a)
+            .storage_buffer("DispatchA", slices.dispatch_a);
+        report(
+            "trav_init dispatch",
+            ctx.dispatch(
+                trav_init,
+                &init_bindings,
+                [init_threads.div_ceil(TRAV_WORKGROUP), 1, 1],
+            ),
+        );
+        let (base, sub) = camera_split(camera.position);
+        let trav_params = Std140(Vec::with_capacity(128))
+            .f32s(&view_proj)
+            .i32s(&[
+                base[0],
+                base[1],
+                base[2],
+                crate::gpu_arena::GPU_TRAV_QUEUE_CAP as i32,
+            ])
+            .f32s(&[sub[0], sub[1], sub[2], focal_px])
+            .i32s(&[w as i32, h as i32, mips as i32, 1])
+            .f32s(&[lod_threshold, 0.0, 0.0, 0.0])
+            .0;
+        for iter in 0..=crate::octree::MAX_OCTREE_DETAIL {
+            let (q_in, q_out, d_in_ref, d_out) = if iter % 2 == 0 {
+                (
+                    slices.queue_a,
+                    slices.queue_b,
+                    dispatch_a_ref,
+                    slices.dispatch_b,
+                )
+            } else {
+                (
+                    slices.queue_b,
+                    slices.queue_a,
+                    dispatch_b_ref,
+                    slices.dispatch_a,
+                )
+            };
+            let tclear_bindings = DrawBindings::new()
+                .storage_buffer("QueueOut", q_out)
+                .storage_buffer("DispatchOut", d_out);
+            report(
+                "trav_clear dispatch",
+                ctx.dispatch(trav_clear, &tclear_bindings, [1, 1, 1]),
+            );
+            let trav_bindings = DrawBindings::new()
+                .inline_uniform("TraversalParams", &trav_params)
+                .storage_buffer("NodeBuffer", slices.nodes)
+                .storage_buffer("QueueIn", q_in)
+                .storage_buffer("QueueOut", q_out)
+                .storage_buffer("DispatchOut", d_out)
+                .storage_buffer("VisibilityBuffer", slices.visibility)
+                .texture("HizPyramid", hiz.all_mips());
+            report(
+                "traversal dispatch_indirect",
+                ctx.dispatch_indirect(traversal, &trav_bindings, d_in_ref, 0),
+            );
+        }
         let clear_bindings =
             DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
         report(
@@ -766,6 +899,7 @@ pub fn setup_compute(
         let bindings = DrawBindings::new()
             .inline_uniform("CmdgenParams", &params)
             .storage_buffer("SectionBuffer", slices.sections)
+            .storage_buffer("VisibilityBuffer", slices.visibility)
             .storage_buffer("OpaqueCommands", slices.opaque_commands)
             .storage_buffer("TranslucentCommands", slices.translucent_commands)
             .storage_buffer("TransSortMeta", slices.trans_sort_meta)
