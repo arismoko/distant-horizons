@@ -448,11 +448,16 @@ fn model_words(index: usize, m: &BakedModel, atlas: &mut [u8]) -> [u32; MODEL_WO
         BakedTint::Water => 3,
     };
     let cutout = m.faces.iter().any(|f| f.cutout);
+    let mut face_tints = 0u32;
+    for (i, face) in m.faces.iter().enumerate() {
+        face_tints |= (u32::from(face.tint_state) & 3) << (16 + i * 2);
+    }
     w[12] = u32::from(m.flags & MODEL_TRANSLUCENT != 0)
         | 2
         | (u32::from(cutout) << 2)
         | (tint_kind << 4)
-        | (u32::from(m.dh_material_id & 0xF) << 8);
+        | (u32::from(m.dh_material_id & 0xF) << 8)
+        | face_tints;
     w[15] = m.mc_entity as u32;
     w
 }

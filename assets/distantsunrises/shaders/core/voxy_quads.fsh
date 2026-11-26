@@ -57,7 +57,14 @@ void main() {
     uint tile_origin = models[mbase + face];
     uint tile_size_packed = models[mbase + 14u];
     vec2 tile_px = vec2(float(tile_size_packed & 0xFFFFu), float(tile_size_packed >> 16));
+    uint face_tint_state = (mflags >> (16u + face * 2u)) & 3u;
+    vec3 tint = vec3(1.0);
+    bool has_tint = inter.y != 0xFFFFFFFFu && inter.y != 0u;
+    if (has_tint) {
+        tint = vec3(float(inter.y & 0xFFu), float((inter.y >> 8) & 0xFFu), float((inter.y >> 16) & 0xFFu)) / 255.0;
+    }
 
+    vec4 avg_albedo = unpack_rgba(models[mbase + 6u + face]);
     vec4 albedo;
     float tex_alpha;
     if (tile_px.x > 0.0) {
@@ -67,13 +74,65 @@ void main() {
         vec2 origin = vec2(float(tile_origin & 0xFFFFu), float(tile_origin >> 16));
         vec2 inset = vec2(0.5) / tile_px; // keep bilinear taps inside the tile
         vec2 p = (origin + clamp(f, inset, vec2(1.0) - inset) * tile_px) / atlas_px;
-        vec2 dx = dFdx(uv) * tile_px / atlas_px;
-        vec2 dy = dFdy(uv) * tile_px / atlas_px;
-        albedo = textureGrad(BlockAtlas, p, dx, dy);
-        tex_alpha = textureLod(BlockAtlas, p, 0.0).a;
+        vec4 c0 = textureLod(BlockAtlas, p, 0.0);
+        tex_alpha = c0.a;
+
+        // 3-level software mip chain (4x4 -> 2x2 -> 1x1 avg) driven by screen-space UV footprint.
+        // With Linear filtering on the 4x4 tile, sampling at (0.25, 0.75) quadrant centers gives
+        // the exact 2x2 mip average with zero bleed across tile borders.
+        vec2 duv_x = dFdx(uv);
+        vec2 duv_y = dFdy(uv);
+        float foot = max(length(duv_x), length(duv_y));
+        float lod = clamp(log2(max(foot * tile_px.x, 1.0)), 0.0, 2.0);
+
+        if (has_tint) {
+            if (tint_kind == 4u || face_tint_state == 2u) {
+                c0.rgb *= tint;
+                avg_albedo.rgb *= tint;
+            } else if (face_tint_state == 1u) {
+                bool grey0 = abs(c0.r - c0.g) < 0.06 && abs(c0.g - c0.b) < 0.06;
+                if (grey0) c0.rgb *= tint;
+                // Partial-tint faces (e.g. grass_block_side: 1/4 grass fringe + 3/4 dirt)
+                // blend smoothly toward a slightly grass-tinted earth tone at mip 2.
+                avg_albedo.rgb *= mix(vec3(1.0), tint, 0.25);
+            }
+        }
+
+        if (lod <= 0.01) {
+            albedo = c0;
+        } else {
+            // Exact 2x2 mip (mip 1) from the four quadrant centers of the 4x4 tile.
+            vec2 q00 = (origin + vec2(0.25, 0.25) * tile_px) / atlas_px;
+            vec2 q10 = (origin + vec2(0.75, 0.25) * tile_px) / atlas_px;
+            vec2 q01 = (origin + vec2(0.25, 0.75) * tile_px) / atlas_px;
+            vec2 q11 = (origin + vec2(0.75, 0.75) * tile_px) / atlas_px;
+            vec4 s00 = textureLod(BlockAtlas, q00, 0.0);
+            vec4 s10 = textureLod(BlockAtlas, q10, 0.0);
+            vec4 s01 = textureLod(BlockAtlas, q01, 0.0);
+            vec4 s11 = textureLod(BlockAtlas, q11, 0.0);
+            if (has_tint) {
+                if (tint_kind == 4u || face_tint_state == 2u) {
+                    s00.rgb *= tint; s10.rgb *= tint; s01.rgb *= tint; s11.rgb *= tint;
+                } else if (face_tint_state == 1u) {
+                    if (abs(s00.r - s00.g) < 0.06 && abs(s00.g - s00.b) < 0.06) s00.rgb *= tint;
+                    if (abs(s10.r - s10.g) < 0.06 && abs(s10.g - s10.b) < 0.06) s10.rgb *= tint;
+                    if (abs(s01.r - s01.g) < 0.06 && abs(s01.g - s01.b) < 0.06) s01.rgb *= tint;
+                    if (abs(s11.r - s11.g) < 0.06 && abs(s11.g - s11.b) < 0.06) s11.rgb *= tint;
+                }
+            }
+            vec4 c1 = 0.25 * (s00 + s10 + s01 + s11);
+            if (lod <= 1.0) {
+                albedo = mix(c0, c1, lod);
+            } else {
+                albedo = mix(c1, avg_albedo, lod - 1.0);
+            }
+        }
     } else {
-        albedo = unpack_rgba(models[mbase + 6u + face]);
+        albedo = avg_albedo;
         tex_alpha = albedo.a;
+        if (has_tint && (tint_kind == 4u || face_tint_state == 2u)) {
+            albedo.rgb *= tint;
+        }
     }
 
 #ifdef TRANSLUCENT
@@ -82,19 +141,6 @@ void main() {
     if (cutout && tex_alpha <= 0.1) discard;
     albedo.a = 1.0;
 #endif
-
-    // Biome / constant tint. Voxy's "partial" tint (grass-like grey texels only) is the
-    // conditional case: tint kinds 1-3 apply only to near-grey texels, kind 4 always.
-    if (inter.y != 0xFFFFFFFFu && inter.y != 0u) {
-        vec3 tint = vec3(float(inter.y & 0xFFu), float((inter.y >> 8) & 0xFFu), float((inter.y >> 16) & 0xFFu)) / 255.0;
-        bool grey = abs(albedo.r - albedo.g) < 0.02 && abs(albedo.g - albedo.b) < 0.02;
-        if (tint_kind == 4u || grey) {
-            albedo.rgb *= tint;
-        }
-    }
-
-    // Inside the radius vanilla's own chunks cover, vanilla draws the world.
-    if (length(rel_pos.xz) < depth_and_light.z) discard;
 
     bool hdr = flags.x != 0u;
     vec3 rgb = hdr ? srgb_to_linear(albedo.rgb) : albedo.rgb;

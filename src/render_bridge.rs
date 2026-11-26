@@ -72,7 +72,7 @@ pub fn quad_layout() -> mod_api::BindGroupLayout {
         .entry(storage("BiomeTintBuffer", true, 4))
         .sampler(
             "BlockAtlas",
-            SamplerFilter::Nearest,
+            SamplerFilter::Linear,
             SamplerAddress::ClampToEdge,
         )
         .build()
@@ -94,7 +94,7 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
         .entry(storage("BiomeTintBuffer", true, 4))
         .sampler(
             "BlockAtlas",
-            SamplerFilter::Nearest,
+            SamplerFilter::Linear,
             SamplerAddress::ClampToEdge,
         )
         .build()

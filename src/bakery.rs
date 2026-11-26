@@ -552,7 +552,16 @@ fn bake_face(
     if qs.is_empty() {
         return BakedFace::EMPTY;
     }
-    qs.sort_by(|x, y| x.depth.total_cmp(&y.depth));
+    qs.sort_by(|x, y| {
+        if (x.depth - y.depth).abs() <= 1e-3 {
+            // At equal depth (e.g. `grass_block_side` + `grass_block_side_overlay`), sample the
+            // tinted overlay first so its opaque grass fringe wins while its transparent bottom
+            // falls through to the base dirt texture.
+            y.tinted.cmp(&x.tinted)
+        } else {
+            x.depth.total_cmp(&y.depth)
+        }
+    });
     let nearest = qs[0].depth;
     // Voxy: a face deeper than -0.1 exists (`offset < -0.1` is empty).
     if nearest < -0.1 {
