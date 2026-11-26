@@ -1240,13 +1240,17 @@ impl Pipeline {
             for dim in &dims {
                 self.advance_intake(io, dir, dim, false);
             }
-            io.flush();
+            if let Err(failure) = io.flush() {
+                failure.report();
+            }
             self.accept_probes(io, dir, remap);
             for dim in &dims {
                 self.advance_intake(io, dir, dim, true);
             }
             self.flush_saves(io, dir, usize::MAX);
-            io.flush();
+            if let Err(failure) = io.flush() {
+                failure.report();
+            }
         } else {
             for dim in dims {
                 let disk = self.disk.get_mut(&dim).unwrap();
@@ -1473,7 +1477,7 @@ mod tests {
             .replace_section(section.clone());
         p.unsaved.entry(DIM.into()).or_default().insert(section.pos);
         assert_eq!(p.flush_saves(&io, &dir, 1), 1);
-        io.flush();
+        io.flush().unwrap();
         let (loaded, mapping) = crate::storage::RegionCache::default()
             .load_octree_section(&dir, DIM, section.pos)
             .unwrap()
@@ -1543,7 +1547,7 @@ mod tests {
         p.advance_intake(&io, &dir, DIM, false);
         assert!(p.disk[DIM].loading.contains_key(&pos));
         assert_eq!(p.flush_saves(&io, &dir, usize::MAX), 0);
-        io.flush();
+        io.flush().unwrap();
         adopt_fixture(&mut p, &io, &dir);
         let merged = p.stores[DIM].section(pos).unwrap();
         assert_eq!(merged.get(0, 0, 0).block_id(), 1);
@@ -1572,7 +1576,7 @@ mod tests {
         let mut disk = DiskIntake::default();
         disk.probe(&mut p.next_probe, &io, &dir, DIM, pos, false);
         p.disk.insert(DIM.to_owned(), disk);
-        io.flush();
+        io.flush().unwrap();
         p.accept_probes(&io, &dir, |_, section, _| section);
         assert_eq!(
             p.stores[DIM].section(pos).unwrap().revision,
@@ -1582,7 +1586,7 @@ mod tests {
 
         stage_live(&mut p, [0, 0], 2);
         assert!(p.advance_intake(&io, &dir, DIM, false).is_empty());
-        io.flush();
+        io.flush().unwrap();
         p.accept_probes(&io, &dir, |_, section, _| section);
         let changes = p.advance_intake(&io, &dir, DIM, false);
         assert!(changes.contains(&(pos, p.stores[DIM].section(pos).unwrap().revision)));
@@ -1794,10 +1798,10 @@ mod tests {
         assert_eq!(p.disk[DIM].loading[&pos], request, "reuse the warm probe");
         assert!(p.stores[DIM].section(pos).is_none());
         assert_eq!(p.flush_saves(&io, &dir, usize::MAX), 0);
-        io.flush();
+        io.flush().unwrap();
         adopt_fixture(&mut p, &io, &dir);
         assert!(p.flush_saves(&io, &dir, usize::MAX) > 0);
-        io.flush();
+        io.flush().unwrap();
         for (key, neighbor_x) in [(pos, 16), (parent, 8)] {
             let (section, _) = RegionCache::default()
                 .load_octree_section(&dir, DIM, key)
@@ -1812,10 +1816,10 @@ mod tests {
         let mut cold = Pipeline::default();
         stage_live(&mut cold, [0, 0], 3);
         cold.advance_intake(&io, &dir, DIM, false);
-        io.flush();
+        io.flush().unwrap();
         adopt_fixture(&mut cold, &io, &dir);
         assert!(cold.flush_saves(&io, &dir, usize::MAX) > 0);
-        io.flush();
+        io.flush().unwrap();
         drop(io);
         let (section, _) = RegionCache::default()
             .load_octree_section(&dir, DIM, pos)
@@ -1859,12 +1863,12 @@ mod tests {
             stage_live(&mut p, [pos.x * 2, 0], 1);
         }
         p.advance_intake(&io, &dir, DIM, false);
-        io.flush();
+        io.flush().unwrap();
         adopt_fixture(&mut p, &io, &dir);
         assert!(p.disk[DIM].failed.contains(&failed));
         assert!(p.stores[DIM].section(failed).is_none());
         p.flush_saves(&io, &dir, usize::MAX);
-        io.flush();
+        io.flush().unwrap();
         drop(io);
         assert_eq!(
             fs::read(failed_path.join("preserve")).unwrap(),
@@ -1903,7 +1907,7 @@ mod tests {
 
         stage_live(&mut p, [0, 0], 1);
         p.advance_intake(&io, &dir, DIM, false);
-        io.flush();
+        io.flush().unwrap();
         adopt_fixture(&mut p, &io, &dir);
         assert!(p.unsaved[DIM].contains(&dirty));
         assert!(
