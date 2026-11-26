@@ -25,7 +25,7 @@
 //! already exists there (a block broken since the last ingest must not leave stale voxels).
 
 use crate::octree::{
-    MAX_OCTREE_DETAIL, OctreeSection, OctreeSectionPos, SECTION_EDGE, Voxel, downsample_2x2x2,
+    MAX_OCTREE_DETAIL, OctreeSection, OctreeSectionPos, SECTION_EDGE, Voxel, downsample_2x2x2_onto,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
@@ -324,7 +324,7 @@ impl OctreeIngestStore {
                 };
                 let merged = {
                     let refs: [Option<&OctreeSection>; 8] = kids.map(|k| self.sections.get(&k));
-                    downsample_2x2x2(*parent, &refs, opacity)
+                    downsample_2x2x2_onto(*parent, self.sections.get(parent), &refs, opacity)
                 };
                 if merged.is_empty() && !self.sections.contains_key(parent) {
                     continue;
@@ -351,6 +351,22 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
     block_id: &mut dyn FnMut(S::Block) -> u32,
     biome_id: &mut dyn FnMut(&str) -> u16,
 ) -> bool {
+    ingest_chunk_culled(store, chunk, snap, src, None, block_id, biome_id)
+}
+
+/// Like [`ingest_chunk`], with optional underground cave culling `(max_y, fill_block)`:
+/// sections wholly below `y = 0` are skipped, and enclosed underground air (`!open` and
+/// `y < max_y`) is filled with `fill_block` (stone) so distant LOD chunks do not mesh invisible
+/// underground caves, ores, and lava pools.
+pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
+    store: &mut OctreeIngestStore,
+    chunk: [i32; 2],
+    snap: &S,
+    src: IngestSource,
+    cave_cull: Option<(i32, u32)>,
+    block_id: &mut dyn FnMut(S::Block) -> u32,
+    biome_id: &mut dyn FnMut(&str) -> u16,
+) -> bool {
     if !store.accept(chunk, src) {
         return false;
     }
@@ -364,6 +380,9 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
     let mut open = [true; VANILLA_SECTION * VANILLA_SECTION];
     for index in (0..snap.section_count()).rev() {
         let y0 = snap.min_y() + (index * VANILLA_SECTION) as i32;
+        if cave_cull.is_some() && y0 + VANILLA_SECTION as i32 <= DISTANT_SOLID_FLOOR {
+            continue;
+        }
         let pos = OctreeSectionPos::new(0, sx, y0.div_euclid(edge), sz);
         let off_y = y0.rem_euclid(edge) as usize;
 
@@ -407,7 +426,7 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
                 let y = y0 + ly as i32;
                 for lz in 0..VANILLA_SECTION {
                     for lx in 0..VANILLA_SECTION {
-                        let id = match uniform_id {
+                        let mut id = match uniform_id {
                             Some(id) => id,
                             None => snap.block(lx, y, lz).map_or(0, &mut *block_id),
                         };
@@ -416,6 +435,11 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
                         if id == 0 {
                             if *column_open {
                                 sky = 15;
+                            } else if let Some((cull_y, fill_id)) = cave_cull
+                                && fill_id != 0
+                                && y < cull_y
+                            {
+                                id = fill_id;
                             }
                         } else {
                             *column_open = false;

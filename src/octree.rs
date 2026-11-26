@@ -709,8 +709,21 @@ pub fn downsample_2x2x2(
     children: &[Option<&OctreeSection>; 8],
     opacity: &dyn Fn(u32) -> u8,
 ) -> OctreeSection {
+    downsample_2x2x2_onto(parent_pos, None, children, opacity)
+}
+
+/// Like [`downsample_2x2x2`], but when `existing` is `Some`, preserves any octant whose child is
+/// `None` so partial detail-0 propagation never wipes coarse terrain in sibling octants.
+pub fn downsample_2x2x2_onto(
+    parent_pos: OctreeSectionPos,
+    existing: Option<&OctreeSection>,
+    children: &[Option<&OctreeSection>; 8],
+    opacity: &dyn Fn(u32) -> u8,
+) -> OctreeSection {
     let dense: Vec<Option<Vec<Voxel>>> = children.iter().map(|c| c.map(|s| s.to_dense())).collect();
-    let mut out = OctreeSection::new(parent_pos);
+    let mut out = existing
+        .cloned()
+        .unwrap_or_else(|| OctreeSection::new(parent_pos));
     for py in 0..SECTION_EDGE {
         for pz in 0..SECTION_EDGE {
             for px in 0..SECTION_EDGE {

@@ -285,6 +285,24 @@ struct Pipeline {
 
 static PIPELINE: LazyLock<Mutex<Pipeline>> = LazyLock::new(Default::default);
 
+/// 8-bit mask of child octants of `pos` that already have a rendered (uploaded to the GPU arena)
+/// finer section or descendant. Used when meshing a parent so an octant is never masked out
+/// before its replacement child is actually drawn (preventing X-ray pop-in holes).
+fn covered_rendered_mask(rendered: &HashSet<OctreeSectionPos>, pos: OctreeSectionPos) -> u8 {
+    let Some(kids) = pos.children() else {
+        return 0;
+    };
+    let mut mask = 0u8;
+    for (ci, child) in kids.into_iter().enumerate() {
+        if rendered.contains(&child)
+            || (child.detail > 0 && covered_rendered_mask(rendered, child) != 0)
+        {
+            mask |= 1u8 << ci;
+        }
+    }
+    mask
+}
+
 /// 8-bit mask of child octants of `pos` (indexed by `child_index(cx, cy, cz)`) that already have
 /// a non-empty finer section or descendant in `store`. Covered octants are masked out when meshing
 /// `pos` so parent and child never overlap, while uncovered octants still draw so LOD ring
@@ -371,6 +389,8 @@ pub fn ingest_chunk(
 ) -> bool {
     let mut guard = PIPELINE.lock().unwrap();
     let p = &mut *guard;
+    let cave_cull = (source == SnapshotSource::Distant && dim != "minecraft:the_nether")
+        .then(|| (60, p.mapper.block_named(host, "minecraft:stone")));
     let store = p.stores.entry(dim.to_owned()).or_default();
     let mapper = std::cell::RefCell::new(&mut p.mapper);
     let accepted = match source {
@@ -388,11 +408,12 @@ pub fn ingest_chunk(
             &mut |state| mapper.borrow_mut().block(host, state),
             &mut |biome| mapper.borrow_mut().biome(biome),
         ),
-        SnapshotSource::Distant => crate::octree_ingest::ingest_chunk(
+        SnapshotSource::Distant => crate::octree_ingest::ingest_chunk_culled(
             store,
             chunk,
             snapshot,
             crate::octree_ingest::IngestSource::Distant,
+            cave_cull,
             &mut |state| mapper.borrow_mut().block(host, state),
             &mut |biome| mapper.borrow_mut().biome(biome),
         ),
@@ -651,12 +672,30 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         return;
     }
 
+    let mut remesh_ancestors: Vec<(String, OctreeSectionPos)> = Vec::new();
     for (done_dim, pos, has_quads) in MESH_WORKER.drain_done() {
-        if has_quads {
-            p.rendered.entry(done_dim).or_default().insert(pos);
-        } else if let Some(live) = p.rendered.get_mut(&done_dim) {
-            live.remove(&pos);
+        let changed = if has_quads {
+            p.rendered.entry(done_dim.clone()).or_default().insert(pos)
+        } else {
+            p.rendered
+                .get_mut(&done_dim)
+                .is_some_and(|live| live.remove(&pos))
+        };
+        if changed {
+            let mut anc = pos.parent();
+            while let Some(a) = anc {
+                if p.rendered
+                    .get(&done_dim)
+                    .is_some_and(|live| live.contains(&a))
+                {
+                    remesh_ancestors.push((done_dim.clone(), a));
+                }
+                anc = a.parent();
+            }
         }
+    }
+    for (anc_dim, anc_pos) in remesh_ancestors {
+        p.queue(&anc_dim, [anc_pos]);
     }
 
     let metas = Arc::clone(&p.meta_snapshot);
@@ -684,7 +723,10 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             }
             continue;
         };
-        let covered = covered_child_mask(store, pos);
+        let covered = p
+            .rendered
+            .get(dim)
+            .map_or(0, |live| covered_rendered_mask(live, pos));
         if covered == 0xFF {
             if p.rendered
                 .get_mut(dim)
