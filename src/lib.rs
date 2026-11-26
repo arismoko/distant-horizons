@@ -589,10 +589,9 @@ fn poll_remote_octree(host: &mut dyn ClientHost) {
             st.camera_pos,
         )
     };
-    if !enabled {
+    if !enabled || !network::octree_sync::client_send_config_once(host) {
         return;
     }
-    network::octree_sync::client_send_config_once(host);
     pipeline::client_sync(
         host,
         &dim,
