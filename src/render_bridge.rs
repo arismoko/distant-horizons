@@ -6,10 +6,7 @@
 use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
 use crate::gen_worker::GenWorkerPool;
-use crate::generic_render::{BeaconTracker, CloudField, GenericGroupMesh};
 use crate::lod::{DimensionLodStore, SectionPos};
-use crate::mesh::{MeshWorker, SectionMeshData};
-use crate::network::SessionConfig;
 use crate::stage3_camera::CameraMatrices;
 use crate::storage::{IoResponse, LodIoWorker};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -27,20 +24,19 @@ use std::time::Instant;
 //      (`instance_count = 0` when culled, ruling 18),
 //   3. one `draw_indirect` for the opaque slots and one for the translucent slots (sunrise#5592)
 //      pull 8-byte quads from the arena (`voxy_quads.vsh/fsh`),
-//   4. `voxy_composite.vsh/fsh` composites the LOD target over vanilla sky pixels.
+//   4. a shader pack that compiled `dh_terrain` / `dh_water` / `dh_shadow` draws through the
+//      pack-linked pipelines (`voxy_pack_*.vsh`) instead of `voxy_quads`.
 // ---------------------------------------------------------------------------------------------
 
 use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
 
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
 pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
-pub const SHADER_COMPOSITE: &str = "distantsunrises:core/voxy_composite";
 pub const SHADER_HIZ: &str = "distantsunrises:voxy_hiz";
 pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
 
 pub const PIPELINE_OPAQUE: &str = "distantsunrises:voxy_opaque";
 pub const PIPELINE_TRANSLUCENT: &str = "distantsunrises:voxy_translucent";
-pub const PIPELINE_COMPOSITE: &str = "distantsunrises:voxy_composite";
 pub const PIPELINE_PACK_TERRAIN: &str = "distantsunrises:voxy_pack_terrain";
 pub const PIPELINE_PACK_WATER: &str = "distantsunrises:voxy_pack_water";
 pub const PIPELINE_PACK_SHADOW: &str = "distantsunrises:voxy_pack_shadow";
@@ -108,9 +104,7 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
 /// Registers the render pipelines. Called from `Hooks::register_render_pipelines`. The compute
 /// pipelines (Hi-Z, command generation) are added with the compute primitives.
 pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
-    use mod_api::{
-        PipelineBlend, PrimitiveTopology, RenderPipeline, SamplerAddress, SamplerFilter, WorldDepth,
-    };
+    use mod_api::{PipelineBlend, PrimitiveTopology, RenderPipeline, WorldDepth};
     // Opaque: depth-tested, culled by the index order of the quad mesh; translucent: sorted by the
     // arena's bucket order, blended, no depth write.
     event.register(
@@ -173,36 +167,6 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
         );
     }
     register_compute(event);
-    event.register(
-        RenderPipeline::new(
-            id(PIPELINE_COMPOSITE),
-            id(SHADER_COMPOSITE),
-            PipelineBlend::Opaque,
-            WorldDepth::ThroughWalls,
-        )
-        .topology(PrimitiveTopology::Triangles)
-        .bind_group_layout(
-            mod_api::BindGroupLayout::builder()
-                .uniform_buffer("CompositeParams", 176)
-                .sampler(
-                    "LodColor",
-                    SamplerFilter::Nearest,
-                    SamplerAddress::ClampToEdge,
-                )
-                .sampler(
-                    "LodDepth",
-                    SamplerFilter::Nearest,
-                    SamplerAddress::ClampToEdge,
-                )
-                .sampler(
-                    "WorldDepth",
-                    SamplerFilter::Nearest,
-                    SamplerAddress::ClampToEdge,
-                )
-                .build()
-                .expect("static composite layout"),
-        ),
-    );
 }
 
 /// Hi-Z copy / reduce and command generation (`assets/distantsunrises/shaders/compute`).
@@ -399,12 +363,6 @@ fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<(HizTarg
     Some((made, true))
 }
 
-/// Whether the Hi-Z sampler can filter linearly. `R32Float` without float32 filtering must be
-/// bound `Nearest` (the cmdgen layout always does), so this only reports the adapter.
-pub fn hiz_linear_filter(host: &dyn mod_api::ClientHost) -> bool {
-    host.render_capabilities().float32_filterable
-}
-
 /// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
 static PENDING_SECTIONS: Mutex<Vec<(SectionKey, BuiltSection)>> = Mutex::new(Vec::new());
 static ARENA: Mutex<Option<ArenaState>> = Mutex::new(None);
@@ -433,7 +391,7 @@ pub fn queue_model_tables(model_words: Vec<u32>, biome_tint_words: Vec<u32>, atl
     *PENDING_TABLES.lock().unwrap() = Some((model_words, biome_tint_words, atlas));
 }
 
-/// Called by the bakery / mesher worker for each finished section (empty = remove).
+/// Called by the pipeline's mesher for each finished section (empty = remove).
 pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
     PENDING_SECTIONS.lock().unwrap().push((key, section));
 }
@@ -463,8 +421,13 @@ fn create_quad_mesh(
 }
 
 /// Creates the arena on first use (ruling 2: it then survives reloads and world close),
-/// uploads pending sections and flushes metadata. Call from `client_tick_pre`.
-pub fn upload_pending(
+/// uploads pending sections and flushes metadata. Call from `client_tick_pre`. Errors are logged
+/// through [`report`]; the frame goes on without them.
+pub fn upload_pending(host: &mut dyn mod_api::ClientHost, config: ArenaConfig) {
+    report("arena upload", try_upload_pending(host, config));
+}
+
+fn try_upload_pending(
     host: &mut dyn mod_api::ClientHost,
     config: ArenaConfig,
 ) -> Result<(), crate::gpu_arena::ArenaError> {
@@ -479,8 +442,11 @@ pub fn upload_pending(
     }
     let state = guard.as_mut().unwrap();
     if let Some((models, tints, atlas)) = PENDING_TABLES.lock().unwrap().take() {
-        state.arena.write_models(host, 0, &models)?;
-        state.arena.write_biome_tints(host, 0, &tints)?;
+        let wrote_models = report("write models", state.arena.write_models(host, 0, &models));
+        let wrote_tints = report(
+            "write biome tints",
+            state.arena.write_biome_tints(host, 0, &tints),
+        );
         let id = mod_api::Identifier::parse(ATLAS_TEXTURE).expect("static texture id");
         let side = crate::pipeline::ATLAS_SIDE as u32;
         let done = if ATLAS_CREATED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -493,17 +459,33 @@ pub fn upload_pending(
         if done.is_ok() {
             ATLAS_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // A failed table write is retried next frame unless newer tables were queued meanwhile.
+        if wrote_models.is_none() || wrote_tints.is_none() {
+            let mut slot = PENDING_TABLES.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some((models, tints, atlas));
+            }
+        }
     }
+    // One section failing (arena full, bad write) never drops the rest of the batch: each is
+    // handled on its own, logged through `report`, and the metadata flush still runs.
     for (key, section) in std::mem::take(&mut *PENDING_SECTIONS.lock().unwrap()) {
-        let old = state.ids.remove(&key);
+        let old = state.ids.get(&key).copied();
         if section.is_empty() {
-            if let Some(old) = old {
-                state.arena.remove(old)?;
+            if let Some(old) = old
+                && report("remove section", state.arena.remove(old)).is_some()
+            {
+                state.ids.remove(&key);
             }
             continue;
         }
-        let id = state.arena.upload_replace(host, old, &section)?;
-        state.ids.insert(key, id);
+        // `upload_replace` keeps the old section live when the new one cannot be stored.
+        if let Some(new) = report(
+            "upload section",
+            state.arena.upload_replace(host, old, &section),
+        ) {
+            state.ids.insert(key, new);
+        }
     }
     state.arena.flush(host)
 }
@@ -520,21 +502,14 @@ pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaErr
         .filter(|k| k.0 == dimension)
         .cloned()
         .collect();
+    let mut result = Ok(());
     for key in doomed {
         let id = state.ids.remove(&key).unwrap();
-        state.arena.remove(id)?;
+        if let Err(e) = state.arena.remove(id) {
+            result = Err(e);
+        }
     }
-    Ok(())
-}
-
-/// Frees the arena's GPU buffers (mod unload / re-init only).
-pub fn release_arena(
-    host: &mut dyn mod_api::ClientHost,
-) -> Result<(), crate::gpu_arena::ArenaError> {
-    match ARENA.lock().unwrap().take() {
-        Some(state) => state.arena.release(host),
-        None => Ok(()),
-    }
+    result
 }
 
 static FRAME_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -557,7 +532,7 @@ pub const TRANSLUCENT_STAGE: mod_api::RenderLevelStage =
 /// draws. Called first from `Hooks::prepare_render_buffers`.
 pub fn begin_frame(camera: [f64; 3]) {
     FRAME_ID.fetch_add(1, Ordering::Relaxed);
-    let (frame, _, _, _) = begin_render_frame(camera);
+    let frame = begin_render_frame(camera);
     *FRAME.lock().unwrap() = Some(frame);
     PREPARED.lock().unwrap().clear();
 }
@@ -832,20 +807,14 @@ pub struct RenderFrameParams {
     pub active_dimension: String,
     pub config: DhConfig,
     pub fog_color: [f32; 4],
-    pub fog_type: u32,
-    pub env_fog_start: f32,
-    pub env_fog_end: f32,
     pub vanilla_far_blocks: f32,
     pub sun_brightness: f32,
-    pub visible_sections: Vec<SectionPos>,
-    pub generic_active: Vec<(String, [f64; 3])>,
 }
 
 /// Telemetry counters surfaced on the F3 debug screen (`RegisterDebugEntriesEvent`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DhStats {
     pub active_sections: usize,
-    pub ready_meshes: usize,
     pub rendered_sections: u64,
     pub rendered_quads: u64,
     pub generated_columns: u64,
@@ -861,7 +830,6 @@ pub struct DhRuntime {
     pub saved_sections: AtomicU64,
     pub frames_drawn: AtomicU64,
     pub io: LodIoWorker,
-    pub mesher: MeshWorker,
     pub gen_pool: GenWorkerPool,
     pub inner: Mutex<DhState>,
 }
@@ -873,12 +841,7 @@ pub struct DhState {
     pub camera: Option<CameraMatrices>,
     pub camera_pos: [f64; 3],
     pub has_camera: bool,
-    pub improved_transparency: bool,
-    pub visible_section_count: usize,
     pub fog_color: [f32; 4],
-    pub fog_type: u32,
-    pub env_fog_start: f32,
-    pub env_fog_end: f32,
     pub vanilla_far_blocks: f32,
     pub sun_brightness: f32,
     pub rain_level: f32,
@@ -890,12 +853,6 @@ pub struct DhState {
     pub dimensions: HashMap<String, DimensionLodStore>,
     pub pending_chunks: HashMap<String, VecDeque<[i32; 2]>>,
     pub pending_chunk_set: HashMap<String, HashSet<[i32; 2]>>,
-    /// Ready CPU meshes awaiting upload to GPU (`world_drawn` drains this).
-    pub pending_gpu_uploads: Vec<SectionMeshData>,
-    /// Set of section positions known to have a valid non-empty mesh for each dimension.
-    pub meshed_sections: HashMap<String, HashSet<SectionPos>>,
-    /// Counter bumped when active dimension resets so the GPU cache drops stale buffers.
-    pub gpu_reset_epoch: u64,
     /// Public API: per-dimension custom world generators overriding built-in distant sampling.
     pub world_generators: HashMap<String, Arc<dyn LodWorldGenerator>>,
     /// Public API: per-dimension client-side remote LOD providers.
@@ -906,12 +863,6 @@ pub struct DhState {
     pub disabled_builtin_net: HashSet<String>,
     /// Public API: section positions already requested from a registered `RemoteLodProvider`.
     pub remote_requested: HashMap<String, HashSet<SectionPos>>,
-    /// Server-enforced multiplayer session policy received via `MSG_SESSION_CONFIG`.
-    pub remote_session_config: Option<SessionConfig>,
-    /// Whether `MSG_SESSION_CONFIG_REQUEST` has been sent for the current remote session.
-    pub remote_config_requested: bool,
-    /// Per-server local disk cache root when connected to a remote multiplayer server.
-    pub remote_cache_dir: Option<PathBuf>,
     /// Per-dimension round-robin cursor across connected players for dedicated/LAN server distant
     /// generation (per dimension so two dimensions with equal player counts do not alias).
     pub server_player_round_robin: HashMap<String, usize>,
@@ -922,16 +873,6 @@ pub struct DhState {
     pub desired_cache: HashMap<(String, u128), DesiredCache>,
     /// Earliest instant the next synchronous distant-sampling batch may run for each dimension.
     pub next_distant_sample: HashMap<String, Instant>,
-    /// Generic box groups (beacons, clouds, and third-party mod groups) per dimension.
-    pub generic_groups: HashMap<String, HashMap<String, GenericGroupMesh>>,
-    pub generic_groups_revision: u64,
-    pub last_uploaded_generic_revision: u64,
-    /// Per-dimension distant beacon trackers.
-    pub beacons: HashMap<String, BeaconTracker>,
-    /// Procedural 3D LOD cloud generator.
-    pub cloud_field: CloudField,
-    /// Start time for smooth LOD cloud drift.
-    pub start_instant: Instant,
 }
 
 /// Cached result of `DimensionLodStore::desired_sections_coarse_to_fine`.
@@ -952,12 +893,7 @@ impl Default for DhState {
             camera: None,
             camera_pos: [0.0, 64.0, 0.0],
             has_camera: false,
-            improved_transparency: false,
-            visible_section_count: 0,
             fog_color: [0.75, 0.85, 1.0, 1.0],
-            fog_type: 0,
-            env_fog_start: 0.0,
-            env_fog_end: 64.0,
             vanilla_far_blocks: 80.0,
             sun_brightness: 1.0,
             rain_level: 0.0,
@@ -967,26 +903,14 @@ impl Default for DhState {
             dimensions: HashMap::new(),
             pending_chunks: HashMap::new(),
             pending_chunk_set: HashMap::new(),
-            pending_gpu_uploads: Vec::new(),
-            meshed_sections: HashMap::new(),
-            gpu_reset_epoch: 0,
             world_generators: HashMap::new(),
             remote_providers: HashMap::new(),
             disabled_builtin_gen: HashSet::new(),
             disabled_builtin_net: HashSet::new(),
             remote_requested: HashMap::new(),
-            remote_session_config: None,
-            remote_config_requested: false,
-            remote_cache_dir: None,
             server_player_round_robin: HashMap::new(),
             desired_cache: HashMap::new(),
             next_distant_sample: HashMap::new(),
-            generic_groups: HashMap::new(),
-            generic_groups_revision: 0,
-            last_uploaded_generic_revision: 0,
-            beacons: HashMap::new(),
-            cloud_field: CloudField::default(),
-            start_instant: Instant::now(),
         }
     }
 }
@@ -1002,27 +926,15 @@ pub fn runtime() -> &'static Arc<DhRuntime> {
             saved_sections: AtomicU64::new(0),
             frames_drawn: AtomicU64::new(0),
             io: LodIoWorker::spawn(),
-            mesher: MeshWorker::spawn(),
             gen_pool: GenWorkerPool::new(),
             inner: Mutex::new(DhState::default()),
         })
     })
 }
 
-/// Drain background IO/mesher results and return frame parameters, pending GPU section uploads,
-/// pending generic box-group uploads, and reset epoch for the stage renderer.
-pub fn begin_render_frame(
-    camera: [f64; 3],
-) -> (
-    RenderFrameParams,
-    Vec<SectionMeshData>,
-    Vec<GenericGroupMesh>,
-    u64,
-) {
+/// Drains background IO results into the section store and returns this frame's parameters.
+pub fn begin_render_frame(camera: [f64; 3]) -> RenderFrameParams {
     let rt = runtime();
-
-    // First pull any newly finished CPU meshes from the background meshing worker.
-    let finished_meshes = rt.mesher.drain_finished();
     let io_responses = rt.io.drain_responses();
 
     let mut st = rt.inner.lock().unwrap();
@@ -1035,91 +947,26 @@ pub fn begin_render_frame(
                 rt.saved_sections.fetch_add(1, Ordering::Relaxed);
             }
             IoResponse::Loaded { dimension, section } => {
-                let pos = section.pos;
-                let dim = st.dimensions.entry(dimension.clone()).or_default();
-                let should_mesh = match dim.sections.get(&pos) {
-                    Some(existing) => existing.populated < section.populated,
-                    None => true,
-                };
-                if should_mesh {
-                    dim.sections.insert(pos, section.clone());
-                    rt.mesher.submit(dimension, section);
+                let dim = st.dimensions.entry(dimension).or_default();
+                let newer = dim
+                    .sections
+                    .get(&section.pos)
+                    .is_none_or(|existing| existing.populated < section.populated);
+                if newer {
+                    dim.sections.insert(section.pos, section);
                 }
             }
         }
     }
 
-    for mesh in finished_meshes {
-        if !mesh.is_empty() {
-            st.meshed_sections
-                .entry(mesh.dimension.clone())
-                .or_default()
-                .insert(mesh.pos);
-            st.pending_gpu_uploads.push(mesh);
-        }
-    }
-
-    let dim_name = st.active_dimension.clone();
-    let uploads: Vec<SectionMeshData> = st
-        .pending_gpu_uploads
-        .drain(..)
-        .filter(|m| m.dimension == dim_name)
-        .collect();
-
-    let mut effective_cfg = st.config;
-    if let Some(scfg) = st.remote_session_config {
-        effective_cfg.render_distance_chunks = effective_cfg
-            .render_distance_chunks
-            .min(scfg.max_render_distance_chunks);
-    }
-
-    let ready_set = st
-        .meshed_sections
-        .get(&dim_name)
-        .cloned()
-        .unwrap_or_default();
-    let visible_sections = if effective_cfg.enabled {
-        DimensionLodStore::select_visible_sections(camera[0], camera[2], effective_cfg, &ready_set)
-    } else {
-        Vec::new()
-    };
-
-    let generic_uploads = if st.last_uploaded_generic_revision != st.generic_groups_revision {
-        st.last_uploaded_generic_revision = st.generic_groups_revision;
-        st.generic_groups
-            .get(&dim_name)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    let generic_active: Vec<(String, [f64; 3])> = st
-        .generic_groups
-        .get(&dim_name)
-        .map(|m| {
-            m.values()
-                .filter(|g| g.active && !g.is_empty())
-                .map(|g| (g.id.clone(), g.origin))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let params = RenderFrameParams {
-        enabled: effective_cfg.enabled,
-        active_dimension: dim_name,
-        config: effective_cfg,
+    RenderFrameParams {
+        enabled: st.config.enabled,
+        active_dimension: st.active_dimension.clone(),
+        config: st.config,
         fog_color: st.fog_color,
-        fog_type: st.fog_type,
-        env_fog_start: st.env_fog_start,
-        env_fog_end: st.env_fog_end,
         vanilla_far_blocks: st.vanilla_far_blocks,
         sun_brightness: st.sun_brightness,
-        visible_sections,
-        generic_active,
-    };
-    let epoch = st.gpu_reset_epoch;
-    (params, uploads, generic_uploads, epoch)
+    }
 }
 
 /// Called by `record_stage` at the end of a frame.
@@ -1146,14 +993,8 @@ pub fn stats() -> DhStats {
         .get(active_dim)
         .map(|d| d.generated_columns)
         .unwrap_or(0);
-    let ready_meshes = st
-        .meshed_sections
-        .get(active_dim)
-        .map(|m| m.len())
-        .unwrap_or(0);
     DhStats {
         active_sections,
-        ready_meshes,
         rendered_sections: rt.rendered_sections.load(Ordering::Relaxed),
         rendered_quads: rt.rendered_quads.load(Ordering::Relaxed),
         generated_columns,

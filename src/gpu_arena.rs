@@ -62,75 +62,10 @@ pub struct ArenaConfig {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Packed quad (Voxy `quad_format.glsl`, 64-bit variant)
+// Packed quad (Voxy `quad_format.glsl`, 64-bit variant): one type, defined by the mesher
 // ---------------------------------------------------------------------------------------------
 
-/// One 8-byte quad: face(3)@0, width-1(4)@3, height-1(4)@7, z(5)@11, y(5)@16, x(5)@21,
-/// state id(20)@26, biome id(9)@46, light id(8)@55.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct PackedQuad(pub u64);
-
-impl PackedQuad {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        face: u8,
-        pos: [u8; 3],
-        size: [u8; 2],
-        state_id: u32,
-        biome_id: u16,
-        light: u8,
-    ) -> Self {
-        debug_assert!(face < 6 && pos.iter().all(|&p| p < 32));
-        debug_assert!(size[0] >= 1 && size[0] <= 16 && size[1] >= 1 && size[1] <= 16);
-        debug_assert!(state_id < (1 << 20) && biome_id < (1 << 9));
-        let mut v = face as u64 & 7;
-        v |= ((size[0] - 1) as u64 & 15) << 3;
-        v |= ((size[1] - 1) as u64 & 15) << 7;
-        v |= (pos[2] as u64 & 31) << 11;
-        v |= (pos[1] as u64 & 31) << 16;
-        v |= (pos[0] as u64 & 31) << 21;
-        v |= (state_id as u64 & 0xF_FFFF) << 26;
-        v |= (biome_id as u64 & 0x1FF) << 46;
-        v |= (light as u64) << 55;
-        Self(v)
-    }
-
-    pub fn face(self) -> u8 {
-        (self.0 & 7) as u8
-    }
-
-    pub fn pos(self) -> [u8; 3] {
-        [
-            ((self.0 >> 21) & 31) as u8,
-            ((self.0 >> 16) & 31) as u8,
-            ((self.0 >> 11) & 31) as u8,
-        ]
-    }
-
-    pub fn size(self) -> [u8; 2] {
-        [
-            ((self.0 >> 3) & 15) as u8 + 1,
-            ((self.0 >> 7) & 15) as u8 + 1,
-        ]
-    }
-
-    pub fn state_id(self) -> u32 {
-        ((self.0 >> 26) & 0xF_FFFF) as u32
-    }
-
-    pub fn biome_id(self) -> u16 {
-        ((self.0 >> 46) & 0x1FF) as u16
-    }
-
-    pub fn light(self) -> u8 {
-        (self.0 >> 55) as u8
-    }
-
-    /// Little-endian bytes as stored in the arena (read in GLSL as `uvec2`, low word first).
-    pub fn to_bytes(self) -> [u8; 8] {
-        self.0.to_le_bytes()
-    }
-}
+pub use crate::mesh::PackedQuad;
 
 // ---------------------------------------------------------------------------------------------
 // Section metadata (Voxy `section.glsl` / `BasicSectionGeometryManager.SectionMeta`)
@@ -577,8 +512,12 @@ impl GpuArena {
         if section.is_empty() {
             return Err(ArenaError::EmptySection);
         }
-        if let Some(old) = old_id {
-            self.remove(old)?;
+        // The old section stays live until the new one is fully uploaded, so a failed replace
+        // keeps showing the previous mesh instead of leaving a hole.
+        if let Some(old) = old_id
+            && !self.live.contains_key(&old)
+        {
+            return Err(ArenaError::UnknownSection(old));
         }
         let start = self
             .quad_alloc
@@ -600,6 +539,9 @@ impl GpuArena {
         self.live.insert(id, start as u32);
         self.dirty
             .insert(id, SectionMeta::new(section, start as u32));
+        if let Some(old) = old_id {
+            self.remove(old)?;
+        }
         Ok(id)
     }
 
@@ -615,13 +557,13 @@ impl GpuArena {
         Ok(())
     }
 
-    /// Writes queued metadata, coalescing consecutive ids into one `write_range`.
+    /// Writes queued metadata, coalescing consecutive ids into one `write_range`. The queue is
+    /// cleared only once every run is written, so a failed flush is retried whole next call.
     pub fn flush(&mut self, host: &mut dyn ClientHost) -> Result<(), ArenaError> {
-        let dirty = std::mem::take(&mut self.dirty);
         let mut run_start = 0u32;
         let mut run: Vec<u8> = Vec::new();
         let mut next = 0u32;
-        for (id, meta) in dirty {
+        for (&id, meta) in &self.dirty {
             if !run.is_empty() && id != next {
                 self.sections.write_range(
                     &*host,
@@ -640,6 +582,7 @@ impl GpuArena {
             self.sections
                 .write_range(&*host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
         }
+        self.dirty.clear();
         Ok(())
     }
 
@@ -792,17 +735,10 @@ mod tests {
     }
 
     #[test]
-    fn packed_quad_round_trips_every_field() {
-        let q = PackedQuad::new(5, [31, 17, 3], [16, 2], 0xF_FFFF, 0x1FF, 0xFF);
-        assert_eq!(q.face(), 5);
-        assert_eq!(q.pos(), [31, 17, 3]);
-        assert_eq!(q.size(), [16, 2]);
-        assert_eq!(q.state_id(), 0xF_FFFF);
-        assert_eq!(q.biome_id(), 0x1FF);
-        assert_eq!(q.light(), 0xFF);
-        assert_eq!(q.0 >> 63, 0);
-        let one = PackedQuad::new(0, [0; 3], [1, 1], 0, 0, 0);
-        assert_eq!(one.0, 0);
+    fn packed_quad_is_stored_little_endian_in_the_arena() {
+        let q = PackedQuad::new(31, 17, 3, 5, 16, 2, 0xF_FFFF, 0x1FF, 15, 15);
+        assert_eq!(q.to_bytes(), q.0.to_le_bytes());
+        assert_eq!(PackedQuad::default().to_bytes(), [0; 8]);
     }
 
     #[test]

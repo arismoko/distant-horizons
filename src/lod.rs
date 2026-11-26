@@ -461,7 +461,6 @@ pub struct LodSection {
     pub extra_spans: HashMap<u16, Vec<ExtraSpan>>,
     pub populated: u16,
     pub revision: u64,
-    pub dirty_mesh: bool,
     pub dirty_save: bool,
 }
 
@@ -473,7 +472,6 @@ impl LodSection {
             extra_spans: HashMap::new(),
             populated: 0,
             revision: 0,
-            dirty_mesh: false,
             dirty_save: false,
         }
     }
@@ -494,7 +492,6 @@ impl LodSection {
             extra_spans,
             populated,
             revision: 1,
-            dirty_mesh: populated > 0,
             dirty_save: false,
         }
     }
@@ -552,7 +549,6 @@ impl LodSection {
             self.extra_spans.insert(key, spans);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.dirty_mesh = true;
         self.dirty_save = true;
         true
     }
@@ -760,7 +756,6 @@ impl DimensionLodStore {
                 extra_spans: child_extra,
                 populated: 0,
                 revision: 0,
-                dirty_mesh: false,
                 dirty_save: false,
             };
             let qx = (cur_pos.x & 1) as usize * (SECTION_SIZE / 2);
@@ -785,46 +780,6 @@ impl DimensionLodStore {
             cur_pos = parent_pos;
         }
         updated
-    }
-
-    /// Returns the desired LOD sections covering the player's render distance via top-down
-    /// quadtree traversal. A node within its split distance subdivides whenever any descendant
-    /// mesh is ready, preventing partially populated coarse ancestors from hiding ready detail-0
-    /// and detail-1 sections behind a single 4096-block root.
-    pub fn select_visible_sections(
-        cam_x: f64,
-        cam_z: f64,
-        config: DhConfig,
-        ready_meshes: &HashSet<SectionPos>,
-    ) -> Vec<SectionPos> {
-        let max_dist = config.render_distance_blocks() as f64;
-        let root_span = SectionPos::new(MAX_DETAIL, 0, 0).block_span() as f64;
-        let radius_roots = (max_dist / root_span).ceil() as i32 + 1;
-        let center_root =
-            SectionPos::from_block(MAX_DETAIL, cam_x.floor() as i32, cam_z.floor() as i32);
-
-        let mut selected = Vec::new();
-        for rz in (center_root.z - radius_roots)..=(center_root.z + radius_roots) {
-            for rx in (center_root.x - radius_roots)..=(center_root.x + radius_roots) {
-                let root = SectionPos::new(MAX_DETAIL, rx, rz);
-                select_node(
-                    root,
-                    cam_x,
-                    cam_z,
-                    max_dist,
-                    config,
-                    ready_meshes,
-                    &mut selected,
-                );
-            }
-        }
-        // Sort front-to-back for early-Z rejection on the GPU.
-        selected.sort_by(|a, b| {
-            let da = a.min_horizontal_distance(cam_x, cam_z);
-            let db = b.min_horizontal_distance(cam_x, cam_z);
-            da.total_cmp(&db)
-        });
-        selected
     }
 
     /// Returns the **leaf** sections to populate, mirroring DH's inside-out `LodQuadTree`: each
@@ -877,83 +832,6 @@ impl DimensionLodStore {
                 .then_with(|| (a.x, a.z).cmp(&(b.x, b.z)))
         });
         leaves
-    }
-}
-
-/// Returns `true` if `pos` is completely covered by ready meshes within `max_dist`: either
-/// `pos` itself is ready, it is outside `max_dist`, or every in-range child is completely covered.
-fn is_fully_covered(
-    pos: SectionPos,
-    cam_x: f64,
-    cam_z: f64,
-    max_dist: f64,
-    config: DhConfig,
-    ready_meshes: &HashSet<SectionPos>,
-) -> bool {
-    let dist = pos.min_horizontal_distance(cam_x, cam_z);
-    if dist > max_dist {
-        return true;
-    }
-    if ready_meshes.contains(&pos) {
-        return true;
-    }
-    if pos.detail > 0
-        && dist < config.detail_split_distance_blocks(pos.detail) as f64
-        && let Some(children) = pos.children()
-    {
-        return children
-            .iter()
-            .all(|&c| is_fully_covered(c, cam_x, cam_z, max_dist, config, ready_meshes));
-    }
-    false
-}
-
-/// Selects renderable LOD sections for `pos` (matches DH `LodQuadTree` coarse-parent fallback):
-/// a ready parent subdivides into its children only when every in-range child is completely
-/// covered, preventing empty void holes when 1–3 sibling quadrants are not yet meshed. If the
-/// parent itself has no ready mesh yet, any ready children are still emitted.
-fn select_node(
-    pos: SectionPos,
-    cam_x: f64,
-    cam_z: f64,
-    max_dist: f64,
-    config: DhConfig,
-    ready_meshes: &HashSet<SectionPos>,
-    out: &mut Vec<SectionPos>,
-) {
-    let dist = pos.min_horizontal_distance(cam_x, cam_z);
-    if dist > max_dist {
-        return;
-    }
-    if pos.detail > 0
-        && dist < config.detail_split_distance_blocks(pos.detail) as f64
-        && let Some(children) = pos.children()
-    {
-        let parent_ready = ready_meshes.contains(&pos);
-        let all_children_covered = children
-            .iter()
-            .all(|&c| is_fully_covered(c, cam_x, cam_z, max_dist, config, ready_meshes));
-        if all_children_covered || !parent_ready {
-            let mut sub_out = Vec::new();
-            for child in children {
-                select_node(
-                    child,
-                    cam_x,
-                    cam_z,
-                    max_dist,
-                    config,
-                    ready_meshes,
-                    &mut sub_out,
-                );
-            }
-            if !sub_out.is_empty() {
-                out.extend(sub_out);
-                return;
-            }
-        }
-    }
-    if ready_meshes.contains(&pos) {
-        out.push(pos);
     }
 }
 
@@ -1029,43 +907,6 @@ mod tests {
         assert_eq!(propagated.len(), MAX_DETAIL as usize);
         let p = store.sections.get(&parent).unwrap();
         assert_eq!(p.get(32, 32).solid_top_y, 70);
-    }
-
-    #[test]
-    fn quadtree_selection_falls_back_to_parent_when_children_unready() {
-        let cfg = DhConfig::default();
-        let root = SectionPos::new(MAX_DETAIL, 0, 0);
-        let mut ready = HashSet::new();
-        ready.insert(root);
-        let vis = DimensionLodStore::select_visible_sections(10.0, 10.0, cfg, &ready);
-        assert_eq!(vis, vec![root]);
-    }
-
-    #[test]
-    fn quadtree_selection_keeps_ready_parent_until_all_in_range_children_are_covered() {
-        let cfg = DhConfig::default();
-        let d1 = SectionPos::new(1, 0, 0);
-        let d0_children = d1.children().unwrap();
-        let mut ready = HashSet::new();
-        ready.insert(d1);
-        // Only 1 of 4 detail-0 children ready: parent d1 must stay rendered so 3 quadrants
-        // do not become empty holes.
-        ready.insert(d0_children[0]);
-        let vis_partial = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
-        assert_eq!(vis_partial, vec![d1]);
-
-        // Once all 4 detail-0 children are ready, d1 subdivides cleanly into its 4 children.
-        for c in d0_children {
-            ready.insert(c);
-        }
-        let vis_full = DimensionLodStore::select_visible_sections(32.0, 32.0, cfg, &ready);
-        assert_eq!(vis_full.len(), 4);
-        for c in d0_children {
-            assert!(
-                vis_full.contains(&c),
-                "expected detail-0 child {c:?} in {vis_full:?}"
-            );
-        }
     }
 
     #[test]

@@ -5,11 +5,10 @@
 
 use crate::config::{
     DEBUG_OFF, DEBUG_SHOW_DETAIL, DEBUG_SHOW_DETAIL_WIREFRAME, DEBUG_SHOW_GEN_MODE,
-    DEBUG_SHOW_LIGHTING, DhConfig, KEY_BEACON_BEAMS_ENABLED, KEY_CAVE_CULLING, KEY_CLOUDS_ENABLED,
-    KEY_DEBUG_MODE, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FADE_ENABLED, KEY_FOG_ENABLED,
-    KEY_HEIGHT_FOG_ENABLED, KEY_HORIZONTAL_QUALITY, KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE,
-    KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED, KEY_SSAO_QUALITY, KEY_THREAD_PRESET,
-    KEY_VERTICAL_QUALITY, MOD_ID, ThreadPreset, setting_key,
+    DEBUG_SHOW_LIGHTING, DhConfig, KEY_CAVE_CULLING, KEY_DEBUG_MODE, KEY_DISTANT_GENERATION,
+    KEY_ENABLED, KEY_FADE_ENABLED, KEY_FOG_ENABLED, KEY_HEIGHT_FOG_ENABLED, KEY_HORIZONTAL_QUALITY,
+    KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE, KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED,
+    KEY_SSAO_QUALITY, KEY_THREAD_PRESET, KEY_VERTICAL_QUALITY, MOD_ID, ThreadPreset, setting_key,
 };
 use crate::render_bridge::{runtime, stats};
 use mod_api::{
@@ -128,8 +127,6 @@ pub fn register_client_commands(commands: &mut Vec<ClientCommandRegistration>) {
         " heightfog <mode:word>",
         " ssao <mode:word>",
         " sharpen <mode:word>",
-        " clouds <mode:word>",
-        " beacons <mode:word>",
         " debug <mode:word>",
         " gen <mode:word>",
         " threads <preset:word>",
@@ -294,8 +291,6 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
             }
         },
         "heightfog" => handle_bool_setting(host, KEY_HEIGHT_FOG_ENABLED, "heightfog", arg),
-        "clouds" => handle_bool_setting(host, KEY_CLOUDS_ENABLED, "clouds", arg),
-        "beacons" => handle_bool_setting(host, KEY_BEACON_BEAMS_ENABLED, "beacons", arg),
         "debug" => {
             let parsed = match arg.map(str::to_ascii_lowercase).as_deref() {
                 Some("off" | "none" | "0") => {
@@ -479,7 +474,7 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
             ));
         }
         "remesh" => {
-            let count = remesh_active_dimension();
+            let count = crate::pipeline::invalidate_models();
             let _ = host.chat_line(Text::translate(
                 "distantsunrises.command.remeshed",
                 vec![Text::literal(count.to_string())],
@@ -633,7 +628,6 @@ fn send_status(host: &mut dyn ClientHost) {
             Text::literal(dim),
             Text::literal(cfg.render_distance_chunks.to_string()),
             Text::literal(s.active_sections.to_string()),
-            Text::literal(s.ready_meshes.to_string()),
             Text::literal(s.rendered_sections.to_string()),
             Text::literal(s.rendered_quads.to_string()),
             Text::literal(format!("{:.0}%/{:.0}%", rain * 100.0, thunder * 100.0)),
@@ -651,30 +645,8 @@ pub fn clear_active_dimension_cache() -> usize {
         .remove(&dim)
         .map(|d| d.sections.len())
         .unwrap_or(0);
-    st.meshed_sections.remove(&dim);
-    st.pending_gpu_uploads.retain(|m| m.dimension != dim);
     st.remote_requested.remove(&dim);
-    st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
     removed
-}
-
-/// Force re-meshing of all populated sections in the active dimension (useful after changing
-/// visual settings such as saturation or brightness).
-pub fn remesh_active_dimension() -> usize {
-    let rt = runtime();
-    let mut st = rt.inner.lock().unwrap();
-    let dim = st.active_dimension.clone();
-    let mut count = 0usize;
-    if let Some(store) = st.dimensions.get(&dim) {
-        for sec in store.sections.values() {
-            if sec.populated > 0 {
-                rt.mesher.submit(dim.clone(), sec.clone());
-                count += 1;
-            }
-        }
-    }
-    st.gpu_reset_epoch = st.gpu_reset_epoch.wrapping_add(1);
-    count
 }
 
 #[cfg(test)]

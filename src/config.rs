@@ -39,8 +39,6 @@ pub const KEY_FOG_SPHERICAL: &str = "fog_spherical";
 pub const KEY_HEIGHT_FOG_ENABLED: &str = "height_fog_enabled";
 pub const KEY_HEIGHT_FOG_BASE_HEIGHT: &str = "height_fog_base_height";
 pub const KEY_HEIGHT_FOG_MIX_MODE: &str = "height_fog_mix_mode";
-pub const KEY_CLOUDS_ENABLED: &str = "clouds_enabled";
-pub const KEY_BEACON_BEAMS_ENABLED: &str = "beacon_beams_enabled";
 pub const KEY_SHARPENING_AMOUNT: &str = "sharpening_amount";
 pub const KEY_DEBUG_MODE: &str = "debug_mode";
 pub const KEY_THREAD_PRESET: &str = "thread_preset";
@@ -165,8 +163,6 @@ pub struct DhConfig {
     pub height_fog_base_height: f32,
     /// 0 = Basic (far only), 1 = Max, 2 = Addition, 3 = Multiply, 4 = Inverse Multiply.
     pub height_fog_mix_mode: u32,
-    pub clouds_enabled: bool,
-    pub beacon_beams_enabled: bool,
     /// FidelityFX Contrast-Adaptive Sharpening strength (0.0 = off, 1.0 = max).
     pub sharpening_amount: f32,
     /// `DEBUG_OFF..=DEBUG_SHOW_DETAIL_WIREFRAME`.
@@ -203,8 +199,6 @@ impl Default for DhConfig {
             height_fog_enabled: true,
             height_fog_base_height: 70.0,
             height_fog_mix_mode: 4,
-            clouds_enabled: true,
-            beacon_beams_enabled: true,
             sharpening_amount: 0.35,
             debug_mode: DEBUG_OFF,
             thread_preset: ThreadPreset::Balanced,
@@ -459,18 +453,6 @@ impl DhConfig {
                 4,
             )
             .tooltip("distantsunrises.setting.height_fog_mix_mode.tooltip"),
-            SettingSpec::toggle(
-                KEY_CLOUDS_ENABLED,
-                "distantsunrises.setting.clouds_enabled",
-                true,
-            )
-            .tooltip("distantsunrises.setting.clouds_enabled.tooltip"),
-            SettingSpec::toggle(
-                KEY_BEACON_BEAMS_ENABLED,
-                "distantsunrises.setting.beacon_beams_enabled",
-                true,
-            )
-            .tooltip("distantsunrises.setting.beacon_beams_enabled.tooltip"),
             SettingSpec::range(
                 KEY_SHARPENING_AMOUNT,
                 "distantsunrises.setting.sharpening_amount",
@@ -573,8 +555,6 @@ impl DhConfig {
                 .map(|v| (v as f32).clamp(-64.0, 320.0))
                 .unwrap_or(def.height_fog_base_height),
             height_fog_mix_mode: read_choice(KEY_HEIGHT_FOG_MIX_MODE, def.height_fog_mix_mode),
-            clouds_enabled: read_bool(KEY_CLOUDS_ENABLED, def.clouds_enabled),
-            beacon_beams_enabled: read_bool(KEY_BEACON_BEAMS_ENABLED, def.beacon_beams_enabled),
             sharpening_amount: read_f64(KEY_SHARPENING_AMOUNT)
                 .map(|v| (v as f32).clamp(0.0, 1.0))
                 .unwrap_or(def.sharpening_amount),
