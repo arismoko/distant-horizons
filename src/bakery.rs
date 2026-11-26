@@ -306,12 +306,13 @@ pub fn build_atlas_mips(level0: &[u8], side: usize, tile: usize, mip_levels: u32
                     b += u32::from(src[at + 2]) * w;
                     a += w;
                 }
-                if a > 0 {
+                if let Some(nz) = std::num::NonZeroU32::new(a) {
                     let out = (y * dst_side + x) * 4;
-                    dst[out] = ((r + a / 2) / a) as u8;
-                    dst[out + 1] = ((g + a / 2) / a) as u8;
-                    dst[out + 2] = ((b + a / 2) / a) as u8;
-                    dst[out + 3] = ((a + 2) / 4) as u8;
+                    let half = nz.get() / 2;
+                    dst[out] = ((r + half) / nz) as u8;
+                    dst[out + 1] = ((g + half) / nz) as u8;
+                    dst[out + 2] = ((b + half) / nz) as u8;
+                    dst[out + 3] = ((nz.get() + 2) / 4) as u8;
                 }
             }
         }
