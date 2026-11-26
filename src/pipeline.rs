@@ -9,7 +9,7 @@ use crate::bakery::{
     MODEL_TRANSLUCENT, SpriteError, SpritePixels, SpriteSource, default_translucent, pack_rgba,
 };
 use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
-use crate::mesh::{SectionQuads, mesh_octree_section};
+use crate::mesh::{SectionQuads, mesh_octree_section_masked};
 use crate::network::octree_sync::{ClientEvent, MappingEntry, OctreeSectionDto, ServerSource};
 use crate::octree::Voxel;
 use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
@@ -191,33 +191,36 @@ struct Pipeline {
 
 static PIPELINE: LazyLock<Mutex<Pipeline>> = LazyLock::new(Default::default);
 
-/// Returns `true` when `pos` is the active leaf detail level for its volume: `pos` exists and is
-/// non-empty in `store`, and none of its finer octree descendants exist and are non-empty.
-/// Ancestors stay in `store` for persistence and coarse fallback, but are never drawn alongside
-/// their children (matching Voxy's hierarchical traversal).
+/// 8-bit mask of child octants of `pos` (indexed by `child_index(cx, cy, cz)`) that already have
+/// a non-empty finer section or descendant in `store`. Covered octants are masked out when meshing
+/// `pos` so parent and child never overlap, while uncovered octants still draw so LOD ring
+/// boundaries never open sky holes or flat stone ceilings.
+pub(crate) fn covered_child_mask(store: &OctreeIngestStore, pos: OctreeSectionPos) -> u8 {
+    let Some(kids) = pos.children() else {
+        return 0;
+    };
+    let mut mask = 0u8;
+    for (ci, child) in kids.into_iter().enumerate() {
+        if store.section(child).is_some_and(|s| !s.is_empty())
+            || (child.detail > 0 && has_non_empty_descendant(store, child))
+        {
+            mask |= 1u8 << ci;
+        }
+    }
+    mask
+}
+
+/// Returns `true` when `pos` exists, is non-empty, and has no finer non-empty descendants.
+#[cfg(test)]
 pub(crate) fn is_render_leaf(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
     let Some(section) = store.section(pos) else {
         return false;
     };
-    if section.is_empty() {
-        return false;
-    }
-    !has_non_empty_descendant(store, pos)
+    !section.is_empty() && covered_child_mask(store, pos) == 0
 }
 
 fn has_non_empty_descendant(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
-    let Some(kids) = pos.children() else {
-        return false;
-    };
-    for child in kids {
-        if store.section(child).is_some_and(|s| !s.is_empty()) {
-            return true;
-        }
-        if child.detail > 0 && has_non_empty_descendant(store, child) {
-            return true;
-        }
-    }
-    false
+    covered_child_mask(store, pos) != 0
 }
 
 impl Pipeline {
@@ -540,7 +543,17 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             continue;
         };
         let key = (dim.to_owned(), pos.detail, [pos.x, pos.y, pos.z]);
-        if !is_render_leaf(store, pos) {
+        let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
+            if p.rendered
+                .get_mut(dim)
+                .is_some_and(|live| live.remove(&pos))
+            {
+                submit_built_section(key, empty_section(pos));
+            }
+            continue;
+        };
+        let covered = covered_child_mask(store, pos);
+        if covered == 0xFF {
             if p.rendered
                 .get_mut(dim)
                 .is_some_and(|live| live.remove(&pos))
@@ -549,13 +562,10 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             }
             continue;
         }
-        let Some(section) = store.section(pos) else {
-            continue;
-        };
         let neighbors: [Option<&OctreeSection>; 6] =
             Face::ALL.map(|face| store.section(pos.neighbor(face)));
         let borders = NeighborBorders::from_neighbors(neighbors);
-        let quads = mesh_octree_section(section, &borders, &p.models);
+        let quads = mesh_octree_section_masked(section, &borders, &p.models, covered);
         let built = built_section(&quads);
         if built.is_empty() {
             if p.rendered
