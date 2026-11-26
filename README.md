@@ -13,9 +13,9 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
 - **8-byte packed quads.** A greedy mesher (`src/mesh.rs`) merges faces of the same model, biome and
   light into quads of at most 16×16 voxels, packed into one `u64` in Voxy's `quad_format` layout.
   `PackedQuad` is defined once, in `mesh.rs`, and re-exported by `gpu_arena`.
-- **4×4 baked atlas.** `src/bakery.rs` bakes each block model into six faces of 4×4 texels. The
-  texels go into one 1024×1024 dynamic texture; a 16-word model record per block state and a biome
-  tint table go into storage buffers.
+- **Mipmapped baked atlas.** `src/bakery.rs` bakes block models into six face grids of 16×16 texels.
+  Face tiles are packed as space allows into one 2048×2048 dynamic texture with five mip levels.
+  A 16-word record per distinct baked model and a biome tint table go into storage buffers.
 - **GPU arena.** `src/gpu_arena.rs` keeps every section's quads in one persistent storage-buffer
   arena (free-list sub-allocation, 32-byte section metadata, 8 quad buckets per section: translucent,
   double-sided and the six faces). A section that cannot be stored keeps its previous mesh.
