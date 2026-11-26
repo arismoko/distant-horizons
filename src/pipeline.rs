@@ -13,7 +13,7 @@ use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
 use crate::mesh::{SectionQuads, mesh_octree_section_masked};
 use crate::network::octree_sync::{ClientEvent, MappingEntry, OctreeSectionDto, ServerSource};
 use crate::octree::Voxel;
-use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
+use crate::octree::{Face, NeighborBorders, OctreeRecord, OctreeSection, OctreeSectionPos};
 use crate::octree_ingest::{ChunkEdit, DistantColumn, IngestSource, OctreeIngestStore};
 use crate::render_bridge::submit_built_section;
 use crate::storage::{DEFAULT_OCTREE_COMPRESSION, LodIoWorker, OctreeLoaded, OctreeMapping};
@@ -97,11 +97,11 @@ impl Mapper {
         }
     }
 
-    /// Names of the ids `section` uses, for a save or a network message.
-    fn mapping_of(&self, section: &OctreeSection) -> (Vec<MappingEntry>, OctreeMapping) {
+    /// Names of the ids in the canonical used palette, in first-use order for sync.
+    fn mapping_of(&self, palette: &[Voxel]) -> (Vec<MappingEntry>, OctreeMapping) {
         let mut entries = Vec::new();
         let mut mapping = OctreeMapping::default();
-        for voxel in section.to_rle().palette {
+        for voxel in palette {
             let (block, biome) = (voxel.block_id(), voxel.biome_id());
             if let Some(name) = block
                 .checked_sub(1)
@@ -125,6 +125,19 @@ impl Mapper {
             }
         }
         (entries, mapping)
+    }
+
+    fn section_dto(&self, section: &OctreeSection) -> Option<OctreeSectionDto> {
+        let rle = section.to_rle();
+        let (entries, _) = self.mapping_of(&rle.palette);
+        OctreeSectionDto::from_rle(
+            &rle,
+            section.revision,
+            &entries,
+            DEFAULT_OCTREE_COMPRESSION,
+            0,
+        )
+        .ok()
     }
 
     /// Translate a section whose ids come from another mapping (a file, a server) into this
@@ -1077,8 +1090,15 @@ impl Pipeline {
                 let Some(section) = store.section(pos) else {
                     continue;
                 };
-                let (_, mapping) = self.mapper.mapping_of(section);
-                io.save_octree_section(world_dir.to_owned(), dim.clone(), section.clone(), mapping);
+                let record = OctreeRecord::from(section);
+                let (_, mapping) = self.mapper.mapping_of(&record.rle.palette);
+                io.queue_octree_record(
+                    world_dir.to_owned(),
+                    dim.clone(),
+                    record,
+                    mapping,
+                    DEFAULT_OCTREE_COMPRESSION,
+                );
                 queued += 1;
             }
         }
@@ -1350,8 +1370,7 @@ impl ServerSource<PlayerRef> for PipelineSource {
     fn section_dto(&self, level: &str, pos: OctreeSectionPos) -> Option<OctreeSectionDto> {
         let p = PIPELINE.lock().unwrap();
         let section = p.stores.get(level)?.section(pos)?;
-        let (entries, _) = p.mapper.mapping_of(section);
-        OctreeSectionDto::from_section(section, &entries, DEFAULT_OCTREE_COMPRESSION, 0).ok()
+        p.mapper.section_dto(section)
     }
 
     fn player_block_xz(&self, player: PlayerRef) -> Option<(i32, i32)> {
@@ -1419,6 +1438,81 @@ mod tests {
     fn adopt_fixture(p: &mut Pipeline, io: &LodIoWorker, dir: &Path) {
         p.accept_probes(io, dir, |_, section, _| section);
         p.advance_intake(io, dir, DIM, true);
+    }
+
+    fn section_with_unused_ids() -> (Mapper, OctreeSection) {
+        let mapper = Mapper {
+            names: vec![
+                "minecraft:stone".into(),
+                "minecraft:dirt".into(),
+                "minecraft:sand".into(),
+            ],
+            biomes: vec!["minecraft:plains".into(), "minecraft:forest".into()],
+            ..Mapper::default()
+        };
+        let mut section =
+            OctreeSection::filled(OctreeSectionPos::new(2, -5, 0, 7), Voxel::new(1, 1, 5, 0));
+        section.set(0, 0, 0, Voxel::new(3, 0, 15, 0));
+        section.set(0, 0, 0, Voxel::new(2, 1, 10, 4));
+        section.footprint.set(0, 11);
+        (mapper, section)
+    }
+
+    #[test]
+    fn flush_reopens_canonical_runs_with_used_names_and_metadata() {
+        let dir = TestTempDir::new("canonical-save");
+        let io = LodIoWorker::spawn();
+        let (mapper, section) = section_with_unused_ids();
+        let mut p = Pipeline {
+            mapper,
+            ..Pipeline::default()
+        };
+        p.stores
+            .entry(DIM.into())
+            .or_default()
+            .replace_section(section.clone());
+        p.unsaved.entry(DIM.into()).or_default().insert(section.pos);
+        assert_eq!(p.flush_saves(&io, &dir, 1), 1);
+        io.flush();
+        let (loaded, mapping) = crate::storage::RegionCache::default()
+            .load_octree_section(&dir, DIM, section.pos)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.to_rle(), section.to_rle());
+        assert_eq!(loaded.revision, section.revision);
+        assert_eq!(loaded.footprint, section.footprint);
+        assert_eq!(
+            mapping.blocks,
+            BTreeMap::from([(1, "minecraft:stone".into()), (2, "minecraft:dirt".into())])
+        );
+        assert_eq!(
+            mapping.biomes,
+            BTreeMap::from([(1, "minecraft:forest".into())])
+        );
+    }
+
+    #[test]
+    fn sync_roundtrip_keeps_used_names_in_first_use_order() {
+        let (mapper, section) = section_with_unused_ids();
+        let buffer = mapper.section_dto(&section).unwrap().encode().unwrap();
+        let (loaded, mapping) = OctreeSectionDto::decode(&buffer)
+            .unwrap()
+            .into_section()
+            .unwrap();
+        assert_eq!(loaded.to_rle(), section.to_rle());
+        assert_eq!(loaded.revision, section.revision);
+        assert!(loaded.footprint.is_empty(), "v1 sync remains voxel-only");
+        assert_eq!(
+            mapping
+                .iter()
+                .map(|e| (e.kind, e.id, e.name.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0, 2, "minecraft:dirt"),
+                (1, 1, "minecraft:forest"),
+                (0, 1, "minecraft:stone")
+            ],
+        );
     }
 
     #[test]

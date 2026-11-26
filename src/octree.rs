@@ -301,6 +301,23 @@ pub struct RleSection {
     pub runs: Vec<Run>,
 }
 
+/// Canonical runs plus the metadata needed by the disk codec.
+pub(crate) struct OctreeRecord {
+    pub(crate) rle: RleSection,
+    pub(crate) revision: u64,
+    pub(crate) footprint: ColumnFootprint,
+}
+
+impl From<&OctreeSection> for OctreeRecord {
+    fn from(section: &OctreeSection) -> Self {
+        Self {
+            rle: section.to_rle(),
+            revision: section.revision,
+            footprint: section.footprint,
+        }
+    }
+}
+
 const OCTANT_EDGE: usize = SECTION_EDGE / 2;
 const OCTANT_VOLUME: usize = OCTANT_EDGE * OCTANT_EDGE * OCTANT_EDGE;
 
