@@ -1740,10 +1740,20 @@ impl LodIoWorker {
         mapping: OctreeMapping,
         mode: DhV2CompressionMode,
     ) {
-        self.queue_octree_record(world_dir, dimension, (&section).into(), mapping, mode);
+        // This public queue keeps its fire-and-forget contract; refusal is observed only by
+        // callers of `queue_octree_record`.
+        let _ = self.queue_octree_record(world_dir, dimension, (&section).into(), mapping, mode);
     }
 
-    /// Queue already-canonical runs; compression and region writes stay on the worker.
+    /// A worker whose thread could not start: it refuses every request.
+    #[cfg(test)]
+    pub(crate) fn spawn_unavailable() -> Self {
+        Self::spawn_with(|_| Err(io::Error::other("spawn refused")))
+    }
+
+    /// Queue already-canonical runs; compression and region writes stay on the worker. Returns
+    /// whether the worker accepted the record: an unavailable or shut-down worker refuses it.
+    #[must_use]
     pub(crate) fn queue_octree_record(
         &self,
         world_dir: PathBuf,
@@ -1751,10 +1761,10 @@ impl LodIoWorker {
         section: OctreeRecord,
         mapping: OctreeMapping,
         mode: DhV2CompressionMode,
-    ) {
+    ) -> bool {
         let mut st = self.shared.state.lock().unwrap();
         if st.shutdown {
-            return;
+            return false;
         }
         let key = (world_dir, dimension, section.rle.pos);
         if !st.pending_octree_saves.contains_key(&key) {
@@ -1769,6 +1779,7 @@ impl LodIoWorker {
             },
         );
         self.shared.wake_worker.notify_one();
+        true
     }
 
     /// Queue a tagged background probe; every completion arrives through
@@ -2836,7 +2847,7 @@ mod tests {
         let dim = "minecraft:overworld";
         let column = SectionPos::new(0, 0, 0);
         let octree = OctreeSectionPos::new(0, 0, 0, 0);
-        let worker = LodIoWorker::spawn_with(|_| Err(io::Error::other("spawn refused")));
+        let worker = LodIoWorker::spawn_unavailable();
         for _ in 0..2 {
             // The same backlog is offered at every barrier; none of it can be served.
             worker.request_save(dir.to_path_buf(), dim.into(), sample_section(column, 95));
