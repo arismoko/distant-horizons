@@ -1520,8 +1520,11 @@ pub mod octree_sync {
             Ok(())
         }
 
-        fn open(&mut self) -> bool {
-            !std::mem::replace(&mut self.open, true)
+        fn config_to_send(&mut self) -> Option<Vec<u8>> {
+            if std::mem::replace(&mut self.open, true) {
+                return None;
+            }
+            ClientSession::config_message(&SessionConfig::default()).ok()
         }
 
         fn close(&mut self) {
@@ -1609,17 +1612,15 @@ pub mod octree_sync {
         }
     }
 
-    /// Send our session config once per connection (`ServerPlayerState.java:62-65`).
+    /// Send our session config once per play world (`ServerPlayerState.java:62-65`).
     pub fn client_send_config_once(host: &mut dyn ClientHost) {
-        if !client_intake().lock().unwrap().open() {
-            return;
-        }
-        if let Ok(bytes) = ClientSession::config_message(&SessionConfig::default()) {
+        let bytes = client_intake().lock().unwrap().config_to_send();
+        if let Some(bytes) = bytes {
             let _ = host.send_payload_to_server(&octree_sync_channel_id(), PayloadBytes(bytes));
         }
     }
 
-    /// Forget the per-connection state when the client leaves a server.
+    /// Forget the per-play-world state at a lifetime boundary.
     pub fn client_reset() {
         client_intake().lock().unwrap().close();
     }
@@ -1669,7 +1670,41 @@ pub mod octree_sync {
         const LEVEL: &str = "minecraft:overworld";
 
         #[test]
-        fn old_connection_cannot_mutate_closed_or_rearmed_client_intake() {
+        fn initial_remote_login_preserves_installed_dimension_and_configures_once() {
+            let state = Mutex::new(crate::render_bridge::DhState {
+                active_dimension: "minecraft:the_nether".into(),
+                ..Default::default()
+            });
+            let mut intake = ClientIntake::default();
+            crate::reset_world(
+                &state,
+                crate::WorldBoundary::ClientLogin(Some(false)),
+                || intake.close(),
+                || {},
+            );
+            assert_eq!(
+                state.lock().unwrap().active_dimension,
+                "minecraft:the_nether"
+            );
+            let config = intake.config_to_send().unwrap();
+            assert!(matches!(
+                Message::decode(&config),
+                Ok(Message::SessionConfig(_))
+            ));
+            assert!(intake.config_to_send().is_none());
+        }
+
+        #[test]
+        fn remote_logout_closes_intake_before_the_transport_retires() {
+            check_remote_intake_reset(crate::WorldBoundary::ClientLogout(Some(false)), "");
+        }
+
+        #[test]
+        fn backend_login_rearms_config_and_rejects_old_raw_payloads() {
+            check_remote_intake_reset(crate::WorldBoundary::ClientLogin(Some(false)), LEVEL);
+        }
+
+        fn check_remote_intake_reset(boundary: crate::WorldBoundary, expected_dimension: &str) {
             let now = Instant::now();
             let cfg = Message::SessionConfig(SessionConfig::default())
                 .encode()
@@ -1683,15 +1718,23 @@ pub mod octree_sync {
             .unwrap();
             let pos = OctreeSectionPos::new(0, 0, 0, 0);
             let mut intake = ClientIntake::default();
-            assert!(intake.open());
+            assert_eq!(intake.config_to_send().as_ref(), Some(&cfg));
+            assert!(intake.config_to_send().is_none());
             intake.receive(&cfg, now, || true).unwrap();
             intake.receive(&split, now, || true).unwrap();
             intake.session.request(LEVEL, pos, None).unwrap();
             assert!(intake.session.config.is_some());
             assert_eq!(intake.events.len(), 1);
+            assert_eq!(intake.session.receiver.buffers.len(), 1);
 
-            intake.close();
-            // The old transport can still be live during the pre-teardown logout callback.
+            let state = Mutex::new(crate::render_bridge::DhState {
+                active_dimension: LEVEL.into(),
+                ..Default::default()
+            });
+            crate::reset_world(&state, boundary, || intake.close(), || {});
+            assert_eq!(state.lock().unwrap().active_dimension, expected_dimension);
+            // Even if the old transport is still live (pre-teardown logout), closed intake
+            // must reject it. The backend switch's old epoch is already inactive by Login.
             for bytes in [&cfg, &split] {
                 intake
                     .receive(bytes, now, || {
@@ -1703,7 +1746,8 @@ pub mod octree_sync {
             assert!(intake.session.pending.is_empty());
             assert!(intake.session.receiver.buffers.is_empty());
 
-            assert!(intake.open());
+            assert_eq!(intake.config_to_send().as_ref(), Some(&cfg));
+            assert!(intake.config_to_send().is_none());
             intake.session.request(LEVEL, pos, None).unwrap();
             let old = Message::Response(OctreeSectionResponse {
                 future_id: 0,
