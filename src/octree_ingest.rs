@@ -425,8 +425,8 @@ pub fn ingest_saved_chunk<S: ChunkVoxelSource>(
 
 /// G4: ingest `DetachedChunkGenerator::sample_surface_columns` results. Each column becomes
 /// `DISTANT_SOLID_DEPTH` solid voxels ending at `height`, the water span above it (sky light
-/// attenuated one level per block of depth, as vanilla water dampens light by 1), and one
-/// lit-air voxel on top so the top face has a light source. Columns whose chunk is owned by G1
+/// attenuated one level per block of depth, as vanilla water dampens light by 1), and a
+/// section's height of lit air on top so the top face and the coarser levels have a light source. Columns whose chunk is owned by G1
 /// or G3 are skipped. `water_block` is the Mapper id of water. Returns the columns written.
 pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
     store: &mut OctreeIngestStore,
@@ -473,10 +473,15 @@ pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
                 store.set_voxel(col.x, y, col.z, Voxel::new(water_block, biome, sky, 0));
             }
         }
-        store.set_voxel(col.x, top + 1, col.z, Voxel::air_with_light(15, 0));
+        // Open sky above the surface: coarser levels average the air's light, so one lit voxel
+        // would leave distant ground dark.
+        let sky_top = top + edge;
+        for y in top + 1..=sky_top {
+            store.set_voxel(col.x, y, col.z, Voxel::air_with_light(15, 0));
+        }
 
         let ys = store.distant_column_ys.entry((col.x, col.z)).or_default();
-        for y in bottom..=top + 1 {
+        for y in bottom..=sky_top {
             ys.insert(y.div_euclid(edge));
         }
         written += 1;
