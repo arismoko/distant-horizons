@@ -10,13 +10,12 @@ use crate::config::{
     KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE, KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED,
     KEY_SSAO_QUALITY, KEY_THREAD_PRESET, KEY_VERTICAL_QUALITY, MOD_ID, ThreadPreset, setting_key,
 };
-use crate::render_bridge::{runtime, stats};
+use crate::render_bridge::{runtime, set_enabled, stats};
 use mod_api::{
     ClientCommandRegistration, ClientHost, ClientSetupContext, Command, CommandArgumentValue,
     CommandInvocation, KeyConflictContext, KeyRegistration, ModKeyMappingRef, Registrar,
     SettingValue, Text,
 };
-use std::sync::atomic::Ordering;
 
 pub const KEYBIND_TOGGLE_RENDERING: &str = "toggle_rendering";
 pub const KEYBIND_CYCLE_QUALITY: &str = "cycle_quality";
@@ -505,7 +504,7 @@ fn quality_label_key(q: u32) -> &'static str {
 fn refresh_config(host: &dyn ClientHost) -> DhConfig {
     let cfg = DhConfig::read_from_host(host);
     let rt = runtime();
-    rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
+    set_enabled(cfg.enabled);
     rt.inner.lock().unwrap().config = cfg;
     rt.gen_pool.reconfigure(cfg.thread_preset);
     cfg

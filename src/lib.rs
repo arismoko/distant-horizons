@@ -55,7 +55,6 @@ use mod_api::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 
 /// Depth below the `WorldSurface` heightmap scanned per loaded chunk column to see through
 /// foliage/water to the solid ocean/ground floor.
@@ -160,7 +159,7 @@ impl Hooks for DistantHorizonsMod {
                 |_host, lines| {
                     let s = stats();
                     lines.push(format!(
-                        "DH: sec={} section slot span={} resident sections={} gen={} saved={}",
+                        "DH: sec={} last prepared section slot span={} last prepared resident sections={} gen={} saved={}",
                         s.active_sections,
                         s.section_high_water,
                         s.resident_sections,
@@ -275,7 +274,7 @@ impl Hooks for DistantHorizonsMod {
         }
         let rt = runtime();
         let cfg = DhConfig::read_from_host(host);
-        rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
+        render_bridge::set_enabled(cfg.enabled);
 
         if host.playing() {
             let kb = self.keybinds.lock().unwrap();
@@ -604,7 +603,7 @@ fn poll_remote_octree(host: &mut dyn ClientHost) {
 fn sync_client_config(host: &dyn Host) {
     let cfg = DhConfig::read_from_host(host);
     let rt = runtime();
-    rt.enabled_flag.store(cfg.enabled, Ordering::Relaxed);
+    render_bridge::set_enabled(cfg.enabled);
     rt.inner.lock().unwrap().config = cfg;
     rt.gen_pool.reconfigure(cfg.thread_preset);
 }

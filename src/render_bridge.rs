@@ -836,6 +836,8 @@ fn try_upload_pending(
         *HIZ.lock().unwrap() = None;
         *SSAO.lock().unwrap() = None;
         *SSAO_PENDING.lock().unwrap() = None;
+        // No arena is left to have prepared these counts; the replacement records its own.
+        clear_arena_stats();
         // The named texture is retired separately at the frame boundary. If it is still
         // registered, retire our atlas before rebaking so its name can be created again.
         if ATLAS_CREATED.load(Ordering::Relaxed) {
@@ -906,6 +908,7 @@ fn try_upload_pending(
     }
     // One section failing (arena full, bad write) never drops the rest of the batch: each is
     // handled on its own, logged through `report`, and the metadata flush still runs.
+    let mut removed = false;
     for (key, section) in std::mem::take(&mut *PENDING_SECTIONS.lock().unwrap()) {
         let old = state.ids.get(&key).copied();
         if section.is_empty() {
@@ -913,6 +916,7 @@ fn try_upload_pending(
                 && report("remove section", state.arena.remove(old)).is_some()
             {
                 state.ids.remove(&key);
+                removed = true;
             }
             continue;
         }
@@ -923,6 +927,10 @@ fn try_upload_pending(
         ) {
             state.ids.insert(key, new);
         }
+    }
+    // An emptied arena prepares no draw, so nothing would overwrite the last prepared counts.
+    if removed && state.arena.section_high_water() == 0 {
+        clear_arena_stats();
     }
     state.arena.flush(host)
 }
@@ -945,6 +953,9 @@ pub(crate) fn clear_sections(dimension: Option<&str>) {
             report("remove section", state.arena.remove(*id));
             false
         });
+        if state.arena.section_high_water() == 0 {
+            clear_arena_stats();
+        }
     }
 }
 
@@ -1528,11 +1539,13 @@ pub struct RenderFrameParams {
 
 /// Telemetry counters surfaced in F3 and `/ds status`.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct DhStats {
+pub(crate) struct DhStats {
     pub active_sections: usize,
-    /// One past the highest occupied GPU section slot; includes holes.
+    /// Last prepared frame: one past the highest occupied GPU section slot; includes holes.
+    /// Zero once the arena is retired or emptied, or rendering is disabled.
     pub section_high_water: u64,
-    /// Sections resident in the GPU arena, independent of draw visibility.
+    /// Last prepared frame: sections resident in the GPU arena, independent of draw visibility.
+    /// Cleared with `section_high_water`.
     pub resident_sections: u64,
     pub generated_columns: u64,
     pub saved_sections: u64,
@@ -1540,7 +1553,7 @@ pub struct DhStats {
 }
 
 /// Shared runtime state accessible from `Hooks` and the stage renderer.
-pub struct DhRuntime {
+pub(crate) struct DhRuntime {
     pub enabled_flag: AtomicBool,
     pub section_high_water: AtomicU64,
     pub resident_sections: AtomicU64,
@@ -1638,7 +1651,7 @@ impl Default for DhState {
 
 static RUNTIME: OnceLock<Arc<DhRuntime>> = OnceLock::new();
 
-pub fn runtime() -> &'static Arc<DhRuntime> {
+pub(crate) fn runtime() -> &'static Arc<DhRuntime> {
     RUNTIME.get_or_init(|| {
         Arc::new(DhRuntime {
             enabled_flag: AtomicBool::new(true),
@@ -1702,8 +1715,25 @@ pub fn record_frame_stats(section_high_water: u64, resident_sections: u64) {
     rt.frames_drawn.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Forgets the last prepared arena occupancy at a lifecycle change (arena retired or emptied,
+/// rendering disabled), where no later preparation would overwrite it. Atomics only, so it
+/// nests under any lock and never touches a replacement arena's own later record.
+fn clear_arena_stats() {
+    let rt = runtime();
+    rt.section_high_water.store(0, Ordering::Relaxed);
+    rt.resident_sections.store(0, Ordering::Relaxed);
+}
+
+/// Publishes the `enabled` setting. Turning rendering off clears the arena counters once, on the
+/// transition, instead of on every disabled frame.
+pub(crate) fn set_enabled(enabled: bool) {
+    if runtime().enabled_flag.swap(enabled, Ordering::Relaxed) && !enabled {
+        clear_arena_stats();
+    }
+}
+
 /// Snapshot stats for F3 and `/ds status`.
-pub fn stats() -> DhStats {
+pub(crate) fn stats() -> DhStats {
     let rt = runtime();
     let st = rt.inner.lock().unwrap();
     let active_dim = &st.active_dimension;
