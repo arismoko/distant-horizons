@@ -90,7 +90,7 @@
   "distantsunrises.command.setting_off": "Distant Sunrises %s disabled.",
   "distantsunrises.command.cleared": "Cleared %s cached Distant Sunrises sections in the active dimension.",
   "distantsunrises.command.remeshed": "Queued %s Distant Sunrises sections for re-meshing.",
-  "distantsunrises.command.status_line": "Distant Sunrises [%s] dim=%s radius=%sch sections=%s last prepared section slot span=%s last prepared resident sections=%s weather=%s",
+  "distantsunrises.command.status_line": "Distant Sunrises [%s] dim=%s radius=%sch sections=%s slots=%s resident=%s (last prepared frame) weather=%s",
   "distantsunrises.command.usage_radius": "Usage: /ds radius <32..512>",
   "distantsunrises.command.usage_quality": "Usage: /ds quality <low|medium|high>",
   "distantsunrises.command.usage_toggle": "Usage: /ds %s <on|off>",
