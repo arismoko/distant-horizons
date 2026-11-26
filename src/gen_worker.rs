@@ -80,8 +80,8 @@ pub struct GenResult {
     pub outcome: GenOutcome,
 }
 
-struct Shared {
-    queue: Mutex<VecDeque<GenJob>>,
+struct Shared<Job = GenJob> {
+    queue: Mutex<VecDeque<Job>>,
     cv: Condvar,
     in_flight: Mutex<HashMap<(String, SectionPos), u64>>,
     dim_epochs: Mutex<HashMap<String, u64>>,
@@ -111,9 +111,9 @@ fn logical_cpus() -> usize {
         .max(1)
 }
 
-impl GenWorkerPool {
-    pub fn new() -> Self {
-        let shared = Arc::new(Shared {
+impl<Job> Shared<Job> {
+    fn new(target: usize) -> Self {
+        Self {
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             in_flight: Mutex::new(HashMap::new()),
@@ -122,9 +122,52 @@ impl GenWorkerPool {
             global_epoch: AtomicU64::new(1),
             next_job_id: AtomicU64::new(1),
             stop: AtomicBool::new(false),
-            target_threads: AtomicUsize::new(ThreadPreset::default().thread_count(logical_cpus())),
+            target_threads: AtomicUsize::new(target),
             preset: AtomicU8::new(ThreadPreset::default() as u8),
-        });
+        }
+    }
+
+    fn set_worker_target(&self, target: usize) {
+        let previous = self.target_threads.load(Ordering::Acquire);
+        if target != previous {
+            let _queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            self.target_threads.store(target, Ordering::Release);
+            if target > previous {
+                self.cv.notify_all();
+            }
+        }
+    }
+
+    fn push_job(&self, job: Job) {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back(job);
+        // A single notification might go only to a parked slot. Wake all when work first
+        // arrives; eligible workers keep checking the queue until it is empty again.
+        if q.len() == 1 {
+            self.cv.notify_all();
+        }
+    }
+
+    fn wait_for_job(&self, idx: usize, mut before_wait: impl FnMut()) -> Option<Job> {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while !self.stop.load(Ordering::Acquire)
+            && (q.is_empty() || idx >= self.target_threads.load(Ordering::Acquire))
+        {
+            before_wait();
+            q = self.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+        if self.stop.load(Ordering::Acquire) {
+            return None;
+        }
+        q.pop_front()
+    }
+}
+
+impl GenWorkerPool {
+    pub fn new() -> Self {
+        let shared = Arc::new(Shared::new(
+            ThreadPreset::default().thread_count(logical_cpus()),
+        ));
         Self {
             shared,
             handles: Mutex::new(Vec::new()),
@@ -156,14 +199,7 @@ impl GenWorkerPool {
     fn apply_preset(&self, preset: ThreadPreset, target: usize) {
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         self.shared.preset.store(preset as u8, Ordering::Release);
-        let previous = self.shared.target_threads.load(Ordering::Acquire);
-        if target != previous {
-            let _queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-            self.shared.target_threads.store(target, Ordering::Release);
-            if target > previous {
-                self.shared.cv.notify_all();
-            }
-        }
+        self.shared.set_worker_target(target);
         if handles.is_empty() {
             return; // not running; `ensure_started` picks the new target up
         }
@@ -278,8 +314,7 @@ impl GenWorkerPool {
             in_flight.insert(key, job_id);
         }
         let global_epoch = self.shared.global_epoch.load(Ordering::Acquire);
-        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        q.push_back(GenJob {
+        self.shared.push_job(GenJob {
             job_id,
             global_epoch,
             dim_epoch,
@@ -290,11 +325,6 @@ impl GenWorkerPool {
             feature_stage,
             cells,
         });
-        // A single notification might go only to a parked slot. Wake all when work first
-        // arrives; eligible workers keep checking the queue until it is empty again.
-        if q.len() == 1 {
-            self.shared.cv.notify_all();
-        }
         true
     }
 
@@ -481,23 +511,7 @@ fn spawn_workers(shared: &Arc<Shared>, handles: &mut Vec<JoinHandle<()>>, target
 }
 
 fn worker_loop(shared: Arc<Shared>, idx: usize) {
-    loop {
-        let job = {
-            let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-            while !shared.stop.load(Ordering::Acquire)
-                && (q.is_empty() || idx >= shared.target_threads.load(Ordering::Acquire))
-            {
-                q = shared.cv.wait(q).unwrap_or_else(|e| e.into_inner());
-            }
-            if shared.stop.load(Ordering::Acquire) {
-                return;
-            }
-            q.pop_front()
-        };
-        let Some(job) = job else {
-            continue;
-        };
-
+    while let Some(job) = shared.wait_for_job(idx, || {}) {
         if !is_job_valid(&shared, &job) {
             clear_in_flight_if_matching(&shared, &job.dimension, job.pos, job.job_id);
             continue;
@@ -638,6 +652,52 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn trimmed_slot_parks_with_work_and_resumes_on_growth() {
+        let shared = Arc::new(Shared::new(2));
+        shared.push_job(41);
+        let (started, running) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let (parking, parked) = mpsc::channel();
+        let (popped, result) = mpsc::channel();
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            started.send(worker_shared.wait_for_job(1, || {})).unwrap();
+            held.recv().unwrap();
+            let mut parking = Some(parking);
+            let job = worker_shared.wait_for_job(1, || {
+                if let Some(parking) = parking.take() {
+                    parking.send(()).unwrap();
+                }
+            });
+            popped.send(job).unwrap();
+        });
+
+        let deadline = std::time::Duration::from_millis(500);
+        let first_job = running.recv_timeout(deadline);
+        shared.set_worker_target(1);
+        shared.push_job(42);
+        release.send(()).unwrap();
+
+        // The worker signals under the queue lock just before waiting. Growth must acquire
+        // that same lock, so it cannot notify before the worker has entered the wait.
+        let did_park = parked.recv_timeout(deadline);
+        let queued_while_trimmed = shared.queue.lock().unwrap().front().copied();
+        shared.set_worker_target(2);
+        let job = result.recv_timeout(deadline);
+        // Wake the worker for cleanup even if the growth notification regresses.
+        {
+            let _queue = shared.queue.lock().unwrap();
+            shared.stop.store(true, Ordering::Release);
+            shared.cv.notify_all();
+        }
+        worker.join().unwrap();
+        assert_eq!(first_job, Ok(Some(41)));
+        assert_eq!(did_park, Ok(()));
+        assert_eq!(queued_while_trimmed, Some(42));
+        assert_eq!(job, Ok(Some(42)));
+    }
 
     #[test]
     fn busy_slot_survives_preset_changes_and_is_joined_on_close() {
