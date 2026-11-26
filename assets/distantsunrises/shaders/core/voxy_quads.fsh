@@ -85,7 +85,7 @@ void main() {
 
     // Biome / constant tint. Voxy's "partial" tint (grass-like grey texels only) is the
     // conditional case: tint kinds 1-3 apply only to near-grey texels, kind 4 always.
-    if (inter.y != 0xFFFFFFFFu) {
+    if (inter.y != 0xFFFFFFFFu && inter.y != 0u) {
         vec3 tint = vec3(float(inter.y & 0xFFu), float((inter.y >> 8) & 0xFFu), float((inter.y >> 16) & 0xFFu)) / 255.0;
         bool grey = abs(albedo.r - albedo.g) < 0.02 && abs(albedo.g - albedo.b) < 0.02;
         if (tint_kind == 4u || grey) {
