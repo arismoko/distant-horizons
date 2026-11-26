@@ -277,7 +277,7 @@ impl OctreeIngestStore {
             let water_top = col.water.map(|w| w >> level).filter(|&w| w > height);
             let top = water_top.unwrap_or(height);
             for y in (height - DISTANT_SOLID_DEPTH + 1)..=height {
-                set(self, vx, y, vz, Voxel::new(id, biome, 0, 0));
+                set(self, vx, y, vz, Voxel::new(id, biome, 15, 0));
             }
             if let Some(w) = water_top {
                 for y in (height + 1)..=w {
@@ -485,7 +485,7 @@ pub fn ingest_distant_columns<B: Copy + Eq + Hash>(
         let water_top = col.water.filter(|&w| w > col.height);
         let top = water_top.unwrap_or(col.height);
         for y in bottom..=col.height {
-            store.set_voxel(col.x, y, col.z, Voxel::new(id, biome, 0, 0));
+            store.set_voxel(col.x, y, col.z, Voxel::new(id, biome, 15, 0));
         }
         if let Some(w) = water_top {
             for y in (col.height + 1)..=w {
@@ -694,6 +694,8 @@ mod tests {
         let cols = [column(40, 5, 20, Some(24), DIRT)];
         ingest_distant_columns(&mut store, &cols, WATER, &mut |b| b, &mut |_| 3);
         assert_eq!(store.voxel_at(40, 20, 5).block_id(), DIRT);
+        // Solids carry the surface's sky light: a face beside a leaf or grass voxel reads it.
+        assert_eq!(store.voxel_at(40, 20, 5).sky_light(), 15);
         assert_eq!(store.voxel_at(40, 13, 5).block_id(), DIRT);
         assert!(store.voxel_at(40, 12, 5).is_air());
         assert_eq!(store.voxel_at(40, 24, 5).block_id(), WATER);

@@ -263,7 +263,13 @@ pub fn mesh_octree_section(
                         }
                     }
                     // No neighbour loaded beyond a section border: open sky, not the solid voxel's own 0.
-                    let light = neighbor.map_or(0x0F, |n| n.light());
+                    // Air that no source wrote (light byte 0) is open sky too: distant columns only
+                    // carry a section's height of lit air above their surface, so beside a cliff
+                    // or under an overhang the neighbouring "air" is unwritten, not dark.
+                    let light = match neighbor {
+                        Some(n) if !(n.is_air() && n.light() == 0) => n.light(),
+                        _ => 0x0F,
+                    };
                     let biome = if meta.biome_coloured() {
                         v.biome_id()
                     } else {
@@ -665,5 +671,25 @@ mod octree_mesh_tests {
             .find(|q| q.face() == Face::PosY.id())
             .unwrap();
         assert_eq!((top.sky_light(), top.block_light()), (12, 3));
+    }
+
+    #[test]
+    fn unwritten_air_beside_and_under_an_overhang_is_open_sky() {
+        let mut s = OctreeSection::new(pos());
+        s.set(5, 5, 5, Voxel::new(STONE, 0, 15, 0));
+        // Solid above the unwritten air west of the stone: still lit, as distant columns hold no caves.
+        // Written air keeps its own light.
+        s.set(4, 9, 5, Voxel::new(STONE, 0, 15, 0));
+        s.set(5, 5, 6, Voxel::air_with_light(3, 0));
+        let m = mesh_octree_section(&s, &NeighborBorders::none(), &models);
+        let sky = |face: Face| {
+            m.opaque
+                .iter()
+                .find(|q| q.face() == face.id() && q.x() == 5 && q.y() == 5 && q.z() == 5)
+                .unwrap()
+                .sky_light()
+        };
+        assert_eq!(sky(Face::NegX), 15);
+        assert_eq!(sky(Face::PosZ), 3);
     }
 }
