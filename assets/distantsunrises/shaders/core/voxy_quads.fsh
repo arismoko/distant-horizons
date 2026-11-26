@@ -48,11 +48,15 @@ void main() {
     bool cutout = (mflags & 4u) != 0u;
     uint tint_kind = (mflags >> 4) & 15u;
 
-    // Clip region: the vanilla chunk area is a Chebyshev square around the camera chunk
+    // Clip region: vanilla's loaded chunk square is centered on the camera's 16x16 chunk
     // (until #5911 provides exact per-chunk AABB depth bounds); `clip_dist = 0` disables.
     float clip_dist = depth_and_light.z;
-    if (clip_dist > 0.0 && max(abs(rel_pos.x), abs(rel_pos.z)) < clip_dist) {
-        discard;
+    if (clip_dist > 0.0) {
+        vec2 cam_in_chunk = fract(camera_sub_pos.xz / 16.0) * 16.0;
+        vec2 rel_chunk_center = rel_pos.xz + (cam_in_chunk - vec2(8.0));
+        if (max(abs(rel_chunk_center.x), abs(rel_chunk_center.y)) < clip_dist) {
+            discard;
+        }
     }
 
     uint tile_origin = models[mbase + face];
@@ -159,12 +163,13 @@ void main() {
     vec3 rgb = hdr ? srgb_to_linear(albedo.rgb) : albedo.rgb;
 
     // Vanilla-style lightmap curve (block<<4 | sky) with non-linear sky/block response and
-    // subtle sky ambient so shaded valleys read naturally instead of harsh flat black.
+    // gamma-appropriate ambient floor so shadowed faces read naturally instead of jet black.
     float block = float((inter.z >> 4) & 15u) / 15.0;
     float sky = float(inter.z & 15u) / 15.0;
     float sky_curve = pow(sky * depth_and_light.w, 1.35);
     float block_curve = pow(block, 1.35);
-    float light = clamp(max(sky_curve, block_curve) * 0.86 + 0.14, 0.14, 1.0);
+    float min_light = hdr ? 0.08 : 0.34;
+    float light = clamp(max(sky_curve, block_curve) * (1.0 - min_light) + min_light, min_light, 1.0);
     float shade = flags.y != 0u ? face_shade : 1.0;
     rgb *= light * shade;
 
