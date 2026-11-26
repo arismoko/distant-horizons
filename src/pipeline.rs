@@ -380,23 +380,21 @@ pub enum SnapshotSource {
     Distant,
 }
 
-/// Ingest one chunk snapshot into `dim`'s octree store (server thread) and queue the touched
-/// sections for meshing. Returns whether the chunk was accepted (a higher-priority source owns it
-/// otherwise).
-pub fn ingest_chunk(
+/// Writes one chunk snapshot into `dim`'s store without propagating mips or queueing meshes.
+/// Returns whether the chunk was accepted; the caller runs [`propagate_and_queue`] afterwards.
+fn ingest_unpropagated(
+    p: &mut Pipeline,
     host: &dyn ServerHost,
     dim: &str,
     chunk: [i32; 2],
     snapshot: &ChunkSnapshot,
     source: SnapshotSource,
 ) -> bool {
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
     let cave_cull = (source == SnapshotSource::Distant && dim != "minecraft:the_nether")
         .then(|| (60, p.mapper.block_named(host, "minecraft:stone")));
     let store = p.stores.entry(dim.to_owned()).or_default();
     let mapper = std::cell::RefCell::new(&mut p.mapper);
-    let accepted = match source {
+    match source {
         SnapshotSource::Loaded => ingest_chunk_snapshot(
             store,
             chunk,
@@ -420,19 +418,63 @@ pub fn ingest_chunk(
             &mut |state| mapper.borrow_mut().block(host, state),
             &mut |biome| mapper.borrow_mut().biome(biome),
         ),
-    };
+    }
+}
+
+/// Propagates every dirty section of `dim`'s store up the octree once, then marks the touched
+/// sections unsaved and queues them for meshing.
+fn propagate_and_queue(p: &mut Pipeline, dim: &str) {
+    let mapper = &p.mapper;
+    let touched = p
+        .stores
+        .get_mut(dim)
+        .expect("store inserted by ingest")
+        .propagate_dirty(&|id| mapper.opacity(id));
+    p.unsaved
+        .entry(dim.to_owned())
+        .or_default()
+        .extend(touched.iter().copied());
+    p.queue(dim, touched);
+}
+
+/// Ingest one chunk snapshot into `dim`'s octree store (server thread) and queue the touched
+/// sections for meshing. Returns whether the chunk was accepted (a higher-priority source owns it
+/// otherwise).
+pub fn ingest_chunk(
+    host: &dyn ServerHost,
+    dim: &str,
+    chunk: [i32; 2],
+    snapshot: &ChunkSnapshot,
+    source: SnapshotSource,
+) -> bool {
+    let mut guard = PIPELINE.lock().unwrap();
+    let p = &mut *guard;
+    let accepted = ingest_unpropagated(p, host, dim, chunk, snapshot, source);
     if accepted {
-        let mapper = &p.mapper;
-        let touched = p
-            .stores
-            .get_mut(dim)
-            .expect("store inserted above")
-            .propagate_dirty(&|id| mapper.opacity(id));
-        p.unsaved
-            .entry(dim.to_owned())
-            .or_default()
-            .extend(touched.iter().copied());
-        p.queue(dim, touched);
+        propagate_and_queue(p, dim);
+    }
+    accepted
+}
+
+/// Ingest several chunk snapshots (one finished distant job) under a single `PIPELINE` lock and
+/// run `propagate_dirty` once for all accepted chunks instead of once per chunk. Returns how many
+/// chunks were accepted.
+pub fn ingest_chunks_batch(
+    host: &dyn ServerHost,
+    dim: &str,
+    chunks: &[([i32; 2], &ChunkSnapshot)],
+    source: SnapshotSource,
+) -> usize {
+    let mut guard = PIPELINE.lock().unwrap();
+    let p = &mut *guard;
+    let mut accepted = 0;
+    for &(chunk, snapshot) in chunks {
+        if ingest_unpropagated(p, host, dim, chunk, snapshot, source) {
+            accepted += 1;
+        }
+    }
+    if accepted > 0 {
+        propagate_and_queue(p, dim);
     }
     accepted
 }
@@ -687,6 +729,10 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         let has_quads = !built.is_empty();
         let key = (done_dim.clone(), pos.detail, [pos.x, pos.y, pos.z]);
         submit_built_section(key, built);
+        if !has_quads {
+            // The matching epoch is the newest job for `pos`: an empty result retires the entry.
+            p.section_epoch.remove(&(done_dim.clone(), pos));
+        }
         let changed = if has_quads {
             p.rendered.entry(done_dim.clone()).or_default().insert(pos)
         } else {
@@ -734,8 +780,9 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         };
         let key = (dim.to_owned(), pos.detail, [pos.x, pos.y, pos.z]);
         let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
-            p.next_epoch = p.next_epoch.wrapping_add(1);
-            p.section_epoch.insert((dim.to_owned(), pos), p.next_epoch);
+            // Removing the entry drops any in-flight mesh result for `pos` (no epoch matches) and
+            // keeps `section_epoch` bounded by the live sections.
+            p.section_epoch.remove(&(dim.to_owned(), pos));
             if p.rendered
                 .get_mut(dim)
                 .is_some_and(|live| live.remove(&pos))
@@ -749,8 +796,7 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             .get(dim)
             .map_or(0, |live| covered_rendered_mask(live, pos));
         if covered == 0xFF {
-            p.next_epoch = p.next_epoch.wrapping_add(1);
-            p.section_epoch.insert((dim.to_owned(), pos), p.next_epoch);
+            p.section_epoch.remove(&(dim.to_owned(), pos));
             if p.rendered
                 .get_mut(dim)
                 .is_some_and(|live| live.remove(&pos))

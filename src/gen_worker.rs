@@ -28,6 +28,18 @@ use std::thread::{self, JoinHandle};
 /// `getMaxRetrievalQueueCount()` line 206: `20 * numberOfThreads`).
 const MAX_RETRIEVAL_REQUESTS_PER_THREAD: usize = 20;
 
+/// Cap on finished `ChunkSnapshot`s buffered in `done` (4 detail-0 jobs of 16 chunks). At or
+/// above it no new detail-0 job is dispatched, so a busy server thread cannot let full 3D
+/// snapshots pile up: `done` stays below `MAX_DONE_CHUNKS` plus what the already dispatched
+/// detail-0 jobs (at most `2 * workers`) can still add.
+pub const MAX_DONE_CHUNKS: usize = 64;
+
+/// Whether dispatching another detail-0 job must wait: `done_chunks` snapshots are already
+/// buffered, or `unfinished_jobs` detail-0 jobs (queued or running) already fill two per worker.
+fn detail0_dispatch_paused(done_chunks: usize, unfinished_jobs: usize, workers: usize) -> bool {
+    done_chunks >= MAX_DONE_CHUNKS || unfinished_jobs >= workers.max(1) * 2
+}
+
 /// Columns sampled per `sample_surface_columns` call inside a worker thread so
 /// world-exit / invalidation cancellation is observed promptly between chunks.
 const WORKER_CHUNK_COLS: usize = 256;
@@ -182,6 +194,33 @@ impl GenWorkerPool {
         set.len() < cap
     }
 
+    /// Backpressure for detail-0 jobs, the only ones that carry `ChunkSnapshot`s.
+    fn detail0_paused(&self) -> bool {
+        let (done_chunks, done_jobs) = {
+            let done = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                done.iter()
+                    .map(|r| r.saved_chunks.len() + r.generated_chunks.len())
+                    .sum::<usize>(),
+                done.iter().filter(|r| r.pos.detail == 0).count(),
+            )
+        };
+        // `in_flight` holds queued, running and finished-but-undrained jobs alike.
+        let in_flight_jobs = self
+            .shared
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter(|(_, p)| p.detail == 0)
+            .count();
+        detail0_dispatch_paused(
+            done_chunks,
+            in_flight_jobs.saturating_sub(done_jobs),
+            self.worker_count(),
+        )
+    }
+
     pub fn is_in_flight(&self, dim: &str, pos: SectionPos) -> bool {
         let set = self
             .shared
@@ -206,6 +245,9 @@ impl GenWorkerPool {
             return false;
         }
         if self.ensure_started() == 0 {
+            return false;
+        }
+        if pos.detail == 0 && self.detail0_paused() {
             return false;
         }
         let cap = self.max_in_flight.load(Ordering::Acquire);
@@ -591,5 +633,31 @@ fn worker_loop(shared: Arc<Shared>, idx: usize) {
                 generated_chunks,
                 outcome,
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn done_chunk_cap_pauses_detail0_dispatch() {
+        assert!(!detail0_dispatch_paused(0, 0, 4));
+        assert!(!detail0_dispatch_paused(MAX_DONE_CHUNKS - 1, 0, 4));
+        assert!(detail0_dispatch_paused(MAX_DONE_CHUNKS, 0, 4));
+        assert!(detail0_dispatch_paused(MAX_DONE_CHUNKS + 16, 0, 4));
+    }
+
+    #[test]
+    fn unfinished_detail0_jobs_are_bounded_by_two_per_worker() {
+        assert!(!detail0_dispatch_paused(0, 7, 4));
+        assert!(detail0_dispatch_paused(0, 8, 4));
+        // No workers still counts as one, so the cap never divides to zero.
+        assert!(detail0_dispatch_paused(0, 2, 0));
+    }
+
+    #[test]
+    fn a_full_done_buffer_is_at_most_four_full_jobs() {
+        assert_eq!(MAX_DONE_CHUNKS / 16, 4);
     }
 }
