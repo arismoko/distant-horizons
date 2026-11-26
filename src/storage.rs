@@ -26,7 +26,7 @@ use crate::octree::{
     MAX_OCTREE_DETAIL, OctreeError, OctreeSection, OctreeSectionPos, RleSection, Run,
     SECTION_VOLUME, Voxel,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -1025,7 +1025,12 @@ struct OpenRegion {
 }
 
 impl OpenRegion {
-    fn open(path: &Path, writable: bool, tick: u64) -> io::Result<Option<Self>> {
+    fn open(
+        path: &Path,
+        writable: bool,
+        tick: u64,
+        quarantine: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<Option<Self>> {
         let open_res = OpenOptions::new().read(true).write(writable).open(path);
         let mut file = match open_res {
             Ok(f) => f,
@@ -1084,23 +1089,10 @@ impl OpenRegion {
             return Ok(None);
         }
 
-        // Quarantine the unrecoverable corrupt file before reinitializing so saves never brick
-        // permanently and forensic data isn't silently overwritten.
+        // Reinitialize only after quarantine preserves the original at its new path.
+        // If renaming fails, the cache refuses writes to this path until the disk session resets.
         drop(file);
-        let corrupt = unique_tmp_path(path, "corrupt");
-        if let Err(e) = fs::rename(path, &corrupt) {
-            eprintln!(
-                "DH: failed to quarantine corrupt region {}: {e}",
-                path.display()
-            );
-            let _ = fs::remove_file(path);
-        } else {
-            eprintln!(
-                "DH: quarantined corrupt region {} -> {}",
-                path.display(),
-                corrupt.display()
-            );
-        }
+        quarantine()?;
         create_empty_region_atomic(path)?;
         let fresh = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(Some(Self {
@@ -1289,15 +1281,87 @@ impl OpenRegion {
     }
 }
 
+/// A save refusal whose cause was already logged at the failed quarantine rename.
+#[derive(Debug)]
+struct RegionWriteRefused;
+
+impl RegionWriteRefused {
+    fn matches(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|cause| cause.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for RegionWriteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("region is read-only for this disk session after quarantine failed")
+    }
+}
+
+impl std::error::Error for RegionWriteRefused {}
+
+impl From<RegionWriteRefused> for io::Error {
+    fn from(error: RegionWriteRefused) -> Self {
+        Self::new(io::ErrorKind::PermissionDenied, error)
+    }
+}
+
+#[cfg(test)]
+type QuarantineRename = Box<dyn FnMut(&Path, &Path) -> io::Result<()> + Send>;
+
 /// Region file handle + index cache owned by the background IO worker thread.
 #[derive(Default)]
 pub struct RegionCache {
     regions: HashMap<PathBuf, OpenRegion>,
+    // Keep failed paths outside the handle LRU: only a disk session reset unblocks them.
+    quarantine_failed: HashSet<PathBuf>,
     tick: u64,
+    #[cfg(test)]
+    quarantine_rename: Option<QuarantineRename>,
 }
 
 impl RegionCache {
+    fn quarantine(&mut self, path: &Path) -> io::Result<()> {
+        let corrupt = unique_tmp_path(path, "corrupt");
+        #[cfg(test)]
+        let result = self.quarantine_rename.as_mut().map_or_else(
+            || fs::rename(path, &corrupt),
+            |rename| rename(path, &corrupt),
+        );
+        #[cfg(not(test))]
+        let result = fs::rename(path, &corrupt);
+
+        if let Err(e) = result {
+            self.quarantine_failed.insert(path.to_path_buf());
+            eprintln!(
+                "DH: failed to quarantine corrupt region {}: {e}; leaving it read-only for this disk session",
+                path.display()
+            );
+            return Err(RegionWriteRefused.into());
+        }
+        eprintln!(
+            "DH: quarantined corrupt region {} -> {}",
+            path.display(),
+            corrupt.display()
+        );
+        Ok(())
+    }
+
+    // Refuse before encoding or treating an empty octree slot as a no-op.
+    fn check_write_allowed(&self, path: &Path) -> io::Result<()> {
+        if self.quarantine_failed.contains(path) {
+            return Err(RegionWriteRefused.into());
+        }
+        Ok(())
+    }
+
     fn get_region(&mut self, path: &Path, writable: bool) -> io::Result<Option<&mut OpenRegion>> {
+        if self.quarantine_failed.contains(path) {
+            return if writable {
+                Err(RegionWriteRefused.into())
+            } else {
+                Ok(None)
+            };
+        }
         self.tick = self.tick.wrapping_add(1);
         let now = self.tick;
 
@@ -1313,7 +1377,7 @@ impl RegionCache {
 
         if !self.regions.contains_key(path) {
             // Open BEFORE evicting so probing nonexistent files never evicts hot handles.
-            let Some(reg) = OpenRegion::open(path, writable, now)? else {
+            let Some(reg) = OpenRegion::open(path, writable, now, || self.quarantine(path))? else {
                 return Ok(None);
             };
             if self.regions.len() >= MAX_CACHED_REGIONS
@@ -1336,6 +1400,8 @@ impl RegionCache {
         }
     }
 
+    /// Store a column section, or return `PermissionDenied` if quarantine has failed for the
+    /// region this disk session.
     pub fn save_section(
         &mut self,
         world_dir: &Path,
@@ -1343,6 +1409,7 @@ impl RegionCache {
         section: &LodSection,
     ) -> io::Result<()> {
         let path = region_path(world_dir, dimension, section.pos);
+        self.check_write_allowed(&path)?;
         let (_, _, slot_idx) = section_region_slot(section.pos);
         let (record, crc) = compress_section_record(section).ok_or_else(|| {
             io::Error::new(
@@ -1388,7 +1455,8 @@ impl RegionCache {
 impl RegionCache {
     /// Encode and store one octree section in its `.dhoct` region slot (copy-on-write append,
     /// then header commit, as for column regions). All-air sections can clear existing data but
-    /// do not allocate a slot of their own.
+    /// do not allocate a slot of their own. Returns `PermissionDenied` if quarantine has failed
+    /// for the region this disk session.
     pub fn save_octree_section(
         &mut self,
         world_dir: &Path,
@@ -1398,6 +1466,7 @@ impl RegionCache {
         mode: DhV2CompressionMode,
     ) -> io::Result<()> {
         let path = octree_region_path(world_dir, dimension, section.pos);
+        self.check_write_allowed(&path)?;
         let (_, _, _, slot_idx) = octree_region_slot(section.pos);
         // Probe without creating a region, after queue coalescing and any in-flight write.
         if section.is_empty()
@@ -1517,6 +1586,10 @@ pub struct LodIoWorker {
 
 impl LodIoWorker {
     pub fn spawn() -> Self {
+        Self::spawn_with_cache(RegionCache::default())
+    }
+
+    fn spawn_with_cache(cache: RegionCache) -> Self {
         let shared = Arc::new(IoShared {
             state: Mutex::new(IoQueueState::default()),
             wake_worker: Condvar::new(),
@@ -1525,7 +1598,7 @@ impl LodIoWorker {
         let worker_shared = Arc::clone(&shared);
         let handle = match thread::Builder::new()
             .name("dh-lod-io".into())
-            .spawn(move || run_io_worker(worker_shared))
+            .spawn(move || run_io_worker(worker_shared, cache))
         {
             Ok(h) => Some(h),
             Err(e) => {
@@ -1679,8 +1752,7 @@ impl Drop for LodIoWorker {
     }
 }
 
-fn run_io_worker(shared: Arc<IoShared>) {
-    let mut cache = RegionCache::default();
+fn run_io_worker(shared: Arc<IoShared>, mut cache: RegionCache) {
     loop {
         enum Task {
             Save(PathBuf, String, LodSection),
@@ -1715,6 +1787,7 @@ fn run_io_worker(shared: Arc<IoShared>) {
                 }
                 if st.reset_regions {
                     cache.regions.clear();
+                    cache.quarantine_failed.clear();
                     st.responses.clear();
                     st.octree_responses.clear();
                     st.reset_regions = false;
@@ -1737,7 +1810,9 @@ fn run_io_worker(shared: Arc<IoShared>) {
                     &job.mapping,
                     job.mode,
                 );
-                if let Err(ref e) = res {
+                if let Err(ref e) = res
+                    && !RegionWriteRefused::matches(e)
+                {
                     eprintln!("DH: failed to save octree section {pos:?} in {dimension}: {e}");
                 }
                 let mut st = shared.state.lock().unwrap();
@@ -1763,7 +1838,9 @@ fn run_io_worker(shared: Arc<IoShared>) {
             }
             Task::Save(world_dir, dimension, section) => {
                 let res = cache.save_section(&world_dir, &dimension, &section);
-                if let Err(ref e) = res {
+                if let Err(ref e) = res
+                    && !RegionWriteRefused::matches(e)
+                {
                     eprintln!(
                         "DH: failed to save section {:?} in {}: {e}",
                         section.pos, dimension
@@ -2367,6 +2444,164 @@ mod tests {
     }
 
     #[test]
+    fn region_quarantine_failure_blocks_both_formats_until_worker_cache_reset() {
+        let dir = TestTempDir::new("quarantine-failure");
+        let dim = "minecraft:overworld";
+        let column = SectionPos::new(0, 0, 0);
+        let octree = OctreeSectionPos::new(0, 0, 0, 0);
+        let column_path = region_path(&dir, dim, column);
+        let octree_path = octree_region_path(&dir, dim, octree);
+        let old_column = vec![0x33; REGION_HEADER_BYTES + 17];
+        let old_octree = vec![0x55; REGION_HEADER_BYTES + 31];
+        let originals = [(&column_path, &old_column), (&octree_path, &old_octree)];
+        for (path, bytes) in originals {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
+        let attempts = Arc::new(Mutex::new(HashMap::<PathBuf, Vec<PathBuf>>::new()));
+        let rename_attempts = Arc::clone(&attempts);
+        let worker = LodIoWorker::spawn_with_cache(RegionCache {
+            quarantine_rename: Some(Box::new(move |from, to| {
+                let mut attempts = rename_attempts.lock().unwrap();
+                let destinations = attempts.entry(from.to_path_buf()).or_default();
+                destinations.push(to.to_path_buf());
+                if destinations.len() == 1 {
+                    return Err(io::Error::other("injected quarantine rename failure"));
+                }
+                fs::rename(from, to)
+            })),
+            ..RegionCache::default()
+        });
+
+        let read_misses = |column, octree| {
+            worker.request_load(dir.to_path_buf(), dim.into(), column);
+            worker.load_octree_section(dir.to_path_buf(), dim.into(), octree, 1, false);
+            worker.flush();
+            assert!(worker.drain_responses().is_empty());
+            let probes = worker.drain_octree_responses();
+            assert_eq!(probes.len(), 1);
+            assert!(probes.into_iter().next().unwrap().result.unwrap().is_none());
+        };
+        let queue_saves = |column, octree| {
+            let column = sample_section(column, 88);
+            let octree = OctreeSection::filled(octree, Voxel::new(2, 0, 12, 0));
+            worker.request_save(dir.to_path_buf(), dim.into(), column.clone());
+            worker.save_octree_section(
+                dir.to_path_buf(),
+                dim.into(),
+                octree.clone(),
+                OctreeMapping::default(),
+            );
+            (column, octree)
+        };
+        let assert_saved = |column: LodSection, octree: OctreeSection| {
+            worker.flush();
+            assert!(matches!(
+                worker.drain_responses().as_slice(),
+                [IoResponse::Saved]
+            ));
+            worker.request_load(dir.to_path_buf(), dim.into(), column.pos);
+            worker.load_octree_section(dir.to_path_buf(), dim.into(), octree.pos, 2, false);
+            worker.flush();
+            assert!(matches!(
+                worker.drain_responses().as_slice(),
+                [IoResponse::Loaded { dimension, section }]
+                    if dimension.as_str() == dim && section.pos == column.pos
+                        && section.columns == column.columns
+            ));
+            let mut probes = worker.drain_octree_responses();
+            assert_eq!(probes.len(), 1);
+            let (loaded, _) = probes.pop().unwrap().result.unwrap().unwrap();
+            assert_eq!(loaded.pos, octree.pos);
+            assert_eq!(loaded.to_dense(), octree.to_dense());
+        };
+        let assert_first_failures_preserved = || {
+            let attempts = attempts.lock().unwrap();
+            assert_eq!(attempts.len(), originals.len());
+            for (path, bytes) in originals {
+                assert_eq!(attempts[path].len(), 1, "{}", path.display());
+                assert!(!attempts[path][0].exists());
+                assert_eq!(&fs::read(path).unwrap(), bytes);
+            }
+        };
+
+        read_misses(column, octree);
+        assert!(attempts.lock().unwrap().is_empty());
+        for (path, bytes) in originals {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+        }
+        queue_saves(column, octree);
+        worker.flush();
+        assert!(worker.drain_responses().is_empty(), "no Saved on refusal");
+        assert_first_failures_preserved();
+        read_misses(column, octree);
+
+        // Open enough distinct region handles to force eviction without resetting the session.
+        let mut empty_region = vec![0; REGION_HEADER_BYTES];
+        empty_region[..HEADER_PAGE_BYTES].copy_from_slice(&encode_header_page(
+            1,
+            &[SlotEntry::default(); REGION_SLOTS],
+        ));
+        for i in 1..=MAX_CACHED_REGIONS + 1 {
+            let pos = OctreeSectionPos::new(0, (i as i32) << OCT_REGION_SHIFT_X, 0, 0);
+            fs::write(octree_region_path(&dir, dim, pos), &empty_region).unwrap();
+            worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 3, false);
+        }
+        worker.flush();
+        let probes = worker.drain_octree_responses();
+        assert_eq!(probes.len(), MAX_CACHED_REGIONS + 1);
+        assert!(
+            probes
+                .into_iter()
+                .all(|probe| probe.result.unwrap().is_none())
+        );
+
+        let column_neighbor = SectionPos::new(0, 1, 0);
+        let octree_neighbor = OctreeSectionPos::new(0, 1, 0, 0);
+        queue_saves(column, octree);
+        queue_saves(column_neighbor, octree_neighbor);
+        worker.flush();
+        assert!(worker.drain_responses().is_empty(), "no Saved on retries");
+        read_misses(column_neighbor, octree_neighbor);
+        assert_first_failures_preserved();
+
+        // The refusal is scoped to the exact file, not the dimension or file format.
+        let (healthy_column, healthy_octree) = queue_saves(
+            SectionPos::new(0, REGION_SIZE as i32, 0),
+            OctreeSectionPos::new(0, 1 << OCT_REGION_SHIFT_X, 0, 0),
+        );
+        assert_saved(healthy_column, healthy_octree);
+        assert_first_failures_preserved();
+
+        worker.reset_world();
+        read_misses(column, octree);
+        assert_first_failures_preserved();
+        let (new_column, new_octree) = queue_saves(column, octree);
+        assert_saved(new_column, new_octree);
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(attempts.len(), originals.len());
+        for (path, bytes) in originals {
+            let [failed, quarantined] = attempts[path].as_slice() else {
+                panic!(
+                    "expected one failed rename and one retry for {}",
+                    path.display()
+                );
+            };
+            assert!(!failed.exists());
+            let prefix = format!("{}.corrupt.", path.file_name().unwrap().to_string_lossy());
+            assert!(
+                quarantined
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            );
+            assert_eq!(&fs::read(quarantined).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn octree_worker_rewrites_existing_slots_with_air_without_allocating_new_ones() {
         let dir = TestTempDir::new("octree-air");
         let dim = "minecraft:overworld";
@@ -2453,7 +2688,7 @@ mod tests {
             OctreeMapping::default(),
         );
         worker.shared.state.lock().unwrap().shutdown = true;
-        run_io_worker(Arc::clone(&worker.shared));
+        run_io_worker(Arc::clone(&worker.shared), RegionCache::default());
 
         let got = worker.drain_octree_responses();
         assert_eq!(got.len(), 1);
