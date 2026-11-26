@@ -6,7 +6,7 @@
 //!   `host.server_has_time()` budgeting into 32³ octree sections (`octree`, `pipeline`), and
 //!   persists them (`DHLOD003` / `.dhoct`, `storage`) on a background IO worker.
 //! - `pipeline` greedy-meshes each section into 8-byte packed quads (`mesh`) using the baked
-//!   per-block models and 4x4 face atlas (`bakery`) and hands them to the GPU arena.
+//!   per-block models and 16x16 mipmapped face atlas (`bakery`) and hands them to the GPU arena.
 //! - `network::octree_sync` streams sections to remote clients over one raw play channel.
 //! - The client tracks camera, day-time lighting, settings (`Options > Mods`), fog colors
 //!   (`render_fog`) and F3 telemetry. `gpu_arena` + GLSL compute (Hi-Z, command generation) and
