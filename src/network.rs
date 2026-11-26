@@ -1711,13 +1711,22 @@ pub mod octree_sync {
                         None => events.push(ClientEvent::UpToDate { level, pos }),
                         Some(payload) => match self.receiver.take(payload.buffer_id) {
                             None => events.push(ClientEvent::Lost { level, pos }),
-                            Some(buffer) => complete_full_response(
-                                events,
-                                level,
-                                pos,
-                                OctreeSectionDto::decode(&buffer)
-                                    .and_then(|dto| dto.into_section()),
-                            )?,
+                            Some(buffer) => match OctreeSectionDto::decode(&buffer)
+                                .and_then(|dto| dto.into_section())
+                            {
+                                Ok((section, mapping)) => events.push(ClientEvent::Section {
+                                    level,
+                                    section,
+                                    mapping,
+                                }),
+                                Err(err) => {
+                                    // The future is already retired. Queue completion even when
+                                    // returning the diagnostic to the payload handler so the
+                                    // pipeline can remove its marker.
+                                    events.push(ClientEvent::Lost { level, pos });
+                                    return Err(err);
+                                }
+                            },
                         },
                     }
                 }
@@ -1736,28 +1745,6 @@ pub mod octree_sync {
             }
             Ok(())
         }
-    }
-
-    fn complete_full_response(
-        events: &mut Vec<ClientEvent>,
-        level: String,
-        pos: OctreeSectionPos,
-        decoded: Result<(OctreeSection, Vec<MappingEntry>), SyncError>,
-    ) -> Result<(), SyncError> {
-        match decoded {
-            Ok((section, mapping)) => events.push(ClientEvent::Section {
-                level,
-                section,
-                mapping,
-            }),
-            Err(err) => {
-                // The future is already retired. Queue completion even when returning the
-                // diagnostic to the payload handler so the pipeline can remove its marker.
-                events.push(ClientEvent::Lost { level, pos });
-                return Err(err);
-            }
-        }
-        Ok(())
     }
 
     // ------------------------------------------------------------------ Sunrise payload glue
@@ -2024,20 +2011,38 @@ pub mod octree_sync {
         const LEVEL: &str = "minecraft:overworld";
 
         #[test]
-        fn unreadable_full_response_queues_lost_completion_and_preserves_error() {
-            let mut intake = ClientIntake::default();
+        fn full_response_without_transfer_queues_lost_and_retires_the_future() {
+            // Covers the real missing-transfer branch only; the decode-error branch is not
+            // exercised because no corrupted packet is crafted.
+            let now = Instant::now();
             let pos = OctreeSectionPos::new(0, 2, 1, -3);
-            let result = complete_full_response(
-                &mut intake.events,
-                LEVEL.into(),
-                pos,
-                Err(SyncError::ChecksumMismatch),
+            let mut intake = ClientIntake::default();
+            assert!(intake.configure(|_| Ok(PayloadAccepted::Queued)));
+            assert!(intake.send_request(LEVEL, pos, None, |_| Ok(PayloadAccepted::Queued)));
+            assert_eq!(
+                intake.session.pending.get(&0),
+                Some(&(LEVEL.to_owned(), pos))
             );
-            assert_eq!(result, Err(SyncError::ChecksumMismatch));
+            let response = Message::Response(OctreeSectionResponse {
+                future_id: 0,
+                payload: Some(OctreePayload {
+                    buffer_id: 4242,
+                    beacon_beams: Vec::new(),
+                }),
+            })
+            .encode()
+            .unwrap();
+
+            intake.receive(&response, now, || true).unwrap();
+            assert!(intake.session.pending.is_empty());
             assert!(matches!(
                 intake.events.as_slice(),
                 [ClientEvent::Lost { level, pos: lost }] if level == LEVEL && *lost == pos
             ));
+
+            intake.events.clear();
+            intake.receive(&response, now, || true).unwrap();
+            assert!(intake.events.is_empty(), "a retired future completes once");
         }
 
         #[test]
