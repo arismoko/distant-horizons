@@ -574,13 +574,12 @@ fn compress_blob(raw: &[u8], mode: DhV2CompressionMode) -> Result<Vec<u8>, Octre
 fn decompress_octree_blob(
     blob: &[u8],
     mode: DhV2CompressionMode,
+    limit: usize,
 ) -> Result<Vec<u8>, OctreeCodecError> {
-    let raw = dh_v2::decompress_blob(blob, mode)
-        .map_err(|e| OctreeCodecError::Decompress(e.to_string()))?;
-    if raw.len() > MAX_OCTREE_BLOB_BYTES {
-        return Err(OctreeCodecError::Oversized("decompressed blob"));
-    }
-    Ok(raw)
+    dh_v2::decompress_blob_with_limit(blob, mode, limit).map_err(|e| match e {
+        dh_v2::DhV2Error::InvalidLength(_) => OctreeCodecError::Oversized("decompressed blob"),
+        _ => OctreeCodecError::Decompress(e.to_string()),
+    })
 }
 
 /// Encode `section` plus its name tables as one `DHLOD003` record using `mode`.
@@ -703,7 +702,7 @@ pub fn decode_octree_section(
     }
 
     // Data blob.
-    let raw = decompress_octree_blob(data_blob, mode)?;
+    let raw = decompress_octree_blob(data_blob, mode, MAX_OCTREE_BLOB_BYTES)?;
     let mut d = Cursor::new(&raw);
     let palette_len = d.varint()? as usize;
     if palette_len == 0 {
@@ -769,7 +768,7 @@ pub fn decode_octree_section(
     section.revision = revision;
 
     // Mapping blob (`IDMAP` deserialize, lines 268-339).
-    let raw = decompress_octree_blob(names_blob, mode)?;
+    let raw = decompress_octree_blob(names_blob, mode, MAX_OCTREE_BLOB_BYTES)?;
     let mut m = Cursor::new(&raw);
     let count = m.i32()?;
     if count < 0 {
@@ -2098,6 +2097,38 @@ mod tests {
         assert!(zstd.len() < plain.len());
         assert_eq!(DEFAULT_OCTREE_COMPRESSION as u8, 4);
         assert_eq!(DhV2CompressionMode::Lz4 as u8, 1);
+    }
+
+    #[test]
+    fn octree_blob_limit_is_inclusive_and_applies_to_both_blobs() {
+        let mode = DhV2CompressionMode::Lz4;
+        let limit = MAX_OCTREE_BLOB_BYTES;
+        let payload = vec![0x5a; limit + 1];
+        let exact = compress_blob(&payload[..limit], mode).unwrap();
+        let decoded = decompress_octree_blob(&exact, mode, limit).unwrap();
+        assert!(decoded == payload[..limit]);
+        let oversized = compress_blob(&payload, mode).unwrap();
+
+        let (section, mapping) = populated_octree(OctreeSectionPos::new(0, 0, 0, 0));
+        let record = encode_octree_section(&section, &mapping, mode).unwrap();
+        let mut blobs = Cursor::new(&record[OCTREE_HEADER_BYTES..record.len() - 4]);
+        let data_len = blobs.u32().unwrap() as usize;
+        let data = blobs.take(data_len).unwrap();
+        let names_len = blobs.u32().unwrap() as usize;
+        let names = blobs.take(names_len).unwrap();
+        for (data, names) in [(oversized.as_slice(), names), (data, oversized.as_slice())] {
+            let mut record = record[..OCTREE_HEADER_BYTES].to_vec();
+            for blob in [data, names] {
+                record.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+                record.extend_from_slice(blob);
+            }
+            let crc = crc32fast::hash(&record);
+            record.extend_from_slice(&crc.to_be_bytes());
+            assert_eq!(
+                decode_octree_section(&record).unwrap_err(),
+                OctreeCodecError::Oversized("decompressed blob")
+            );
+        }
     }
 
     #[test]

@@ -607,35 +607,34 @@ fn decode_data_v2_region(
     Ok(())
 }
 
-/// Decompresses a single DH V2 blob according to `mode`, enforcing [`MAX_DECOMPRESSED_BYTES`].
+/// Decompresses a single DH V2 blob according to `mode`, with a 64 MiB output limit.
 pub fn decompress_blob(data: &[u8], mode: DhV2CompressionMode) -> Result<Vec<u8>, DhV2Error> {
+    decompress_blob_with_limit(data, mode, MAX_DECOMPRESSED_BYTES)
+}
+
+/// Decodes at most `limit` output bytes. `InvalidLength` means the output limit was exceeded.
+pub(crate) fn decompress_blob_with_limit(
+    data: &[u8],
+    mode: DhV2CompressionMode,
+    limit: usize,
+) -> Result<Vec<u8>, DhV2Error> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
     match mode {
         DhV2CompressionMode::Uncompressed => {
-            if data.len() > MAX_DECOMPRESSED_BYTES {
+            if data.len() > limit {
                 return Err(DhV2Error::InvalidLength(
                     "uncompressed blob exceeds limit".into(),
                 ));
             }
             Ok(data.to_vec())
         }
-        DhV2CompressionMode::Lz4 => decompress_lz4_frame(data),
+        DhV2CompressionMode::Lz4 => decompress_lz4_frame(data, limit),
         DhV2CompressionMode::ZstdBlock | DhV2CompressionMode::ZstdStream => {
             let decoder = ruzstd::decoding::StreamingDecoder::new(data)
                 .map_err(|e| DhV2Error::DecompressFailed(e.to_string()))?;
-            let mut out = Vec::new();
-            decoder
-                .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
-                .read_to_end(&mut out)
-                .map_err(|e| DhV2Error::DecompressFailed(e.to_string()))?;
-            if out.len() > MAX_DECOMPRESSED_BYTES {
-                return Err(DhV2Error::InvalidLength(
-                    "zstd decompressed blob exceeds limit".into(),
-                ));
-            }
-            Ok(out)
+            read_bounded(decoder, limit, "zstd")
         }
         DhV2CompressionMode::Lzma2 => {
             let decoder = xz4rust::XzDecoder::in_heap_with_alloc_dict_size(1 << 20, 16 << 20);
@@ -645,24 +644,39 @@ pub fn decompress_blob(data: &[u8], mode: DhV2CompressionMode) -> Result<Vec<u8>
                 buf_size,
                 decoder,
             );
-            let mut out = Vec::new();
-            reader
-                .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
-                .read_to_end(&mut out)
-                .map_err(|e| DhV2Error::DecompressFailed(e.to_string()))?;
-            if out.len() > MAX_DECOMPRESSED_BYTES {
-                return Err(DhV2Error::InvalidLength(
-                    "xz decompressed blob exceeds limit".into(),
-                ));
-            }
-            Ok(out)
+            read_bounded(reader, limit, "xz")
         }
     }
 }
 
+fn read_bounded(mut reader: impl Read, limit: usize, codec: &str) -> Result<Vec<u8>, DhV2Error> {
+    let mut out = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64)
+        .read_to_end(&mut out)
+        .map_err(|e| DhV2Error::DecompressFailed(e.to_string()))?;
+    if out.len() == limit {
+        // Take stops at the limit even if there is more output. Probe without growing `out`.
+        loop {
+            match reader.read(&mut [0]) {
+                Ok(0) => break,
+                Ok(_) => {
+                    return Err(DhV2Error::InvalidLength(format!(
+                        "{codec} decompressed blob exceeds limit"
+                    )));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(DhV2Error::DecompressFailed(e.to_string())),
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Decodes a standard LZ4 frame (`0x184D2204`, produced by Java `LZ4FrameOutputStream`) using
 /// `lz4_flex::block::decompress` with zero extra crates.
-fn decompress_lz4_frame(data: &[u8]) -> Result<Vec<u8>, DhV2Error> {
+fn decompress_lz4_frame(data: &[u8], limit: usize) -> Result<Vec<u8>, DhV2Error> {
     if data.len() < 7 {
         return Err(DhV2Error::DecompressFailed("lz4 frame too short".into()));
     }
@@ -746,21 +760,26 @@ fn decompress_lz4_frame(data: &[u8]) -> Result<Vec<u8>, DhV2Error> {
             }
             pos += 4;
         }
+        let remaining = limit - out.len();
         if uncompressed {
-            if out.len().saturating_add(block_bytes.len()) > MAX_DECOMPRESSED_BYTES {
+            if block_bytes.len() > remaining {
                 return Err(DhV2Error::InvalidLength(
                     "lz4 decompressed blob exceeds limit".into(),
                 ));
             }
             out.extend_from_slice(block_bytes);
         } else {
-            let decoded = lz4_flex::block::decompress(block_bytes, block_max_size)
-                .map_err(|e| DhV2Error::DecompressFailed(e.to_string()))?;
-            if out.len().saturating_add(decoded.len()) > MAX_DECOMPRESSED_BYTES {
-                return Err(DhV2Error::InvalidLength(
-                    "lz4 decompressed blob exceeds limit".into(),
-                ));
-            }
+            // With safe-decode, lz4_flex 0.14.0 uses a fixed-size output slice and
+            // reports OutputTooSmall before a literal or match would exceed it.
+            let decoded = lz4_flex::block::decompress(block_bytes, block_max_size.min(remaining))
+                .map_err(|e| match e {
+                lz4_flex::block::DecompressError::OutputTooSmall { expected, .. }
+                    if remaining < block_max_size && expected <= block_max_size =>
+                {
+                    DhV2Error::InvalidLength("lz4 decompressed blob exceeds limit".into())
+                }
+                _ => DhV2Error::DecompressFailed(e.to_string()),
+            })?;
             out.extend_from_slice(&decoded);
         }
     }
@@ -960,21 +979,86 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reader_stops_after_one_overflow_byte() {
+        struct CountingReader<R> {
+            inner: R,
+            emitted: usize,
+        }
+        impl<R: Read> Read for CountingReader<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.emitted += n;
+                Ok(n)
+            }
+        }
+
+        let payload = [b'a'; 64];
+        let blob = ruzstd::encoding::compress_to_vec(
+            payload.as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        let reader = || CountingReader {
+            inner: ruzstd::decoding::StreamingDecoder::new(blob.as_slice()).unwrap(),
+            emitted: 0,
+        };
+        assert_eq!(
+            read_bounded(reader(), payload.len(), "zstd").unwrap(),
+            payload
+        );
+        let mut oversized = reader();
+        assert!(matches!(
+            read_bounded(&mut oversized, 32, "zstd"),
+            Err(DhV2Error::InvalidLength(_))
+        ));
+        assert_eq!(oversized.emitted, 33);
+    }
+
+    #[test]
     fn decompress_lz4_frame_handles_compressed_and_uncompressed_blocks() {
+        let raw_block = b"raw";
         let payload =
             b"minecraft:plains_DH-BSW_minecraft:stone_repeated_repeated_repeated_repeated";
         let compressed_block = lz4_flex::block::compress(payload);
 
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&0x184D_2204u32.to_le_bytes());
-        frame.push(0x60);
-        frame.push(0x40);
-        frame.push(0x00);
+        let mut frame = vec![0x04, 0x22, 0x4d, 0x18, 0x60, 0x40, 0x82];
+        frame.extend_from_slice(&(0x8000_0000 | raw_block.len() as u32).to_le_bytes());
+        frame.extend_from_slice(raw_block);
         frame.extend_from_slice(&(compressed_block.len() as u32).to_le_bytes());
         frame.extend_from_slice(&compressed_block);
         frame.extend_from_slice(&0u32.to_le_bytes());
 
-        let decoded = decompress_blob(&frame, DhV2CompressionMode::Lz4).expect("decode lz4 frame");
-        assert_eq!(decoded, payload);
+        let mode = DhV2CompressionMode::Lz4;
+        let expected = [raw_block.as_slice(), payload.as_slice()].concat();
+        assert_eq!(decompress_blob(&frame, mode).unwrap(), expected);
+        assert_eq!(
+            decompress_blob_with_limit(&frame, mode, expected.len()).unwrap(),
+            expected
+        );
+        for limit in [raw_block.len() - 1, expected.len() - 1] {
+            assert!(matches!(
+                decompress_blob_with_limit(&frame, mode, limit),
+                Err(DhV2Error::InvalidLength(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn lz4_compressed_block_stops_before_validating_past_output_limit() {
+        let frame = [
+            0x04, 0x22, 0x4d, 0x18, 0x60, 0x40, 0x82, // frame header
+            5, 0, 0, 0, // compressed block size
+            0x10, b'a', 1, 0,    // one literal and a four-byte match
+            0x10, // missing a final literal (only reached if the match fit)
+            0, 0, 0, 0, // end mark
+        ];
+        let mode = DhV2CompressionMode::Lz4;
+        assert!(matches!(
+            decompress_blob_with_limit(&frame, mode, 4),
+            Err(DhV2Error::InvalidLength(_))
+        ));
+        assert!(matches!(
+            decompress_blob_with_limit(&frame, mode, 5),
+            Err(DhV2Error::DecompressFailed(_))
+        ));
     }
 }
