@@ -307,6 +307,7 @@ fn covered_rendered_mask(rendered: &HashSet<OctreeSectionPos>, pos: OctreeSectio
 /// a non-empty finer section or descendant in `store`. Covered octants are masked out when meshing
 /// `pos` so parent and child never overlap, while uncovered octants still draw so LOD ring
 /// boundaries never open sky holes or flat stone ceilings.
+#[cfg(test)]
 pub(crate) fn covered_child_mask(store: &OctreeIngestStore, pos: OctreeSectionPos) -> u8 {
     let Some(kids) = pos.children() else {
         return 0;
@@ -331,6 +332,7 @@ pub(crate) fn is_render_leaf(store: &OctreeIngestStore, pos: OctreeSectionPos) -
     !section.is_empty() && covered_child_mask(store, pos) == 0
 }
 
+#[cfg(test)]
 fn has_non_empty_descendant(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
     covered_child_mask(store, pos) != 0
 }
@@ -408,15 +410,60 @@ pub fn ingest_chunk(
             &mut |state| mapper.borrow_mut().block(host, state),
             &mut |biome| mapper.borrow_mut().biome(biome),
         ),
-        SnapshotSource::Distant => crate::octree_ingest::ingest_chunk_culled(
-            store,
-            chunk,
-            snapshot,
-            crate::octree_ingest::IngestSource::Distant,
-            cave_cull,
-            &mut |state| mapper.borrow_mut().block(host, state),
-            &mut |biome| mapper.borrow_mut().biome(biome),
-        ),
+        SnapshotSource::Distant => {
+            let ok = crate::octree_ingest::ingest_chunk_culled(
+                store,
+                chunk,
+                snapshot,
+                crate::octree_ingest::IngestSource::Distant,
+                cave_cull,
+                &mut |state| mapper.borrow_mut().block(host, state),
+                &mut |biome| mapper.borrow_mut().biome(biome),
+            );
+            static DIAG_COUNT: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if ok && DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                let (sx, sz) = (
+                    (chunk[0] * 16).div_euclid(32),
+                    (chunk[1] * 16).div_euclid(32),
+                );
+                let counts: Vec<(i32, usize)> = (0..=4)
+                    .map(|sy| {
+                        let c = store
+                            .section(OctreeSectionPos::new(0, sx, sy, sz))
+                            .map_or(0, |s| s.non_air_count());
+                        (sy, c)
+                    })
+                    .collect();
+                let mut sy2_blocks: HashMap<u32, usize> = HashMap::new();
+                if let Some(s) = store.section(OctreeSectionPos::new(0, sx, 2, sz)) {
+                    for v in s.to_dense() {
+                        if !v.is_air() {
+                            *sy2_blocks.entry(v.block_id()).or_default() += 1;
+                        }
+                    }
+                }
+                let m = mapper.borrow();
+                let mut top: Vec<(String, usize)> = sy2_blocks
+                    .into_iter()
+                    .map(|(id, n)| {
+                        let name = id
+                            .checked_sub(1)
+                            .and_then(|i| m.names.get(i as usize))
+                            .cloned()
+                            .unwrap_or_else(|| format!("id#{id}"));
+                        (name, n)
+                    })
+                    .collect();
+                top.sort_by(|a, b| b.1.cmp(&a.1));
+                top.truncate(8);
+                eprintln!(
+                    "distantsunrises: diag distant chunk={chunk:?} sy0..4={counts:?} sy2_top={top:?} total_states={}",
+                    m.states.len()
+                );
+            }
+            ok
+        }
     };
     if accepted {
         let mapper = &p.mapper;

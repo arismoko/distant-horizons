@@ -426,7 +426,7 @@ pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
                 let y = y0 + ly as i32;
                 for lz in 0..VANILLA_SECTION {
                     for lx in 0..VANILLA_SECTION {
-                        let mut id = match uniform_id {
+                        let id = match uniform_id {
                             Some(id) => id,
                             None => snap.block(lx, y, lz).map_or(0, &mut *block_id),
                         };
@@ -435,11 +435,6 @@ pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
                         if id == 0 {
                             if *column_open {
                                 sky = 15;
-                            } else if let Some((cull_y, fill_id)) = cave_cull
-                                && fill_id != 0
-                                && y < cull_y
-                            {
-                                id = fill_id;
                             }
                         } else {
                             *column_open = false;
