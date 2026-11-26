@@ -228,6 +228,22 @@ impl MeshWorker {
                         &*job.metas,
                         job.covered,
                     );
+                    if job.pos.detail == 0 && job.pos.y == 2 {
+                        static MESH_DIAG: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        if MESH_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            eprintln!(
+                                "distantsunrises: diag mesh pos={:?} non_air={} opaque={} trans={} aabb={:?}..{:?} covered={:#x}",
+                                job.pos,
+                                job.section.non_air_count(),
+                                quads.opaque.len(),
+                                quads.translucent.len(),
+                                quads.aabb_min,
+                                quads.aabb_max,
+                                job.covered
+                            );
+                        }
+                    }
                     let built = built_section(&quads);
                     let has_quads = !built.is_empty();
                     let key = (
@@ -455,7 +471,7 @@ pub fn ingest_chunk(
                         (name, n)
                     })
                     .collect();
-                top.sort_by(|a, b| b.1.cmp(&a.1));
+                top.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
                 top.truncate(8);
                 eprintln!(
                     "distantsunrises: diag distant chunk={chunk:?} sy0..4={counts:?} sy2_top={top:?} total_states={}",
