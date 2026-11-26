@@ -1012,7 +1012,7 @@ fn sample_distant_sections(
         };
 
         let saved_reader = host.level(dim).and_then(|l| l.saved_chunk_reader(host));
-        let feature_stage = match config.distant_generation_mode {
+        let feature_stage = match cfg.distant_generation_mode {
             2 => Some(mod_api::GenerationStage::Features),
             3 => Some(mod_api::GenerationStage::Light),
             _ => None,
