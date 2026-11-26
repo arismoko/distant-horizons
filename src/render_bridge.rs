@@ -29,7 +29,7 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------------------------
 
 use crate::gpu_arena::{
-    ArenaConfig, BuiltSection, GpuArena, OPAQUE_COUNT_OFFSET, TRANSLUCENT_COUNT_OFFSET,
+    ArenaConfig, ArenaError, BuiltSection, GpuArena, OPAQUE_COUNT_OFFSET, TRANSLUCENT_COUNT_OFFSET,
 };
 
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
@@ -610,16 +610,29 @@ fn vanilla_clip_dist(frame: &RenderFrameParams) -> f32 {
 
 /// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
 static PENDING_SECTIONS: Mutex<Vec<(SectionKey, BuiltSection)>> = Mutex::new(Vec::new());
-static ARENA: Mutex<Option<ArenaState>> = Mutex::new(None);
+static ARENA: Mutex<Option<ArenaState<GpuArena, mod_api::MeshRef>>> = Mutex::new(None);
 
 /// Identity of an uploaded section: `(dimension, lod level, section position)`.
 pub type SectionKey = (String, u8, [i32; 3]);
 
-struct ArenaState {
-    arena: GpuArena,
+struct ArenaState<Arena, Mesh> {
+    arena: Arena,
     /// Shared quad index pattern (`0,1,2,2,1,3` per quad) the indirect commands index into.
-    quad_mesh: Option<mod_api::MeshRef>,
+    quad_mesh: Option<Mesh>,
     ids: HashMap<SectionKey, u32>,
+}
+
+/// GPU operations used by the terrain lifetime decisions. Draws and uploads use the concrete arena.
+trait TerrainGpu {
+    type Arena;
+    type Mesh;
+    type Ticket: Copy;
+
+    fn create_arena(&mut self, config: ArenaConfig) -> Result<Self::Arena, ArenaError>;
+    fn create_quad_mesh(&mut self) -> Result<Self::Mesh, ArenaError>;
+    fn requests_live(&self, arena: &Self::Arena) -> bool;
+    fn poll_readback(&self, ticket: Self::Ticket) -> Result<Option<Vec<u8>>, mod_api::BufferError>;
+    fn release_readback(&self, ticket: Self::Ticket) -> Result<(), mod_api::BufferError>;
 }
 
 /// Model words, biome tint words and the baked face atlas mip chain (RGBA8; level `l` is
@@ -645,25 +658,29 @@ pub fn queue_model_tables(
 /// Most GPU node requests kept between two [`drain_gpu_node_requests`] calls.
 const MAX_GPU_NODE_REQUESTS: usize = 512;
 
-struct PendingReadback {
-    ticket: mod_api::ReadbackTicket,
+struct PendingReadback<Ticket> {
+    ticket: Ticket,
     retired: bool,
 }
 
-#[derive(Default)]
-struct NodeRequests {
+struct NodeRequests<Ticket> {
     // One ticket, even when the world has changed and its bytes are no longer wanted.
-    pending: Option<PendingReadback>,
+    pending: Option<PendingReadback<Ticket>>,
     ready: Vec<(u8, [i32; 3])>,
 }
 
-static NODE_REQUESTS: Mutex<NodeRequests> = Mutex::new(NodeRequests {
-    pending: None,
-    ready: Vec::new(),
-});
+static NODE_REQUESTS: Mutex<NodeRequests<mod_api::ReadbackTicket>> =
+    Mutex::new(NodeRequests::new());
 
-impl NodeRequests {
-    fn start(&mut self, request: impl FnOnce() -> Option<mod_api::ReadbackTicket>) {
+impl<Ticket: Copy> NodeRequests<Ticket> {
+    const fn new() -> Self {
+        Self {
+            pending: None,
+            ready: Vec::new(),
+        }
+    }
+
+    fn start(&mut self, request: impl FnOnce() -> Option<Ticket>) {
         if self.pending.is_none() {
             self.pending = request().map(|ticket| PendingReadback {
                 ticket,
@@ -679,17 +696,17 @@ impl NodeRequests {
         }
     }
 
-    fn service(&mut self, host: &dyn mod_api::ClientHost, source: mod_api::StorageBufferRef) {
+    fn service<G: TerrainGpu<Ticket = Ticket> + ?Sized>(&mut self, gpu: &G, arena: &G::Arena) {
         // In #6138 the host can exist without mod GPU resources. A ticket operation would
         // return the same Unavailable as a spent ticket; probe the retained request buffer.
-        if self.pending.is_none() || source.size(host).is_err() {
+        if self.pending.is_none() || !gpu.requests_live(arena) {
             return;
         }
         let pending = self.pending.take().unwrap();
         if pending.retired {
-            report("release_readback", pending.ticket.release(host));
+            report("release_readback", gpu.release_readback(pending.ticket));
         } else {
-            match report("poll_readback", pending.ticket.poll_readback(host)) {
+            match report("poll_readback", gpu.poll_readback(pending.ticket)) {
                 Some(Some(bytes)) => {
                     self.ready
                         .extend(crate::gpu_arena::decode_gpu_requests(&bytes));
@@ -711,10 +728,7 @@ pub fn drain_gpu_node_requests() -> Vec<(u8, [i32; 3])> {
 pub(crate) fn poll_node_requests(host: &dyn mod_api::ClientHost) {
     let guard = ARENA.lock().unwrap();
     let Some(state) = guard.as_ref() else { return };
-    NODE_REQUESTS
-        .lock()
-        .unwrap()
-        .service(host, state.arena.requests);
+    NODE_REQUESTS.lock().unwrap().service(host, &state.arena);
 }
 
 /// Called by the pipeline's mesher for each finished section (empty = remove).
@@ -725,25 +739,45 @@ pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
 /// Most quads one indirect command can span (a 32³ section's worth of faces in one bucket).
 const MAX_QUADS_PER_COMMAND: u32 = 1 << 16;
 
-/// A mesh holding only the shared quad index buffer; its one vertex binding is never read (the
-/// vertex stages pull quads from the arena by `gl_VertexID`). It has the stride of the default
-/// `position_tex_color` binding, which a pipeline with no declared binding must be drawn with.
-fn create_quad_mesh(
-    host: &mut dyn mod_api::ClientHost,
-) -> Result<mod_api::MeshRef, crate::gpu_arena::ArenaError> {
-    use mod_api::{IndexFormat, MeshBufferInit, MeshDescriptor, MeshIndexInit};
-    let mut bytes = Vec::with_capacity(MAX_QUADS_PER_COMMAND as usize * 24);
-    for q in 0..MAX_QUADS_PER_COMMAND {
-        for i in [0u32, 1, 2, 2, 1, 3] {
-            bytes.extend_from_slice(&(q * 4 + i).to_le_bytes());
-        }
+impl TerrainGpu for dyn mod_api::ClientHost + '_ {
+    type Arena = GpuArena;
+    type Mesh = mod_api::MeshRef;
+    type Ticket = mod_api::ReadbackTicket;
+
+    fn create_arena(&mut self, config: ArenaConfig) -> Result<Self::Arena, ArenaError> {
+        GpuArena::new(self, config)
     }
-    let dummy = [0u8; 24];
-    let vertex = [MeshBufferInit::from_bytes(24, &dummy)];
-    let desc = MeshDescriptor::new(&vertex)
-        .with_indices(MeshIndexInit::from_bytes(IndexFormat::Uint32, &bytes));
-    host.create_mesh(&desc)
-        .map_err(|_| crate::gpu_arena::ArenaError::Buffer(mod_api::BufferError::Unavailable))
+
+    /// A mesh holding only the shared quad index buffer; its one vertex binding is never read
+    /// (the vertex stages pull quads from the arena by `gl_VertexID`). It has the stride of the
+    /// default `position_tex_color` binding, which a pipeline with no declared binding uses.
+    fn create_quad_mesh(&mut self) -> Result<Self::Mesh, ArenaError> {
+        use mod_api::{IndexFormat, MeshBufferInit, MeshDescriptor, MeshIndexInit};
+        let mut bytes = Vec::with_capacity(MAX_QUADS_PER_COMMAND as usize * 24);
+        for q in 0..MAX_QUADS_PER_COMMAND {
+            for i in [0u32, 1, 2, 2, 1, 3] {
+                bytes.extend_from_slice(&(q * 4 + i).to_le_bytes());
+            }
+        }
+        let dummy = [0u8; 24];
+        let vertex = [MeshBufferInit::from_bytes(24, &dummy)];
+        let desc = MeshDescriptor::new(&vertex)
+            .with_indices(MeshIndexInit::from_bytes(IndexFormat::Uint32, &bytes));
+        self.create_mesh(&desc)
+            .map_err(|_| ArenaError::Buffer(mod_api::BufferError::Unavailable))
+    }
+
+    fn requests_live(&self, arena: &Self::Arena) -> bool {
+        arena.requests.size(self).is_ok()
+    }
+
+    fn poll_readback(&self, ticket: Self::Ticket) -> Result<Option<Vec<u8>>, mod_api::BufferError> {
+        ticket.poll_readback(self)
+    }
+
+    fn release_readback(&self, ticket: Self::Ticket) -> Result<(), mod_api::BufferError> {
+        ticket.release(self)
+    }
 }
 
 /// Creates the arena on first use (ruling 2: it then survives reloads and world close),
@@ -753,22 +787,22 @@ pub fn upload_pending(host: &mut dyn mod_api::ClientHost, config: ArenaConfig) {
     report("arena upload", try_upload_pending(host, config));
 }
 
-fn ensure_arena<'a>(
-    slot: &'a mut Option<ArenaState>,
-    host: &mut dyn mod_api::ClientHost,
+fn ensure_arena<'a, G: TerrainGpu + ?Sized>(
+    slot: &'a mut Option<ArenaState<G::Arena, G::Mesh>>,
+    gpu: &mut G,
     config: ArenaConfig,
-) -> Result<&'a mut ArenaState, crate::gpu_arena::ArenaError> {
+) -> Result<&'a mut ArenaState<G::Arena, G::Mesh>, ArenaError> {
     if slot.is_none() {
-        let quad_mesh = create_quad_mesh(host)?;
+        let quad_mesh = gpu.create_quad_mesh()?;
         *slot = Some(ArenaState {
-            arena: GpuArena::new(host, config)?,
+            arena: gpu.create_arena(config)?,
             quad_mesh: Some(quad_mesh),
             ids: HashMap::new(),
         });
     }
     let state = slot.as_mut().unwrap();
     if state.quad_mesh.is_none() {
-        state.quad_mesh = Some(create_quad_mesh(host)?);
+        state.quad_mesh = Some(gpu.create_quad_mesh()?);
     }
     Ok(state)
 }
@@ -876,7 +910,7 @@ pub(crate) fn invalidate_quad_mesh() {
     ArenaState::invalidate_quad_mesh(&mut ARENA.lock().unwrap());
 }
 
-impl ArenaState {
+impl<Arena, Mesh> ArenaState<Arena, Mesh> {
     fn invalidate_quad_mesh(slot: &mut Option<Self>) {
         if let Some(state) = slot {
             state.quad_mesh = None;
@@ -1694,64 +1728,46 @@ fn report<T, E: std::fmt::Debug>(what: &'static str, result: Result<T, E>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mod_api::{
-        Backend, BackendRef, BufferError, ClientHost, Host, MeshDescriptor, MeshError, MeshRef,
-        ReadbackTicket, StorageBufferDescriptor, StorageBufferRef,
-    };
-    use std::cell::{Cell, RefCell};
+    use mod_api::BufferError;
+    use std::cell::RefCell;
 
     #[derive(Default)]
     struct RecordingGpu {
-        available: Cell<bool>,
-        buffers: Cell<u32>,
-        meshes: Cell<u64>,
+        available: bool,
+        arenas: u32,
+        meshes: u32,
         ready: RefCell<Option<Vec<u8>>>,
-        polled: RefCell<Vec<ReadbackTicket>>,
-        released: RefCell<Vec<ReadbackTicket>>,
+        polled: RefCell<Vec<u32>>,
+        released: RefCell<Vec<u32>>,
     }
 
-    impl Host for RecordingGpu {
-        fn backend(&self) -> Option<BackendRef<'_>> {
-            Some(BackendRef::of(self))
-        }
-    }
-    mod_api::impl_host_areas!(RecordingGpu);
-    impl ClientHost for RecordingGpu {}
-    mod_api::impl_client_host_areas!(RecordingGpu);
-    impl Backend for RecordingGpu {}
-    mod_api::impl_backend_areas!(RecordingGpu, except(client_render));
+    impl TerrainGpu for RecordingGpu {
+        type Arena = u32;
+        type Mesh = u32;
+        type Ticket = u32;
 
-    impl mod_api::prelude::ClientRenderClientBackend for RecordingGpu {
-        fn create_mesh(&self, _: &MeshDescriptor<'_>) -> Result<MeshRef, MeshError> {
-            let generation = self.meshes.get() + 1;
-            self.meshes.set(generation);
-            Ok(mod_api::__private::built::mesh_ref(generation, 0))
+        fn create_arena(&mut self, _: ArenaConfig) -> Result<Self::Arena, ArenaError> {
+            self.arenas += 1;
+            Ok(self.arenas)
         }
 
-        fn create_storage_buffer(
-            &self,
-            _: &StorageBufferDescriptor,
-        ) -> Result<StorageBufferRef, BufferError> {
-            let slot = self.buffers.get();
-            self.buffers.set(slot + 1);
-            Ok(mod_api::__private::built::storage_buffer_ref(1, slot))
+        fn create_quad_mesh(&mut self) -> Result<Self::Mesh, ArenaError> {
+            self.meshes += 1;
+            Ok(self.meshes)
         }
 
-        fn storage_buffer_size(&self, _: StorageBufferRef) -> Result<u64, BufferError> {
+        fn requests_live(&self, _: &Self::Arena) -> bool {
             self.available
-                .get()
-                .then_some(crate::gpu_arena::GPU_REQUEST_BUF_BYTES)
-                .ok_or(BufferError::Unavailable)
         }
 
-        fn readback_poll(&self, ticket: ReadbackTicket) -> Result<Option<Vec<u8>>, BufferError> {
-            assert!(self.available.get(), "polled without a renderer");
+        fn poll_readback(&self, ticket: Self::Ticket) -> Result<Option<Vec<u8>>, BufferError> {
+            assert!(self.available, "polled without a renderer");
             self.polled.borrow_mut().push(ticket);
             Ok(self.ready.borrow_mut().take())
         }
 
-        fn readback_release(&self, ticket: ReadbackTicket) -> Result<(), BufferError> {
-            assert!(self.available.get(), "released without a renderer");
+        fn release_readback(&self, ticket: Self::Ticket) -> Result<(), BufferError> {
+            assert!(self.available, "released without a renderer");
             self.released.borrow_mut().push(ticket);
             // A retire discards the completed bytes without polling or decoding them.
             self.ready.borrow_mut().take();
@@ -1769,87 +1785,75 @@ mod tests {
 
     #[test]
     fn retired_traversal_ticket_survives_missing_renderer_and_cannot_publish_into_next_world() {
-        let host = RecordingGpu::default();
-        let buffer = mod_api::__private::built::storage_buffer_ref(1, 0);
-        let ticket = mod_api::__private::built::readback_ticket;
-        let mut requests = NodeRequests::default();
+        let mut host = RecordingGpu {
+            available: true,
+            ..Default::default()
+        };
+        let arena = 1;
+        let mut requests = NodeRequests::new();
 
-        host.available.set(true);
-        requests.start(|| Some(ticket(1)));
+        requests.start(|| Some(1));
         *host.ready.borrow_mut() = Some(single_node_request(17));
-        requests.service(&host, buffer);
+        requests.service(&host, &arena);
         assert_eq!(requests.ready, [(1, [17, 0, 0])]);
-        requests.start(|| Some(ticket(2)));
-        requests.service(&host, buffer); // still in flight
+        requests.start(|| Some(2));
+        requests.service(&host, &arena); // still in flight
         *host.ready.borrow_mut() = Some(single_node_request(23));
 
         requests.retire();
         assert!(requests.ready.is_empty());
-        host.available.set(false);
-        requests.service(&host, buffer);
+        host.available = false;
+        requests.service(&host, &arena);
         requests.retire(); // another world retired before another usable client tick
         requests.start(|| panic!("retired ticket must still occupy the single slot"));
-        assert_eq!(requests.pending.as_ref().unwrap().ticket, ticket(2));
+        assert_eq!(requests.pending.as_ref().unwrap().ticket, 2);
         assert!(host.released.borrow().is_empty());
 
-        host.available.set(true);
-        requests.service(&host, buffer);
-        assert_eq!(*host.released.borrow(), [ticket(2)]);
-        assert_eq!(*host.polled.borrow(), [ticket(1), ticket(2)]);
+        host.available = true;
+        requests.service(&host, &arena);
+        assert_eq!(*host.released.borrow(), [2]);
+        assert_eq!(*host.polled.borrow(), [1, 2]);
         assert!(requests.ready.is_empty());
         assert!(requests.pending.is_none());
 
-        requests.start(|| Some(ticket(3)));
+        requests.start(|| Some(3));
         *host.ready.borrow_mut() = Some(single_node_request(31));
-        requests.service(&host, buffer);
+        requests.service(&host, &arena);
         assert_eq!(requests.ready, [(1, [31, 0, 0])]);
-        assert_eq!(*host.polled.borrow(), [ticket(1), ticket(2), ticket(3)]);
+        assert_eq!(*host.polled.borrow(), [1, 2, 3]);
     }
 
     #[test]
     fn quad_mesh_recovery_only_recreates_mesh_after_each_invalidation() {
         let mut host = RecordingGpu::default();
-        host.available.set(true);
         let mut slot = None;
-        let config = || ArenaConfig {
+        let config = ArenaConfig {
             max_sections: 4,
             geometry_bytes: 0,
         };
-        let first = ensure_arena(&mut slot, &mut host, config()).unwrap();
-        let storage = (
-            first.arena.quads,
-            first.arena.requests,
-            first.arena.models,
-            first.arena.slices.quads.length,
-        );
-        let buffers = host.buffers.get();
+        let first = ensure_arena(&mut slot, &mut host, config).unwrap();
+        let arena = first.arena;
         let mut old_mesh = first.quad_mesh.unwrap();
-        // World close/rejoin and in-world pack reload enter the same invalidation path.
-        // See the separate engine witnesses; this scoped backend proves the shared recovery.
+        assert_eq!(host.arenas, 1);
+        // Exercise the shared invalidation twice with a retained arena, not an actual world
+        // rejoin or pack apply. Pack reload retention is blocked by Sunrise #6264.
         for generation in [2, 3] {
             ArenaState::invalidate_quad_mesh(&mut slot);
             assert!(slot.as_ref().unwrap().quad_mesh.is_none());
-            let recovered = ensure_arena(&mut slot, &mut host, config()).unwrap();
+            let recovered = ensure_arena(&mut slot, &mut host, config).unwrap();
             let mesh = recovered.quad_mesh.unwrap();
             assert_ne!(mesh, old_mesh);
+            assert_eq!(recovered.arena, arena);
+            assert_eq!(host.arenas, 1);
+            assert_eq!(host.meshes, generation);
             assert_eq!(
-                (
-                    recovered.arena.quads,
-                    recovered.arena.requests,
-                    recovered.arena.models,
-                    recovered.arena.slices.quads.length,
-                ),
-                storage,
-            );
-            assert_eq!(host.buffers.get(), buffers);
-            assert_eq!(host.meshes.get(), generation);
-            assert_eq!(
-                ensure_arena(&mut slot, &mut host, config())
+                ensure_arena(&mut slot, &mut host, config)
                     .unwrap()
                     .quad_mesh,
                 Some(mesh)
             );
-            assert_eq!(host.meshes.get(), generation);
+            assert_eq!(host.arenas, 1);
+            assert_eq!(host.meshes, generation);
             old_mesh = mesh;
         }
     }
