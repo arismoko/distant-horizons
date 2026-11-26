@@ -173,12 +173,14 @@ void main() {
     float shade = flags.y != 0u ? face_shade : 1.0;
     rgb *= light * shade;
 
-    // Atmospheric fog + smooth far-horizon fade (Voxy `blit_texture_depth_cutout.frag`:
-    // soft quadratic haze past mid-range, then smooth blend into sky over the last 12%
-    // of the LOD render distance so the horizon has no hard edge).
+    // Atmospheric aerial-perspective haze + smooth far-horizon fade (Voxy
+    // `blit_texture_depth_cutout.frag`: keeps foreground/midground crisp, adds soft pale-blue
+    // haze across distant peaks and ridges, then blends smoothly into sky over the last 15%).
     float d = fog.w != 0.0 ? length(rel_pos) : length(rel_pos.xz);
-    float haze = fog_curve((d - fog.x) / max(fog.y - fog.x, 1.0), uint(fog.z)) * 0.40;
-    float fade_start = fog.y * 0.88;
+    float aerial_start = min(fog.x * 0.30, 360.0);
+    float t_aerial = clamp((d - aerial_start) / max(fog.y - aerial_start, 1.0), 0.0, 1.0);
+    float haze = smoothstep(0.0, 1.0, t_aerial) * 0.58;
+    float fade_start = fog.y * 0.85;
     float horizon_fade = smoothstep(fade_start, fog.y, d);
     float f = clamp(max(haze, horizon_fade), 0.0, 1.0);
     vec3 fc = hdr ? srgb_to_linear(fog_color.rgb) : fog_color.rgb;

@@ -71,15 +71,27 @@ void main() {
     vec3 local = base + swizzle_axis(axis, vec3(vec2(size) * corner_mask, 0.0));
     vec3 world = local * lod_scale + vec3(section << 5) - camera_sub_pos.xyz;
 
+    // Model entry: tint kind selects biome LUT column or a constant.
+    uint mbase = model_id * 16u;
+    uint mflags = models[mbase + 12u];
+    uint tint_kind = (mflags >> 4) & 15u;
+    // Coarse LODs (detail >= 1) quantize sea-level water (y=62) up to top_y = 64.0, 1 block above
+    // detail-0 water (63.0), which creates a dark step line at the detail-0/detail-1 ocean border.
+    // Snap coarse sea-level water tops back to 63.0 so all LOD rings stay coplanar across oceans.
+    bool is_water = (mflags & 1u) != 0u && tint_kind == 3u;
+    if (detail >= 1u && face == 1u && is_water) {
+        int top_block_y = ((y << int(detail)) << 5) + int(local.y) * int(1u << detail);
+        if (top_block_y == 64) {
+            world.y -= 1.0;
+        }
+    }
+
     vec4 clip = view_proj * vec4(world, 1.0);
     // The world's reversed depth over an infinite far plane (depth = near / w), so LOD and vanilla
     // geometry order correctly where they overlap and nothing clips at vanilla's far plane.
     clip.z = depth_and_light.x;
     gl_Position = clip;
 
-    // Model entry: tint kind selects biome LUT column or a constant.
-    uint mbase = model_id * 16u;
-    uint mflags = models[mbase + 12u];
     bool double_sided = (mflags & 8u) != 0u;
     // Exact per-quad backface culling for single-sided faces (keeps `.cull(false)` safe for
     // double-sided foliage while never drawing undersides or back walls from the wrong side).
@@ -99,7 +111,6 @@ void main() {
             return;
         }
     }
-    uint tint_kind = (mflags >> 4) & 15u;
     uint tint = 0xFFFFFFFFu;
     if (tint_kind == 4u) {
         tint = models[mbase + 13u];
