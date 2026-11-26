@@ -297,8 +297,9 @@ struct Pipeline {
     /// Sections currently uploaded to the GPU arena (strictly leaf sections: never both parent
     /// and child for the same volume).
     rendered: HashMap<String, HashSet<OctreeSectionPos>>,
-    /// Sections changed since their last save.
+    /// Changed sections not yet accepted by the save queue.
     unsaved: HashMap<String, HashSet<OctreeSectionPos>>,
+    saves_refused: bool,
     /// Sections already asked of a remote server, per dimension.
     requested: HashMap<String, HashSet<OctreeSectionPos>>,
     disk: HashMap<String, DiskIntake>,
@@ -619,34 +620,42 @@ impl Pipeline {
 /// monotonically increasing mesh/probe IDs. No client tick can enqueue uploads during this reset.
 pub(crate) fn reset_world(io: &LodIoWorker) {
     let mut p = PIPELINE.lock().unwrap();
-    p.reset_world(io);
+    let abandoned = p.reset_world(io);
+    if abandoned != 0 {
+        eprintln!("DH: abandoned {abandoned} unsaved octree sections at world reset");
+    }
     MESH_WORKER.clear();
     PLAYER_XZ.lock().unwrap().clear();
     crate::render_bridge::clear_sections(None);
 }
 
 impl Pipeline {
-    fn reset_world(&mut self, io: &LodIoWorker) {
+    fn reset_world(&mut self, io: &LodIoWorker) -> usize {
         io.reset_world();
+        // Accepted operations drained above. If no worker could start, nothing can write
+        // the refused sections now, and their old world keys must not survive this reset.
+        let abandoned = self.unsaved.values().map(HashSet::len).sum();
         self.stores.clear();
         self.dirty.clear();
         self.queued.clear();
         self.section_epoch.clear();
         self.rendered.clear();
         self.unsaved.clear();
+        self.saves_refused = false;
         self.requested.clear();
         self.disk.clear();
+        abandoned
     }
 
-    fn clear_dimension(&mut self, dim: &str) {
+    fn clear_dimension(&mut self, dim: &str) -> usize {
         self.stores.remove(dim);
         self.dirty.remove(dim);
         self.queued.remove(dim);
         self.section_epoch.retain(|(d, _), _| d != dim);
         self.rendered.remove(dim);
-        self.unsaved.remove(dim);
         self.requested.remove(dim);
         self.disk.remove(dim);
+        self.unsaved.remove(dim).map_or(0, |set| set.len())
     }
 }
 
@@ -1088,8 +1097,8 @@ pub fn ingest_distant(
 
 /// Hand up to `limit` changed sections of every dimension to the I/O worker (it coalesces newer
 /// saves of one section). Returns how many the worker accepted; if it refuses one (unavailable
-/// or shut down) the flush stops, reports once, and keeps that section and the rest unsaved.
-/// Nothing is retried within the flush.
+/// or shut down) the flush stops and keeps that section and the rest unsaved. The first refusal
+/// and the first subsequent acceptance are logged. Nothing is retried within the flush.
 pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
     PIPELINE.lock().unwrap().flush_saves(io, world_dir, limit)
 }
@@ -1112,17 +1121,20 @@ impl Pipeline {
                 };
                 let record = OctreeRecord::from(section);
                 let (_, mapping) = self.mapper.mapping_of(&record.rle.palette);
-                if !io.queue_octree_record(
+                if let Err(cause) = io.queue_octree_record(
                     world_dir.to_owned(),
                     dim.clone(),
                     record,
                     mapping,
                     DEFAULT_OCTREE_COMPRESSION,
                 ) {
-                    eprintln!(
-                        "DH: octree saves refused by the I/O worker; unsaved sections kept for a later flush"
-                    );
+                    if !std::mem::replace(&mut self.saves_refused, true) {
+                        eprintln!("DH: octree saves refused: {cause}; keeping unsaved sections");
+                    }
                     return queued;
+                }
+                if std::mem::take(&mut self.saves_refused) {
+                    eprintln!("DH: octree saves accepted again");
                 }
                 set.remove(&pos);
                 queued += 1;
@@ -1237,10 +1249,13 @@ pub fn finish_server_io(
     unloading: Option<&str>,
 ) {
     let mut p = PIPELINE.lock().unwrap();
-    p.finish_server_io(io, dir, unloading, |mapper, section, mapping| {
+    let abandoned = p.finish_server_io(io, dir, unloading, |mapper, section, mapping| {
         mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
     });
     if let Some(dim) = unloading {
+        if abandoned != 0 {
+            eprintln!("DH: abandoned {abandoned} unsaved octree sections at close of {dim}");
+        }
         MESH_WORKER.clear_dim(dim);
         crate::render_bridge::clear_sections(Some(dim));
     }
@@ -1253,7 +1268,7 @@ impl Pipeline {
         dir: Option<&Path>,
         unloading: Option<&str>,
         remap: impl FnMut(&mut Mapper, OctreeSection, OctreeMapping) -> OctreeSection,
-    ) {
+    ) -> usize {
         let dims: Vec<_> = self
             .disk
             .iter()
@@ -1291,9 +1306,9 @@ impl Pipeline {
                 disk.pending.clear();
             }
         }
-        if let Some(dim) = unloading {
-            self.clear_dimension(dim);
-        }
+        // Full server stop drains here; the subsequent world reset reports and retires
+        // any sections still unsaved. A level unload retires only that dimension now.
+        unloading.map_or(0, |dim| self.clear_dimension(dim))
     }
 }
 
@@ -1540,13 +1555,18 @@ mod tests {
             .extend([first.pos, second.pos]);
 
         let refusing = LodIoWorker::spawn_unavailable();
+        assert!(!p.saves_refused);
         for _ in 0..2 {
             assert_eq!(p.flush_saves(&refusing, &dir, usize::MAX), 0);
             assert_eq!(p.unsaved[DIM].len(), 2, "refused records are kept");
+            assert!(p.saves_refused);
         }
 
         let io = LodIoWorker::spawn();
+        assert_eq!(p.flush_saves(&io, &dir, 0), 0);
+        assert!(p.saves_refused, "no acceptance is not a recovery");
         assert_eq!(p.flush_saves(&io, &dir, usize::MAX), 2);
+        assert!(!p.saves_refused);
         assert!(p.unsaved[DIM].is_empty());
         io.flush().unwrap();
         for section in [&first, &second] {
@@ -1556,6 +1576,37 @@ mod tests {
                 .unwrap();
             assert_eq!(loaded.to_rle(), section.to_rle());
         }
+
+        // A later refusal leaves one changed section, alongside accepted writes and a read probe.
+        let nether = "minecraft:the_nether";
+        p.stores
+            .entry(nether.into())
+            .or_default()
+            .replace_section(first.clone());
+        p.unsaved
+            .entry(nether.into())
+            .or_default()
+            .insert(first.pos);
+        assert!(p.disk.entry(DIM.into()).or_default().probe(
+            &mut p.next_probe,
+            &refusing,
+            &dir,
+            DIM,
+            first.pos,
+            false,
+        ));
+        assert_eq!(p.flush_saves(&refusing, &dir, usize::MAX), 0);
+        assert!(p.saves_refused);
+        assert_eq!(
+            p.finish_server_io(&refusing, Some(&dir), None, |_, section, _| section),
+            0,
+            "server stopping drains but does not retire terrain"
+        );
+        assert_eq!(p.reset_world(&refusing), 1, "only the unaccepted save");
+        assert!(p.unsaved.is_empty());
+        assert!(p.disk.is_empty());
+        assert!(!p.saves_refused);
+        assert_eq!(p.reset_world(&refusing), 0, "retirement is counted once");
     }
 
     #[test]
@@ -1689,7 +1740,9 @@ mod tests {
             &state,
             crate::WorldBoundary::ServerAboutToStart,
             || {},
-            || p.reset_world(&io),
+            || {
+                p.reset_world(&io);
+            },
         );
         assert!(state.lock().unwrap().server_open);
         assert!(p.stores.is_empty());
@@ -1787,7 +1840,9 @@ mod tests {
             &state,
             crate::WorldBoundary::ClientLogin(Some(false)),
             || {},
-            || p.reset_world(&io),
+            || {
+                p.reset_world(&io);
+            },
         );
         assert_eq!(state.lock().unwrap().active_dimension, nether);
         assert!(p.stores.is_empty());
@@ -1828,7 +1883,9 @@ mod tests {
             &state,
             crate::WorldBoundary::ServerStopped,
             || {},
-            || p.reset_world(&io),
+            || {
+                p.reset_world(&io);
+            },
         );
         let st = state.lock().unwrap();
         assert!(st.world_dir.is_none());
@@ -2012,7 +2069,11 @@ mod tests {
         p.advance_intake(&io, &dir, DIM, false);
         assert!(p.disk[DIM].loading.contains_key(&waiting));
 
-        p.finish_server_io(&io, Some(&dir), Some(DIM), |_, section, _| section);
+        assert_eq!(
+            p.finish_server_io(&io, Some(&dir), Some(DIM), |_, section, _| section),
+            0,
+            "accepted saves are not abandoned on level close"
+        );
         assert!(!p.stores.contains_key(DIM));
         assert!(!p.unsaved.contains_key(DIM));
         assert!(!p.disk.contains_key(DIM));
