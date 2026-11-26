@@ -629,12 +629,22 @@ impl Pipeline {
 pub(crate) fn client_level_unload(dim: &str) {
     let mut p = PIPELINE.lock().unwrap();
     MESH_WORKER.clear_dim(dim);
-    p.section_epoch.retain(|(d, _), _| d != dim);
-    p.rendered.remove(dim);
-    if let Some(positions) = p.stores.get(dim).map(OctreeIngestStore::section_positions) {
-        p.queue(dim, positions);
-    }
+    p.retire_client_rendering(dim);
     crate::render_bridge::clear_sections(Some(dim));
+}
+
+impl Pipeline {
+    fn retire_client_rendering(&mut self, dim: &str) {
+        self.section_epoch.retain(|(d, _), _| d != dim);
+        self.rendered.remove(dim);
+        if let Some(positions) = self
+            .stores
+            .get(dim)
+            .map(OctreeIngestStore::section_positions)
+        {
+            self.queue(dim, positions);
+        }
+    }
 }
 
 /// A resource reload, shader-pack change or `/ds remesh` invalidates every baked model: bake them
@@ -1448,7 +1458,14 @@ mod tests {
             p.disk.is_empty(),
             "remote residency did not create a disk entry"
         );
-        p.reset_world(&io);
+        let state = Mutex::new(crate::render_bridge::DhState::default());
+        crate::reset_world(
+            &state,
+            crate::WorldBoundary::ServerAboutToStart,
+            || {},
+            || p.reset_world(&io),
+        );
+        assert!(state.lock().unwrap().server_open);
         assert!(p.stores.is_empty());
         assert!(p.requested.is_empty());
         assert!(p.section_epoch.is_empty());
@@ -1478,6 +1495,91 @@ mod tests {
         assert_eq!(reopened.get(0, 0, 0).block_id(), 1);
         assert_eq!(reopened.get(17, 0, 0), sibling);
         assert!(reopened.to_dense().into_iter().all(|v| v != remote));
+    }
+
+    #[test]
+    fn portal_unload_keeps_terrain_and_requests_but_backend_login_retires_them() {
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        let mut state = crate::render_bridge::DhState::default();
+        let nether = "minecraft:the_nether";
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        for dim in [DIM, nether] {
+            p.stores
+                .entry(dim.into())
+                .or_default()
+                .replace_section(OctreeSection::filled(pos, Voxel::new(3, 0, 6, 0)));
+            p.requested.entry(dim.into()).or_default().insert(pos);
+            p.rendered.entry(dim.into()).or_default().insert(pos);
+            p.section_epoch.insert((dim.into(), pos), 8);
+        }
+        // The destination's load arrives before the old client level's unload.
+        state.active_dimension = nether.into();
+        p.retire_client_rendering(DIM);
+        assert!(p.stores[DIM].section(pos).is_some());
+        assert!(p.requested[DIM].contains(&pos));
+        assert!(p.queued[DIM].contains(&pos), "remesh on return");
+        assert!(!p.rendered.contains_key(DIM));
+        assert!(!p.section_epoch.contains_key(&(DIM.into(), pos)));
+        assert!(p.rendered[nether].contains(&pos));
+
+        // The very same unload at configuration start cannot tell it is a realm change.
+        p.retire_client_rendering(nether);
+        assert!(p.stores[nether].section(pos).is_some());
+        assert!(p.requested[nether].contains(&pos));
+        let state = Mutex::new(state);
+        crate::reset_world(
+            &state,
+            crate::WorldBoundary::ClientLogin(Some(false)),
+            || {},
+            || p.reset_world(&io),
+        );
+        assert_eq!(state.lock().unwrap().active_dimension, nether);
+        assert!(p.stores.is_empty());
+        assert!(p.rendered.is_empty());
+        assert!(p.queued.is_empty());
+        assert!(p.requested.entry(nether.into()).or_default().insert(pos));
+    }
+
+    #[test]
+    fn orderly_stop_drains_before_cleanup_and_stopped_does_not_require_level_unload() {
+        use crate::storage::RegionCache;
+        let dir = TestTempDir::new("orderly-stop");
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        let state = Mutex::new(crate::render_bridge::DhState {
+            server_open: true,
+            world_dir: Some(dir.to_path_buf()),
+            live_levels: [DIM.into()].into(),
+            ..Default::default()
+        });
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        stage_live(&mut p, [0, 0], 1);
+        crate::finish_server_stop(&state, |world_dir| {
+            assert!(state.lock().unwrap().live_levels.is_empty());
+            assert!(world_dir.is_some());
+            p.finish_server_io(&io, world_dir, None, |_, section, _| section);
+        });
+        assert!(state.lock().unwrap().server_open);
+        assert!(p.stores[DIM].section(pos).is_some());
+        let (saved, _) = RegionCache::default()
+            .load_octree_section(&dir, DIM, pos)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.get(0, 0, 0).block_id(), 1);
+
+        // No LevelUnload was delivered. ServerStopped still retires the whole realm.
+        crate::reset_world(
+            &state,
+            crate::WorldBoundary::ServerStopped,
+            || {},
+            || p.reset_world(&io),
+        );
+        let st = state.lock().unwrap();
+        assert!(st.world_dir.is_none());
+        assert!(!st.server_open);
+        assert!(p.stores.is_empty());
+        assert!(p.disk.is_empty());
     }
 
     #[test]

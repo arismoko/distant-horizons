@@ -186,11 +186,17 @@ impl Hooks for DistantHorizonsMod {
 
     fn client_player_logging_in(
         &self,
-        _host: &mut dyn ClientHost,
+        host: &mut dyn ClientHost,
         _event: &mut mod_api::ClientPlayerLoggingInEvent,
     ) {
-        // Play login can follow configuration's world close without a logout.
         render_bridge::invalidate_quad_mesh();
+        // Reconfiguration can close the old play world without LoggingOut. Login, unlike
+        // Respawn, opens a new play world, and ClientLevelLoad has already installed its key.
+        let integrated_local = host
+            .client_session()
+            .client_server()
+            .map(|s| s.integrated_local);
+        WorldBoundary::ClientLogin(integrated_local).apply();
     }
 
     fn client_player_logging_out(
@@ -199,14 +205,11 @@ impl Hooks for DistantHorizonsMod {
         _event: &mut mod_api::ClientPlayerLoggingOutEvent,
     ) {
         render_bridge::invalidate_quad_mesh();
-        let rt = runtime();
-        let owns_server = host.client_session().client_server().map_or_else(
-            || rt.inner.lock().unwrap().server_open,
-            |server| server.integrated_local,
-        );
-        if !owns_server {
-            reset_world(rt, false);
-        }
+        let integrated_local = host
+            .client_session()
+            .client_server()
+            .map(|s| s.integrated_local);
+        WorldBoundary::ClientLogout(integrated_local).apply();
     }
 
     fn client_level_unload(
@@ -254,16 +257,21 @@ impl Hooks for DistantHorizonsMod {
     }
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
-        if host.on(MOD_ID) && host.client_session().client_server().is_some() {
-            let dim = runtime().inner.lock().unwrap().active_dimension.clone();
-            pipeline::client_tick(host, &dim);
-            render_bridge::upload_pending(
-                host,
-                gpu_arena::ArenaConfig {
-                    max_sections: gpu_arena::VOXY_MAX_SECTIONS,
-                    geometry_bytes: gpu_arena::VOXY_GEOMETRY_BYTES,
-                },
-            );
+        if host.on(MOD_ID) {
+            // The retained renderer can service a retired ticket between play worlds, even
+            // when there is no mesh or connected level to upload to.
+            render_bridge::poll_node_requests(host);
+            if host.client_session().client_server().is_some() {
+                let dim = runtime().inner.lock().unwrap().active_dimension.clone();
+                pipeline::client_tick(host, &dim);
+                render_bridge::upload_pending(
+                    host,
+                    gpu_arena::ArenaConfig {
+                        max_sections: gpu_arena::VOXY_MAX_SECTIONS,
+                        geometry_bytes: gpu_arena::VOXY_GEOMETRY_BYTES,
+                    },
+                );
+            }
         }
         let rt = runtime();
         let cfg = DhConfig::read_from_host(host);
@@ -386,7 +394,7 @@ impl Hooks for DistantHorizonsMod {
         _event: &mut mod_api::ServerAboutToStartEvent,
     ) {
         // Dev 2 fires this before level_load and startup chunk notifications.
-        reset_world(runtime(), true);
+        WorldBoundary::ServerAboutToStart.apply();
     }
 
     fn server_started(&self, host: &mut dyn ServerHost, _event: &mut ServerStartedEvent) {
@@ -399,18 +407,15 @@ impl Hooks for DistantHorizonsMod {
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         let rt = runtime();
-        let world_dir = {
-            let mut st = rt.inner.lock().unwrap();
-            st.live_levels.clear();
-            st.world_dir.clone()
-        };
-        rt.gen_pool.shutdown_and_join();
-        pipeline::finish_server_io(host, &rt.io, world_dir.as_deref(), None);
+        finish_server_stop(&rt.inner, |world_dir| {
+            rt.gen_pool.shutdown_and_join();
+            pipeline::finish_server_io(host, &rt.io, world_dir, None);
+        });
     }
 
     fn server_stopped(&self, _host: &mut dyn ServerHost, _event: &mut mod_api::ServerStoppedEvent) {
         // Also retires admissions after a failed open or a stop which skipped level_unload.
-        reset_world(runtime(), false);
+        WorldBoundary::ServerStopped.apply();
     }
 
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
@@ -472,14 +477,63 @@ impl Hooks for DistantHorizonsMod {
     }
 }
 
-fn reset_world(rt: &render_bridge::DhRuntime, server_open: bool) {
-    rt.gen_pool.shutdown_and_join();
-    network::octree_sync::client_reset();
+fn finish_server_stop(
+    state: &Mutex<render_bridge::DhState>,
+    finish_io: impl FnOnce(Option<&std::path::Path>),
+) {
+    let world_dir = {
+        let mut st = state.lock().unwrap();
+        st.live_levels.clear();
+        st.world_dir.clone()
+    };
+    finish_io(world_dir.as_deref());
+}
+
+#[derive(Clone, Copy)]
+enum WorldBoundary {
+    ClientLogin(Option<bool>),
+    ClientLogout(Option<bool>),
+    ServerAboutToStart,
+    ServerStopped,
+}
+
+impl WorldBoundary {
+    fn apply(self) {
+        let rt = runtime();
+        reset_world(
+            &rt.inner,
+            self,
+            || {
+                rt.gen_pool.shutdown_and_join();
+                network::octree_sync::client_reset();
+            },
+            || pipeline::reset_world(&rt.io),
+        );
+    }
+}
+
+fn reset_world(
+    state: &Mutex<render_bridge::DhState>,
+    boundary: WorldBoundary,
+    stop_intake: impl FnOnce(),
+    retire_terrain: impl FnOnce(),
+) {
+    match boundary {
+        WorldBoundary::ClientLogin(integrated_local)
+        | WorldBoundary::ClientLogout(integrated_local)
+            if integrated_local.unwrap_or_else(|| state.lock().unwrap().server_open) =>
+        {
+            // A window never retires the terrain owned by its integrated server.
+            return;
+        }
+        _ => {}
+    }
+    stop_intake();
     // Legacy submissions and I/O response adoption take this lock; do not let an old result
     // become visible after the disk worker and pipeline cross the lifetime boundary.
-    let mut st = rt.inner.lock().unwrap();
-    pipeline::reset_world(&rt.io);
-    st.server_open = server_open;
+    let mut st = state.lock().unwrap();
+    retire_terrain();
+    st.server_open = matches!(boundary, WorldBoundary::ServerAboutToStart);
     st.world_dir = None;
     st.live_levels.clear();
     st.dimensions.clear();
@@ -490,7 +544,9 @@ fn reset_world(rt: &render_bridge::DhRuntime, server_open: bool) {
     st.server_player_round_robin.clear();
     st.remote_requested.clear();
     st.client_loaded_chunks.clear();
-    st.active_dimension.clear();
+    if !matches!(boundary, WorldBoundary::ClientLogin(_)) {
+        st.active_dimension.clear();
+    }
     st.camera = None;
     st.has_camera = false;
 }
@@ -1251,5 +1307,42 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
             dim.to_owned(),
             std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::render_bridge::DhState;
+    use std::path::PathBuf;
+
+    #[test]
+    fn integrated_client_login_and_logout_leave_server_terrain_admitted() {
+        let dim = "minecraft:overworld";
+        let world_dir = PathBuf::from("local-world");
+        let state = Mutex::new(DhState {
+            server_open: true,
+            world_dir: Some(world_dir.clone()),
+            live_levels: [dim.to_owned()].into(),
+            active_dimension: dim.to_owned(),
+            ..Default::default()
+        });
+        for boundary in [
+            WorldBoundary::ClientLogin(Some(true)),
+            WorldBoundary::ClientLogout(Some(true)),
+            // The window can lose its session view before the integrated server stops.
+            WorldBoundary::ClientLogout(None),
+        ] {
+            reset_world(
+                &state,
+                boundary,
+                || panic!("integrated client must not stop server admission or intake"),
+                || panic!("integrated client must not retire shared terrain or region handles"),
+            );
+        }
+        let st = state.lock().unwrap();
+        assert!(st.server_open && st.live_levels.contains(dim));
+        assert_eq!(st.world_dir.as_ref(), Some(&world_dir));
+        assert_eq!(st.active_dimension, dim);
     }
 }
