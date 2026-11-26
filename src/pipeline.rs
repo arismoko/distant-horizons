@@ -6,7 +6,8 @@
 
 use crate::bakery::{
     BakeQuad, BakeRequest, BakedModel, BakedModelTable, BakedTint, BiomeTintTable, FluidKind,
-    MODEL_TRANSLUCENT, SpriteError, SpritePixels, SpriteSource, default_translucent, pack_rgba,
+    MODEL_TRANSLUCENT, SpriteError, SpritePixels, SpriteSource, build_atlas_mips,
+    default_translucent, pack_rgba,
 };
 use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
 use crate::mesh::{SectionQuads, mesh_octree_section_masked};
@@ -561,12 +562,18 @@ fn bake_request(
     }
 }
 
-/// Side of the baked face atlas: one 1024² dynamic texture (the mod's whole 4 MiB budget).
-pub const ATLAS_SIDE: usize = 1024;
+/// Side of the baked face atlas: one 2048² dynamic texture, 128 x 128 face tiles of 16 texels
+/// (16 384 faces = 2 730 full six-face models).
+pub const ATLAS_SIDE: usize = 2048;
+/// Mip levels of the atlas (`0..=4`: 2048, 1024, 512, 256, 128 texels wide, i.e. face tiles of 16,
+/// 8, 4, 2 and 1 texels). `voxy_quads.fsh` samples them with `textureGrad`.
+pub const ATLAS_MIP_LEVELS: u32 = 5;
 /// Texels per face side (`bakery::FACE_GRID`).
 const TILE: usize = crate::bakery::FACE_GRID;
 /// Faces the atlas holds; later models draw with the flat per-face colour (tile size 0).
 const ATLAS_FACES: usize = (ATLAS_SIDE / TILE) * (ATLAS_SIDE / TILE);
+// Every mip level must keep whole tiles (`build_atlas_mips` never mixes neighbouring faces).
+const _: () = assert!(TILE >= 1 << (ATLAS_MIP_LEVELS - 1));
 
 /// One model as the 16 words `voxy_quads.vsh/fsh` read: `[0..6]` atlas tile origins (`x | y << 16`
 /// in atlas pixels), `[6..12]` per-face average colour, `[12]` flags (bit 0 translucent, bit 1 face
@@ -684,7 +691,8 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             metas.push(p.models.meta_for(id as u32));
         }
         p.meta_snapshot = Arc::new(MetaTable(metas));
-        crate::render_bridge::queue_model_tables(words, tint_words, atlas);
+        let atlas_mips = build_atlas_mips(&atlas, ATLAS_SIDE, TILE, ATLAS_MIP_LEVELS);
+        crate::render_bridge::queue_model_tables(words, tint_words, atlas_mips);
     }
     if p.baked < p.mapper.states.len() {
         return;

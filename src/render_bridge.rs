@@ -71,20 +71,26 @@ fn storage(name: &str, read_only: bool, min_size: u32) -> mod_api::BindEntry {
     )
 }
 
+/// Sampler of the baked face atlas: trilinear over all mip levels (`max_lod > 0.25` enables
+/// linear blending between levels `0..=ATLAS_MIP_LEVELS - 1`, like vanilla's backends).
+fn atlas_sampler() -> mod_api::Sampler {
+    let mut sampler = mod_api::Sampler::new(
+        mod_api::SamplerFilter::Linear,
+        mod_api::SamplerAddress::ClampToEdge,
+    );
+    sampler.max_lod = Some((crate::pipeline::ATLAS_MIP_LEVELS - 1) as f32);
+    sampler
+}
+
 /// The quad pipelines' set-1 layout (`voxy_quads.vsh/fsh`).
 pub fn quad_layout() -> mod_api::BindGroupLayout {
-    use mod_api::{SamplerAddress, SamplerFilter};
     mod_api::BindGroupLayout::builder()
         .uniform_buffer("QuadParams", 160)
         .entry(storage("QuadBuffer", true, 8))
         .entry(storage("SectionBuffer", true, 32))
         .entry(storage("ModelBuffer", true, 64))
         .entry(storage("BiomeTintBuffer", true, 4))
-        .sampler(
-            "BlockAtlas",
-            SamplerFilter::Linear,
-            SamplerAddress::ClampToEdge,
-        )
+        .sampler("BlockAtlas", atlas_sampler())
         .build()
         .expect("static quad layout")
 }
@@ -92,7 +98,6 @@ pub fn quad_layout() -> mod_api::BindGroupLayout {
 /// The pack-linked pipelines' set-1 layout (`voxy_pack_*.vsh`): `SceneUniform` is 176 bytes
 /// ([`crate::shader_pack::PACK_SCENE_UNIFORM_SIZE`]) and the quad arena block is `QuadArena`.
 pub fn pack_layout() -> mod_api::BindGroupLayout {
-    use mod_api::{SamplerAddress, SamplerFilter};
     mod_api::BindGroupLayout::builder()
         .uniform_buffer(
             "SceneUniform",
@@ -102,11 +107,7 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
         .entry(storage("SectionBuffer", true, 32))
         .entry(storage("ModelBuffer", true, 64))
         .entry(storage("BiomeTintBuffer", true, 4))
-        .sampler(
-            "BlockAtlas",
-            SamplerFilter::Linear,
-            SamplerAddress::ClampToEdge,
-        )
+        .sampler("BlockAtlas", atlas_sampler())
         .build()
         .expect("static pack layout")
 }
@@ -186,16 +187,14 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
 /// Hi-Z copy / reduce and command generation (`assets/distantsunrises/shaders/compute`).
 fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
     use mod_api::{
-        BindGroupLayout, ComputePipeline, SamplerAddress, SamplerFilter, StorageImageAccess,
+        BindGroupLayout, ComputePipeline, Sampler, SamplerAddress, SamplerFilter,
+        StorageImageAccess,
     };
+    let nearest = || Sampler::new(SamplerFilter::Nearest, SamplerAddress::ClampToEdge);
     let hiz_layout = || {
         BindGroupLayout::builder()
             .uniform_buffer("HizParams", 16)
-            .sampler(
-                "HizSource",
-                SamplerFilter::Nearest,
-                SamplerAddress::ClampToEdge,
-            )
+            .sampler("HizSource", nearest())
             .entry(mod_api::BindEntry::new(
                 "HizDest",
                 mod_api::BindingKind::StorageImage {
@@ -251,11 +250,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     .entry(storage("QueueOut", false, 20))
                     .entry(storage("DispatchOut", false, 16))
                     .entry(storage("VisibilityBuffer", false, 4))
-                    .sampler(
-                        "HizPyramid",
-                        SamplerFilter::Nearest,
-                        SamplerAddress::ClampToEdge,
-                    )
+                    .sampler("HizPyramid", nearest())
                     .build()
                     .expect("static traversal layout"),
             )
@@ -285,11 +280,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     .entry(storage("TranslucentCommands", false, 20))
                     .entry(storage("TransSortMeta", false, 2056))
                     .entry(storage("TransSortEntries", false, 8))
-                    .sampler(
-                        "HizPyramid",
-                        SamplerFilter::Nearest,
-                        SamplerAddress::ClampToEdge,
-                    )
+                    .sampler("HizPyramid", nearest())
                     .build()
                     .expect("static cmdgen layout"),
             )
@@ -329,11 +320,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
             .bind_group_layout(
                 BindGroupLayout::builder()
                     .uniform_buffer("SsaoParams", 32)
-                    .sampler(
-                        "WorldDepthTex",
-                        SamplerFilter::Nearest,
-                        SamplerAddress::ClampToEdge,
-                    )
+                    .sampler("WorldDepthTex", nearest())
                     .entry(mod_api::BindEntry::new(
                         "SsaoOut",
                         mod_api::BindingKind::StorageImage {
@@ -356,11 +343,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
         .cull(false)
         .bind_group_layout(
             BindGroupLayout::builder()
-                .sampler(
-                    "SsaoTex",
-                    SamplerFilter::Nearest,
-                    SamplerAddress::ClampToEdge,
-                )
+                .sampler("SsaoTex", nearest())
                 .build()
                 .expect("static ssao_apply layout"),
         ),
@@ -562,8 +545,9 @@ struct ArenaState {
     ids: HashMap<SectionKey, u32>,
 }
 
-/// Model words, biome tint words and the baked face atlas (RGBA8, `ATLAS_SIDE²`).
-type Tables = (Vec<u32>, Vec<u32>, Vec<u8>);
+/// Model words, biome tint words and the baked face atlas mip chain (RGBA8; level `l` is
+/// `ATLAS_SIDE >> l` texels wide).
+type Tables = (Vec<u32>, Vec<u32>, Vec<Vec<u8>>);
 static PENDING_TABLES: Mutex<Option<Tables>> = Mutex::new(None);
 static ATLAS_CREATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -571,9 +555,14 @@ static ATLAS_CREATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub const ATLAS_TEXTURE: &str = "distantsunrises:voxy_atlas";
 
 /// Queues the baked model words and biome tint words for the next `upload_pending` (they replace
-/// the previous tables, which a resource reload or new block id makes stale).
-pub fn queue_model_tables(model_words: Vec<u32>, biome_tint_words: Vec<u32>, atlas: Vec<u8>) {
-    *PENDING_TABLES.lock().unwrap() = Some((model_words, biome_tint_words, atlas));
+/// the previous tables, which a resource reload or new block id makes stale). `atlas_mips` holds
+/// all `ATLAS_MIP_LEVELS` levels of the face atlas, finest first.
+pub fn queue_model_tables(
+    model_words: Vec<u32>,
+    biome_tint_words: Vec<u32>,
+    atlas_mips: Vec<Vec<u8>>,
+) {
+    *PENDING_TABLES.lock().unwrap() = Some((model_words, biome_tint_words, atlas_mips));
 }
 
 /// Called by the pipeline's mesher for each finished section (empty = remove).
@@ -626,7 +615,7 @@ fn try_upload_pending(
         });
     }
     let state = guard.as_mut().unwrap();
-    if let Some((models, tints, atlas)) = PENDING_TABLES.lock().unwrap().take() {
+    if let Some((models, tints, atlas_mips)) = PENDING_TABLES.lock().unwrap().take() {
         let wrote_models = report("write models", state.arena.write_models(host, 0, &models));
         let wrote_tints = report(
             "write biome tints",
@@ -634,21 +623,42 @@ fn try_upload_pending(
         );
         let id = mod_api::Identifier::parse(ATLAS_TEXTURE).expect("static texture id");
         let side = crate::pipeline::ATLAS_SIDE as u32;
-        let done = if ATLAS_CREATED.load(std::sync::atomic::Ordering::Relaxed) {
-            host.update_dynamic_texture(&id, side, side, &atlas)
+        // Level 0 creates (with the whole mip chain allocated) or replaces the texture; levels
+        // `1..ATLAS_MIP_LEVELS` are then written as regions.
+        let level0 = if ATLAS_CREATED.load(std::sync::atomic::Ordering::Relaxed) {
+            host.update_dynamic_texture(&id, side, side, &atlas_mips[0])
         } else {
-            host.create_dynamic_texture(&id, side, side, &atlas)
+            host.create_dynamic_texture(
+                &id,
+                side,
+                side,
+                crate::pipeline::ATLAS_MIP_LEVELS,
+                &atlas_mips[0],
+            )
         };
-        // A refused atlas leaves every model on its flat colour: tile size stays in the table, so
-        // keep trying next time rather than drawing from a missing texture.
-        if done.is_ok() {
+        if level0.is_ok() {
             ATLAS_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        report(
+            "upload atlas",
+            level0.and_then(|()| {
+                (1..crate::pipeline::ATLAS_MIP_LEVELS).try_for_each(|level| {
+                    let size = side >> level;
+                    host.update_dynamic_texture_region(
+                        &id,
+                        level,
+                        [0, 0],
+                        [size, size],
+                        &atlas_mips[level as usize],
+                    )
+                })
+            }),
+        );
         // A failed table write is retried next frame unless newer tables were queued meanwhile.
         if wrote_models.is_none() || wrote_tints.is_none() {
             let mut slot = PENDING_TABLES.lock().unwrap();
             if slot.is_none() {
-                *slot = Some((models, tints, atlas));
+                *slot = Some((models, tints, atlas_mips));
             }
         }
     }
