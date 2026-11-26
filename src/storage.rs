@@ -1643,6 +1643,22 @@ impl IoQueueState {
     }
 }
 
+/// An octree save was not admitted, as distinct from an accepted write that failed.
+#[derive(Debug)]
+pub(crate) enum SaveRefusal<'a> {
+    NoWorker(&'a io::Error),
+    Shutdown,
+}
+
+impl std::fmt::Display for SaveRefusal<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoWorker(cause) => write!(f, "I/O worker could not start: {cause}"),
+            Self::Shutdown => f.write_str("I/O worker is shut down"),
+        }
+    }
+}
+
 struct IoShared {
     state: Mutex<IoQueueState>,
     wake_worker: Condvar,
@@ -1654,6 +1670,7 @@ struct IoShared {
 pub struct LodIoWorker {
     shared: Arc<IoShared>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    spawn_error: Option<io::Error>,
 }
 
 impl LodIoWorker {
@@ -1675,19 +1692,20 @@ impl LodIoWorker {
             wake_worker: Condvar::new(),
             wake_flusher: Condvar::new(),
         });
-        let handle = match spawn(Arc::clone(&shared)) {
-            Ok(h) => Some(h),
+        let (handle, spawn_error) = match spawn(Arc::clone(&shared)) {
+            Ok(h) => (Some(h), None),
             Err(e) => {
                 eprintln!("DH: failed to spawn dh-lod-io worker thread: {e}");
                 // Nothing can serve work: refuse every request, as after shutdown, so no
                 // barrier waits on or reports operations that were never accepted.
                 shared.state.lock().unwrap().shutdown = true;
-                None
+                (None, Some(e))
             }
         };
         Self {
             shared,
             handle: Mutex::new(handle),
+            spawn_error,
         }
     }
 
@@ -1751,9 +1769,8 @@ impl LodIoWorker {
         Self::spawn_with(|_| Err(io::Error::other("spawn refused")))
     }
 
-    /// Queue already-canonical runs; compression and region writes stay on the worker. Returns
-    /// whether the worker accepted the record: an unavailable or shut-down worker refuses it.
-    #[must_use]
+    /// Queue already-canonical runs; compression and region writes stay on the worker.
+    /// A refusal means the worker did not accept the record.
     pub(crate) fn queue_octree_record(
         &self,
         world_dir: PathBuf,
@@ -1761,10 +1778,13 @@ impl LodIoWorker {
         section: OctreeRecord,
         mapping: OctreeMapping,
         mode: DhV2CompressionMode,
-    ) -> bool {
+    ) -> Result<(), SaveRefusal<'_>> {
         let mut st = self.shared.state.lock().unwrap();
         if st.shutdown {
-            return false;
+            return Err(self
+                .spawn_error
+                .as_ref()
+                .map_or(SaveRefusal::Shutdown, SaveRefusal::NoWorker));
         }
         let key = (world_dir, dimension, section.rle.pos);
         if !st.pending_octree_saves.contains_key(&key) {
@@ -1779,7 +1799,7 @@ impl LodIoWorker {
             },
         );
         self.shared.wake_worker.notify_one();
-        true
+        Ok(())
     }
 
     /// Queue a tagged background probe; every completion arrives through
@@ -2853,7 +2873,16 @@ mod tests {
             worker.request_save(dir.to_path_buf(), dim.into(), sample_section(column, 95));
             worker.request_load(dir.to_path_buf(), dim.into(), column);
             let (section, mapping) = populated_octree(octree);
-            worker.save_octree_section(dir.to_path_buf(), dim.into(), section, mapping);
+            let refusal = worker.queue_octree_record(
+                dir.to_path_buf(),
+                dim.into(),
+                (&section).into(),
+                mapping,
+                DEFAULT_OCTREE_COMPRESSION,
+            );
+            assert!(
+                matches!(refusal, Err(SaveRefusal::NoWorker(cause)) if cause.to_string() == "spawn refused")
+            );
             worker.load_octree_section(dir.to_path_buf(), dim.into(), octree, 1, true);
             worker.flush().unwrap();
             worker.reset_world();
@@ -3028,8 +3057,9 @@ mod tests {
                 wake_flusher: Condvar::new(),
             }),
             handle: Mutex::new(None),
+            spawn_error: None,
         };
-        worker.save_octree_section(dir.to_path_buf(), dim.into(), old, mapping);
+        worker.save_octree_section(dir.to_path_buf(), dim.into(), old.clone(), mapping);
         worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 7, false);
         worker.save_octree_section(
             dir.to_path_buf(),
@@ -3038,6 +3068,16 @@ mod tests {
             OctreeMapping::default(),
         );
         worker.shared.state.lock().unwrap().shutdown = true;
+        assert!(matches!(
+            worker.queue_octree_record(
+                dir.to_path_buf(),
+                dim.into(),
+                (&old).into(),
+                OctreeMapping::default(),
+                DEFAULT_OCTREE_COMPRESSION,
+            ),
+            Err(SaveRefusal::Shutdown)
+        ));
         run_io_worker(Arc::clone(&worker.shared), RegionCache::default());
 
         let got = worker.drain_octree_responses();
