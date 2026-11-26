@@ -253,11 +253,13 @@ pub fn mesh_octree_section(
                         borders.get(face, x, y, z)
                     };
                     if meta.fluid() {
-                        // Never emit vertical water walls or undersides into an unloaded border,
-                        // and at coarse LODs (detail >= 1) emit only `+Y` water surfaces so
-                        // detail-0/detail-1 sea-level steps and coarse hillside springs do not
+                        // Never emit vertical water walls or undersides into an unloaded border
+                        // or unwritten air (e.g. the unpopulated half of a 32³ section beside a
+                        // 16×16 loaded chunk), and at coarse LODs (detail >= 1) emit only `+Y`
+                        // water surfaces so detail-0/detail-1 steps and coarse springs do not
                         // produce vertical blue ribbons or floating blobs.
-                        if (neighbor.is_none() && face != Face::PosY)
+                        let unwritten_air = neighbor.is_some_and(|n| n.is_air() && n.light() == 0);
+                        if ((neighbor.is_none() || unwritten_air) && face != Face::PosY)
                             || (section.pos.detail >= 1 && face != Face::PosY)
                         {
                             continue;
@@ -273,12 +275,13 @@ pub fn mesh_octree_section(
                             continue;
                         }
                     }
-                    // No neighbour loaded beyond a section border: open sky, not the solid voxel's own 0.
-                    // Air that no source wrote (light byte 0) is open sky too: distant columns only
-                    // carry a section's height of lit air above their surface, so beside a cliff
-                    // or under an overhang the neighbouring "air" is unwritten, not dark.
+                    // No neighbour loaded beyond a section border, or an unlit/unwritten
+                    // non-occluding neighbour (unwritten air, unlit seagrass/leaves/water in a
+                    // chunk whose light was not ready): fall back to the voxel's own light if
+                    // non-zero, otherwise open sky 15, so visible surfaces never turn pitch black.
                     let light = match neighbor {
-                        Some(n) if !(n.is_air() && n.light() == 0) => n.light(),
+                        Some(n) if n.light() != 0 => n.light(),
+                        _ if v.light() != 0 => v.light(),
                         _ => 0x0F,
                     };
                     let biome = if meta.biome_coloured() {

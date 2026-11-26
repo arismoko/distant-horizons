@@ -659,8 +659,11 @@ pub fn mip_voxels(children: [Voxel; 8], opacity: &dyn Fn(u32) -> u8) -> Voxel {
     let mut block = 0u32;
     let mut sky = 0u32;
     for v in &children {
-        block += (v.light() & 0xF0) as u32;
-        sky += (v.light() & 0x0F) as u32;
+        // Treat unwritten air (light == 0) as open sky (15) when mipping air light so a mix of
+        // lit air and unwritten air never averages down to sky 1..2 and darkens coarse cliffs.
+        let l = if v.light() == 0 { 0x0F } else { v.light() };
+        block += (l & 0xF0) as u32;
+        sky += (l & 0x0F) as u32;
     }
     let block = (block / 8) & 0xF0;
     let sky = sky.div_ceil(8);

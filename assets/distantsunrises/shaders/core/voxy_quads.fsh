@@ -145,10 +145,13 @@ void main() {
     bool hdr = flags.x != 0u;
     vec3 rgb = hdr ? srgb_to_linear(albedo.rgb) : albedo.rgb;
 
-    // Vanilla-style lightmap: light id = block<<4 | sky (what mesh.rs packs).
+    // Vanilla-style lightmap curve (block<<4 | sky) with non-linear sky/block response and
+    // subtle sky ambient so shaded valleys read naturally instead of harsh flat black.
     float block = float((inter.z >> 4) & 15u) / 15.0;
     float sky = float(inter.z & 15u) / 15.0;
-    float light = clamp(max(sky * depth_and_light.w, block) * 0.90 + 0.10, 0.08, 1.0);
+    float sky_curve = pow(sky * depth_and_light.w, 1.35);
+    float block_curve = pow(block, 1.35);
+    float light = clamp(max(sky_curve, block_curve) * 0.86 + 0.14, 0.14, 1.0);
     float shade = flags.y != 0u ? face_shade : 1.0;
     rgb *= light * shade;
 
