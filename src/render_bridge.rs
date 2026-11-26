@@ -687,7 +687,7 @@ pub fn prepare_draws(
         // the LOD starts, so using it would fog every LOD quad into the sky colour.
         [far_dh * 0.75, far_dh, 0.0, 0.0],
         frame.fog_color,
-        true,
+        false, // frames store vanilla gamma; no sRGB decode in the shader
         frame.config.shading_enabled,
     );
     let (base, sub) = camera_split(camera.position);

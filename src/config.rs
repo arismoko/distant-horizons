@@ -189,7 +189,7 @@ impl Default for DhConfig {
             fog_enabled: true,
             noise_enabled: true,
             noise_intensity: 0.12,
-            overdraw_prevention: 0.35,
+            overdraw_prevention: 0.9,
             fade_enabled: true,
             shading_enabled: true,
             brightness_multiplier: 1.0,
@@ -349,7 +349,7 @@ impl DhConfig {
                 0.0,
                 1.0,
                 0.05,
-                0.35,
+                0.9,
             )
             .tooltip("distantsunrises.setting.overdraw_prevention.tooltip"),
             SettingSpec::toggle(

@@ -93,6 +93,9 @@ void main() {
         }
     }
 
+    // Inside the radius vanilla's own chunks cover, vanilla draws the world.
+    if (length(rel_pos.xz) < depth_and_light.z) discard;
+
     bool hdr = flags.x != 0u;
     vec3 rgb = hdr ? srgb_to_linear(albedo.rgb) : albedo.rgb;
 
