@@ -743,7 +743,7 @@ pub fn downsample_2x2x2_onto(
             }
         }
     }
-    out.revision = 0;
+    out.revision = existing.map_or(1, |e| e.revision.wrapping_add(1));
     out
 }
 

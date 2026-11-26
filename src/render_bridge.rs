@@ -488,11 +488,11 @@ impl HizTarget {
 
 /// The Hi-Z pyramid for a `size` viewport, created or resized on demand. `None` when the
 /// adapter refuses the target; the caller then skips Hi-Z culling (`hiz_enabled = false`).
-fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<(HizTarget, bool)> {
+fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<HizTarget> {
     use mod_api::{RenderTargetDescriptor, RenderTargetFormat, StorageImageAccess};
     let mut slot = HIZ.lock().unwrap();
     if let Some(h) = slot.as_ref().filter(|h| h.size == size) {
-        return Some((HizTarget { ..*h }, false));
+        return Some(HizTarget { ..*h });
     }
     if let Some(old) = slot.take() {
         let _ = old.target.release(host);
@@ -505,7 +505,7 @@ fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<(HizTarg
     let target = host.create_render_target(&desc).ok()?;
     let made = HizTarget { target, size, mips };
     *slot = Some(HizTarget { ..made });
-    Some((made, true))
+    Some(made)
 }
 
 /// Mod-owned `R32Float` SSAO output target, resized with the viewport.
@@ -546,6 +546,15 @@ fn ensure_ssao(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<SsaoTar
     let made = SsaoTarget { target, size };
     *slot = Some(SsaoTarget { ..made });
     Some(made)
+}
+
+/// Consistent circular vanilla clip distance shared between opaque LODs and compute SSAO.
+fn vanilla_clip_dist(frame: &RenderFrameParams) -> f32 {
+    if frame.config.overdraw_prevention > 0.0 {
+        (frame.vanilla_far_blocks * frame.config.overdraw_prevention - 2.0).max(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
@@ -777,7 +786,7 @@ pub fn setup_compute(
     let dispatch_b_ref = arena.dispatch_b;
     let focal_px = (h as f32 * 0.5 * camera.projection[5].abs()).max(1.0);
     let lod_threshold = 2.0f32;
-    let Some((hiz, _)) = ensure_hiz(host, [w, h]) else {
+    let Some(hiz) = ensure_hiz(host, [w, h]) else {
         return;
     };
     let mips = hiz.mips;
@@ -938,15 +947,15 @@ pub fn setup_compute(
     report("add_compute_pass", added);
 
     // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
-    if let (Ok(ssao_pipe), Some(ssao_target)) = (
-        assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
-        ensure_ssao(host, [w, h]),
-    ) {
-        let clip_dist = if frame.config.overdraw_prevention > 0.0 {
-            (frame.vanilla_far_blocks * frame.config.overdraw_prevention.max(0.98) - 1.0).max(0.0)
-        } else {
-            0.0
-        };
+    // Uses the target ensured during `prepare_draws` so a resize never frees a handle already
+    // bound by this frame's `ssao_apply` draw.
+    if frame.config.ssao_enabled
+        && let (Ok(ssao_pipe), Some(ssao_target)) = (
+            assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
+            ensure_ssao(host, [w, h]),
+        )
+    {
+        let clip_dist = vanilla_clip_dist(&frame);
         let ssao_params = Std140(Vec::with_capacity(32))
             .f32s(&[
                 camera.projection[0].abs().max(1e-4),
@@ -1004,18 +1013,15 @@ pub fn prepare_draws(
     let rd_blocks = frame.config.render_distance_blocks().max(256.0);
     let far_dh = (rd_blocks * 1.4).max(1024.0);
     let atlas_id = id(ATLAS_TEXTURE);
-    // Match vanilla's circular loaded chunk radius around the camera chunk (RD*16 - 2 blocks so
-    // diagonal corners where vanilla has no chunks never open sky holes; exact per-chunk AABB
-    // cutout wires in once #5911 merges).
-    let clip_dist = if frame.config.overdraw_prevention > 0.0 {
-        (frame.vanilla_far_blocks * frame.config.overdraw_prevention.max(0.98) - 2.0).max(0.0)
+    let clip_dist = vanilla_clip_dist(&frame);
+    // Keep mid-ground hills crisp like Voxy (`NormalRenderPipeline.java`), respecting
+    // `fog_enabled`, `fog_falloff`, and `fog_spherical`.
+    let (fog_start, fog_end) = if frame.config.fog_enabled {
+        let start = (rd_blocks * 0.55).max(frame.vanilla_far_blocks + 64.0);
+        (start, rd_blocks.max(start + 64.0))
     } else {
-        0.0
+        (far_dh * 4.0, far_dh * 8.0)
     };
-    // Keep mid-ground hills crisp like Voxy (`NormalRenderPipeline.java`), with gentle quadratic
-    // atmospheric haze starting past half RD and smooth 88%-100% far-horizon fade.
-    let fog_start = (rd_blocks * 0.55).max(frame.vanilla_far_blocks + 64.0);
-    let fog_end = rd_blocks.max(fog_start + 64.0);
     let quad_params = quad_params_bytes(
         view_proj,
         camera.position,
@@ -1023,7 +1029,12 @@ pub fn prepare_draws(
         far_dh,
         clip_dist,
         frame.sun_brightness,
-        [fog_start, fog_end, 2.0, 0.0],
+        [
+            fog_start,
+            fog_end,
+            frame.config.fog_falloff.min(2) as f32,
+            f32::from(frame.config.fog_spherical),
+        ],
         frame.fog_color,
         false, // frames store vanilla gamma; no sRGB decode in the shader
         frame.config.shading_enabled,
@@ -1046,11 +1057,17 @@ pub fn prepare_draws(
     };
     let s = arena.slices;
     // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws.
-    if let (Ok(ssao_apply), Some(ssao_src)) = (
-        assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
-        SSAO.lock().unwrap().as_ref().map(SsaoTarget::source),
-    ) {
-        let bindings = DrawBindings::new().texture("SsaoTex", ssao_src);
+    // Ensure the target for the current window size here (before `setup_compute`) so resize
+    // reallocations happen once per frame before any draw holds the handle.
+    if frame.config.ssao_enabled
+        && let (Some(win_size), Ok(ssao_apply), Ok(_)) = (
+            host.window_size(),
+            assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
+            assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
+        )
+        && let Some(ssao_target) = ensure_ssao(host, win_size)
+    {
+        let bindings = DrawBindings::new().texture("SsaoTex", ssao_target.source());
         if let Some(batch) = report(
             "ssao_apply draw",
             context.draw_mesh(
@@ -1153,16 +1170,6 @@ pub fn prepare_draws(
         ) {
             PREPARED.lock().unwrap().push((OPAQUE_STAGE, batch));
         }
-    }
-    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if LOGGED.fetch_add(1, Ordering::Relaxed).is_multiple_of(300) {
-        eprintln!(
-            "distantsunrises: arena sections high-water {sections}, live {}, opaque commands {}, quad bytes used {}, vanilla far {} blocks",
-            arena.live_sections(),
-            arena.opaque_command_count(),
-            arena.used_geometry_bytes(),
-            frame.vanilla_far_blocks
-        );
     }
     record_frame_stats(sections as u64, arena.live_sections() as u64);
 }

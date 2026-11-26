@@ -96,7 +96,9 @@ bool occluded_by_hiz(vec3 mn, vec3 mx) {
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    if (gid >= queue_in.count) return;
+    uint max_q = uint(base_section.w);
+    uint q_count = min(queue_in.count, max_q);
+    if (gid >= q_count) return;
 
     uint node_idx = queue_in.items[gid];
     GpuNode n = nodes[node_idx];
@@ -121,14 +123,10 @@ void main() {
     bool has_geom = section_id != 0xFFFFFFFFu;
     bool has_children = child_mask != 0u && child_base != 0xFFFFFFFFu;
 
-    // Screen-space projected voxel error: closest point of node AABB to the camera.
-    vec3 closest = clamp(vec3(0.0), mn, mx);
-    float dist = max(length(closest), 1.0);
-    float voxel_px = (scale * camera_sub_pos.w) / dist;
-
-    bool subdivide = detail > 0u && has_children && (voxel_px > lod_cfg.x || !has_geom);
+    // Descend whenever uploaded finer children exist so GPU traversal stays 1:1 consistent
+    // with CPU `covered_rendered_mask` (avoiding masked-octant holes at any window size/FOV).
+    bool subdivide = detail > 0u && has_children;
     if (subdivide) {
-        uint max_q = uint(base_section.w);
         for (uint ci = 0u; ci < 8u; ci++) {
             if ((child_mask & (1u << ci)) != 0u) {
                 uint slot = atomicAdd(queue_out.count, 1u);

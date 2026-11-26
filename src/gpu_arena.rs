@@ -405,16 +405,16 @@ pub fn build_node_tree(
     use crate::octree::{MAX_OCTREE_DETAIL, child_index};
 
     let mut nodes: Vec<GpuNode> = Vec::new();
-    let mut index_of: HashMap<(u8, [i32; 3]), usize> = HashMap::new();
+    let mut root_index: HashMap<[i32; 3], usize> = HashMap::new();
     let mut roots: Vec<u32> = Vec::new();
 
     // Ensure a root node exists at `MAX_OCTREE_DETAIL` and return its index.
     let ensure_root = |pos: [i32; 3],
                        nodes: &mut Vec<GpuNode>,
-                       index_of: &mut HashMap<(u8, [i32; 3]), usize>,
+                       root_index: &mut HashMap<[i32; 3], usize>,
                        roots: &mut Vec<u32>|
      -> usize {
-        if let Some(&idx) = index_of.get(&(MAX_OCTREE_DETAIL, pos)) {
+        if let Some(&idx) = root_index.get(&pos) {
             return idx;
         }
         let idx = nodes.len();
@@ -427,7 +427,7 @@ pub fn build_node_tree(
             child_mask: 0,
             aabb: SectionAabb::FULL.pack(),
         });
-        index_of.insert((MAX_OCTREE_DETAIL, pos), idx);
+        root_index.insert(pos, idx);
         roots.push(idx as u32);
         idx
     };
@@ -437,7 +437,7 @@ pub fn build_node_tree(
         // Walk from root down to `clamped_level`, allocating 8-child blocks as needed.
         let shift = MAX_OCTREE_DETAIL - clamped_level;
         let root_pos = [pos[0] >> shift, pos[1] >> shift, pos[2] >> shift];
-        let mut cur_idx = ensure_root(root_pos, &mut nodes, &mut index_of, &mut roots);
+        let mut cur_idx = ensure_root(root_pos, &mut nodes, &mut root_index, &mut roots);
         let mut cur_pos = root_pos;
         let mut cur_level = MAX_OCTREE_DETAIL;
         while cur_level > clamped_level {
@@ -471,18 +471,19 @@ pub fn build_node_tree(
                         child_mask: 0,
                         aabb: SectionAabb::FULL.pack(),
                     });
-                    index_of.insert((next_level, [cx, cy, cz]), base + ci);
                 }
                 base
             };
             nodes[cur_idx].child_mask |= 1u32 << oct;
+            // Any internal node with children must keep FULL bounds regardless of HashMap
+            // iteration order so frustum/Hi-Z culling never drops children outside a masked mesh.
+            nodes[cur_idx].aabb = SectionAabb::FULL.pack();
             cur_idx = child_base + oct;
             cur_pos = next_pos;
             cur_level = next_level;
         }
         nodes[cur_idx].section_id = section_id;
-        // Leaf nodes tighten to their exact geometry AABB; internal nodes keep FULL so their
-        // bounding box conservatively encloses all 8 child octants.
+        // Leaf nodes tighten to their exact geometry AABB; internal nodes keep FULL.
         if nodes[cur_idx].child_mask == 0 {
             nodes[cur_idx].aabb = aabb.pack();
         }
@@ -557,16 +558,18 @@ pub struct GpuArena {
 
 impl GpuArena {
     pub fn new(host: &mut dyn ClientHost, config: ArenaConfig) -> Result<Self, ArenaError> {
-        let mut sections = config.max_sections.max(1);
+        let initial_sections = config.max_sections.max(1);
+        let min_sections = initial_sections.min(1 << 14);
+        let mut sections = initial_sections;
         let mut geometry = config.geometry_bytes.max(MIN_GEOMETRY_BYTES);
         loop {
             match Self::try_new(host, sections, geometry) {
                 Ok(arena) => return Ok(arena),
                 Err(ArenaError::Buffer(_))
-                    if geometry > MIN_GEOMETRY_BYTES || sections > 1 << 14 =>
+                    if geometry > MIN_GEOMETRY_BYTES || sections > min_sections =>
                 {
                     geometry = (geometry / 2).max(MIN_GEOMETRY_BYTES);
-                    sections = (sections / 2).max(1 << 14);
+                    sections = (sections / 2).max(min_sections);
                 }
                 Err(e) => return Err(e),
             }
@@ -600,28 +603,16 @@ impl GpuArena {
             host,
             StorageBufferDescriptor::new(n * SECTION_METADATA_BYTES),
         )?;
-        let opaque_commands = make(
-            host,
-            StorageBufferDescriptor::new(
-                n * OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES,
-            )
-            .indirect(true),
-        )?;
+        let cmd_bytes = n * OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
+        let tcmd_bytes = n * TRANSLUCENT_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
+        let tsort_entry_bytes = n * TRANS_SORT_ENTRY_BYTES;
+        let opaque_commands = make(host, StorageBufferDescriptor::new(cmd_bytes).indirect(true))?;
         let translucent_commands = make(
             host,
-            StorageBufferDescriptor::new(
-                n * TRANSLUCENT_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES,
-            )
-            .indirect(true),
+            StorageBufferDescriptor::new(tcmd_bytes).indirect(true),
         )?;
-        let trans_sort_meta = make(
-            host,
-            StorageBufferDescriptor::new(TRANS_SORT_META_BYTES).indirect(true),
-        )?;
-        let trans_sort_entries = make(
-            host,
-            StorageBufferDescriptor::new(n * TRANS_SORT_ENTRY_BYTES),
-        )?;
+        let trans_sort_meta = make(host, StorageBufferDescriptor::new(TRANS_SORT_META_BYTES))?;
+        let trans_sort_entries = make(host, StorageBufferDescriptor::new(tsort_entry_bytes))?;
         let node_bytes = GPU_MAX_NODES * GPU_NODE_BYTES;
         let root_bytes = GPU_TRAV_QUEUE_CAP as u64 * 4;
         let vis_bytes = n * 4;
@@ -638,16 +629,10 @@ impl GpuArena {
             host,
             StorageBufferDescriptor::new(GPU_DISPATCH_BYTES).indirect(true),
         )?;
-        let models = make(
-            host,
-            StorageBufferDescriptor::new(MODEL_COUNT * MODEL_WORDS * 4),
-        )?;
-        let biome_tints = make(host, StorageBufferDescriptor::new(BIOME_COUNT * 3 * 4))?;
-        let cmd_bytes = n * OPAQUE_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
-        let tcmd_bytes = n * TRANSLUCENT_SLOTS_PER_SECTION * DRAW_INDEXED_INDIRECT_BYTES;
-        let tsort_entry_bytes = n * TRANS_SORT_ENTRY_BYTES;
         let model_bytes = MODEL_COUNT * MODEL_WORDS * 4;
         let biome_bytes = BIOME_COUNT * 3 * 4;
+        let models = make(host, StorageBufferDescriptor::new(model_bytes))?;
+        let biome_tints = make(host, StorageBufferDescriptor::new(biome_bytes))?;
         let slices = ArenaSlices {
             quads: quads.slice(0, geometry_bytes),
             sections: sections.slice(0, n * SECTION_METADATA_BYTES),
@@ -813,7 +798,15 @@ impl GpuArena {
         self.dirty.clear();
         if self.nodes_dirty {
             let (node_list, root_list) = build_node_tree(&self.live_meta);
-            if !node_list.is_empty() && (node_list.len() as u64) <= GPU_MAX_NODES {
+            if (node_list.len() as u64) > GPU_MAX_NODES {
+                eprintln!(
+                    "distantsunrises: GPU node tree ({} nodes) exceeds GPU_MAX_NODES ({GPU_MAX_NODES}); skipping node/root upload",
+                    node_list.len()
+                );
+                self.nodes_dirty = false;
+                return Ok(());
+            }
+            if !node_list.is_empty() {
                 let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
                 for n in &node_list {
                     nbytes.extend_from_slice(&n.to_bytes());
@@ -1047,5 +1040,18 @@ mod tests {
         }
         assert_eq!(cur.section_id, 10);
         assert_eq!(unpack_section_pos([cur.pos0, cur.pos1]), (0, [-3, 2, 5]));
+    }
+
+    #[test]
+    fn gpu_node_tree_keeps_parent_aabb_full_regardless_of_insert_order() {
+        let tight = SectionAabb {
+            offset: [1, 2, 3],
+            size: [4, 5, 6],
+        };
+        let mut live = HashMap::new();
+        live.insert(1, (4u8, [0, 0, 0], tight));
+        live.insert(2, (0u8, [0, 0, 0], tight));
+        let (nodes, roots) = build_node_tree(&live);
+        assert_eq!(nodes[roots[0] as usize].aabb, SectionAabb::FULL.pack());
     }
 }

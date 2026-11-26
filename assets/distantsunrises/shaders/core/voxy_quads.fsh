@@ -32,14 +32,11 @@ vec4 unpack_rgba(uint c) {
     return vec4(float(c & 0xFFu), float((c >> 8) & 0xFFu), float((c >> 16) & 0xFFu), float(c >> 24)) / 255.0;
 }
 
-float fog_curve(float t_raw, uint mode) {
-    float t = clamp(t_raw, 0.0, 1.0);
-    if (mode == 0u) return t;
-    if (mode == 1u) return clamp(1.0 - exp(-2.5 * t), 0.0, 1.0);
-    return clamp(1.0 - exp(-2.8 * t * t), 0.0, 1.0);
-}
-
 void main() {
+    // Hoist screen-space derivatives to uniform control flow before any discard/branch.
+    vec2 duv_x = dFdx(uv);
+    vec2 duv_y = dFdy(uv);
+
     uint face = inter.x & 0xFFu;
     uint model_id = inter.x >> 8;
     uint mbase = model_id * 16u;
@@ -87,8 +84,6 @@ void main() {
         // dirt below), test greyscale on the UNBLENDED nearest texel (`texelFetch`) so bilinear
         // filtering between grass and dirt never strips the green grass lip, and tint greyscale
         // texels BEFORE averaging for mip 1 / mip 2.
-        vec2 duv_x = dFdx(uv);
-        vec2 duv_y = dFdy(uv);
         float foot = max(length(duv_x), length(duv_y));
         float lod = clamp(log2(max(foot * tile_px.x, 1.0)), 0.0, 2.0);
 

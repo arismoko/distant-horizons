@@ -164,7 +164,7 @@ void main() {
     // voxy_trans_prefix.csh + voxy_trans_scatter.csh.
     translucent_cmds[id] = make(0u, 0u, 0u, false);
     if (visible && c_trans != 0u) {
-        uint dist = min(uint(abs(rel.x) + abs(rel.y) + abs(rel.z)), 255u);
+        uint dist = min((uint(abs(rel.x) + abs(rel.y) + abs(rel.z)) << detail), 255u);
         uint bucket = 255u - dist;
         uint slot = atomicAdd(visible_count, 1u);
         atomicAdd(bucket_counts[bucket], 1u);

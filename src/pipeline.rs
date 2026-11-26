@@ -190,6 +190,7 @@ impl crate::bakery::ModelLookup for MetaTable {
 struct MeshJob {
     dim: String,
     pos: OctreeSectionPos,
+    epoch: u64,
     section: OctreeSection,
     borders: NeighborBorders,
     covered: u8,
@@ -198,7 +199,7 @@ struct MeshJob {
 
 struct MeshWorker {
     queue: Arc<(Mutex<VecDeque<MeshJob>>, std::sync::Condvar)>,
-    done: Arc<Mutex<Vec<(String, OctreeSectionPos, bool)>>>,
+    done: Arc<Mutex<Vec<(String, OctreeSectionPos, u64, BuiltSection)>>>,
 }
 
 impl MeshWorker {
@@ -207,7 +208,12 @@ impl MeshWorker {
             Mutex::new(VecDeque::<MeshJob>::new()),
             std::sync::Condvar::new(),
         ));
-        let done = Arc::new(Mutex::new(Vec::<(String, OctreeSectionPos, bool)>::new()));
+        let done = Arc::new(Mutex::new(Vec::<(
+            String,
+            OctreeSectionPos,
+            u64,
+            BuiltSection,
+        )>::new()));
         let q_bg = Arc::clone(&queue);
         let d_bg = Arc::clone(&done);
         let _ = std::thread::Builder::new()
@@ -228,31 +234,10 @@ impl MeshWorker {
                         &*job.metas,
                         job.covered,
                     );
-                    if job.pos.detail == 0 && job.pos.y == 2 {
-                        static MESH_DIAG: std::sync::atomic::AtomicUsize =
-                            std::sync::atomic::AtomicUsize::new(0);
-                        if MESH_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                            eprintln!(
-                                "distantsunrises: diag mesh pos={:?} non_air={} opaque={} trans={} aabb={:?}..{:?} covered={:#x}",
-                                job.pos,
-                                job.section.non_air_count(),
-                                quads.opaque.len(),
-                                quads.translucent.len(),
-                                quads.aabb_min,
-                                quads.aabb_max,
-                                job.covered
-                            );
-                        }
-                    }
                     let built = built_section(&quads);
-                    let has_quads = !built.is_empty();
-                    let key = (
-                        job.dim.clone(),
-                        job.pos.detail,
-                        [job.pos.x, job.pos.y, job.pos.z],
-                    );
-                    submit_built_section(key, built);
-                    d_bg.lock().unwrap().push((job.dim, job.pos, has_quads));
+                    d_bg.lock()
+                        .unwrap()
+                        .push((job.dim, job.pos, job.epoch, built));
                 }
             });
         Self { queue, done }
@@ -270,10 +255,10 @@ impl MeshWorker {
 
     fn clear_dim(&self, dim: &str) {
         self.queue.0.lock().unwrap().retain(|j| j.dim != dim);
-        self.done.lock().unwrap().retain(|(d, _, _)| d != dim);
+        self.done.lock().unwrap().retain(|(d, _, _, _)| d != dim);
     }
 
-    fn drain_done(&self) -> Vec<(String, OctreeSectionPos, bool)> {
+    fn drain_done(&self) -> Vec<(String, OctreeSectionPos, u64, BuiltSection)> {
         std::mem::take(&mut *self.done.lock().unwrap())
     }
 }
@@ -290,6 +275,9 @@ struct Pipeline {
     models_dirty: bool,
     dirty: HashMap<String, VecDeque<OctreeSectionPos>>,
     queued: HashMap<String, HashSet<OctreeSectionPos>>,
+    /// Monotonic epoch per `(dim, pos)` so stale off-thread mesh results are dropped before upload.
+    next_epoch: u64,
+    section_epoch: HashMap<(String, OctreeSectionPos), u64>,
     /// Sections currently uploaded to the GPU arena (strictly leaf sections: never both parent
     /// and child for the same volume).
     rendered: HashMap<String, HashSet<OctreeSectionPos>>,
@@ -459,6 +447,7 @@ pub fn clear_dimension(dim: &str) {
     p.stores.remove(dim);
     p.dirty.remove(dim);
     p.queued.remove(dim);
+    p.section_epoch.retain(|(d, _), _| d != dim);
     p.rendered.remove(dim);
     p.unsaved.remove(dim);
     p.requested.remove(dim);
@@ -625,7 +614,10 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
     }
     let mut counts = [0u16; BUCKETS];
     let mut all = Vec::with_capacity(quads.quad_count() as usize);
-    for (i, bucket) in by_bucket.into_iter().enumerate() {
+    for (i, mut bucket) in by_bucket.into_iter().enumerate() {
+        if bucket.len() > u16::MAX as usize {
+            bucket.truncate(u16::MAX as usize);
+        }
         counts[i] = bucket.len() as u16;
         all.extend(bucket);
     }
@@ -691,7 +683,13 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
     }
 
     let mut remesh_ancestors: Vec<(String, OctreeSectionPos)> = Vec::new();
-    for (done_dim, pos, has_quads) in MESH_WORKER.drain_done() {
+    for (done_dim, pos, epoch, built) in MESH_WORKER.drain_done() {
+        if p.section_epoch.get(&(done_dim.clone(), pos)).copied() != Some(epoch) {
+            continue;
+        }
+        let has_quads = !built.is_empty();
+        let key = (done_dim.clone(), pos.detail, [pos.x, pos.y, pos.z]);
+        submit_built_section(key, built);
         let changed = if has_quads {
             p.rendered.entry(done_dim.clone()).or_default().insert(pos)
         } else {
@@ -702,10 +700,16 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         if changed {
             let mut anc = pos.parent();
             while let Some(a) = anc {
-                if p.rendered
-                    .get(&done_dim)
-                    .is_some_and(|live| live.contains(&a))
-                {
+                let should_requeue = if has_quads {
+                    p.rendered
+                        .get(&done_dim)
+                        .is_some_and(|live| live.contains(&a))
+                } else {
+                    p.stores
+                        .get(&done_dim)
+                        .is_some_and(|s| s.section(a).is_some_and(|sec| !sec.is_empty()))
+                };
+                if should_requeue {
                     remesh_ancestors.push((done_dim.clone(), a));
                 }
                 anc = a.parent();
@@ -733,6 +737,8 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         };
         let key = (dim.to_owned(), pos.detail, [pos.x, pos.y, pos.z]);
         let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
+            p.next_epoch = p.next_epoch.wrapping_add(1);
+            p.section_epoch.insert((dim.to_owned(), pos), p.next_epoch);
             if p.rendered
                 .get_mut(dim)
                 .is_some_and(|live| live.remove(&pos))
@@ -746,6 +752,8 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             .get(dim)
             .map_or(0, |live| covered_rendered_mask(live, pos));
         if covered == 0xFF {
+            p.next_epoch = p.next_epoch.wrapping_add(1);
+            p.section_epoch.insert((dim.to_owned(), pos), p.next_epoch);
             if p.rendered
                 .get_mut(dim)
                 .is_some_and(|live| live.remove(&pos))
@@ -757,10 +765,15 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         let neighbors: [Option<&OctreeSection>; 6] =
             Face::ALL.map(|face| store.section(pos.neighbor(face)));
         let borders = NeighborBorders::from_neighbors(neighbors);
+        let section_clone = section.clone();
+        p.next_epoch = p.next_epoch.wrapping_add(1);
+        let epoch = p.next_epoch;
+        p.section_epoch.insert((dim.to_owned(), pos), epoch);
         MESH_WORKER.push(MeshJob {
             dim: dim.to_owned(),
             pos,
-            section: section.clone(),
+            epoch,
+            section: section_clone,
             borders,
             covered,
             metas: Arc::clone(&metas),
