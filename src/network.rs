@@ -1060,19 +1060,21 @@ pub mod octree_sync {
     /// Chebyshev distance in chunks from a block position to a section, `DH:
     /// DhSectionPos.getChebyshevSignedBlockDistance(..) / 16` (`AbstractDhServerLevel.java:146`),
     /// clamped to 0 inside the section.
-    pub fn chebyshev_chunk_distance(pos: OctreeSectionPos, block_x: i32, block_z: i32) -> i32 {
-        let [ox, _, oz] = pos.block_origin();
-        let span = pos.block_span();
-        let axis = |p: i32, o: i32| {
-            if p < o {
-                o - p
-            } else if p >= o + span {
-                p - (o + span) + 1
+    pub fn chebyshev_chunk_distance(pos: OctreeSectionPos, block_x: i32, block_z: i32) -> i64 {
+        let span = i64::from(pos.block_span());
+        let axis = |block: i32, section: i32| {
+            let block = i64::from(block);
+            let origin = i64::from(section) * span;
+            let end = origin + span;
+            if block < origin {
+                origin - block
+            } else if block >= end {
+                block - end + 1
             } else {
                 0
             }
         };
-        axis(block_x, ox).max(axis(block_z, oz)) / 16
+        axis(block_x, pos.x).max(axis(block_z, pos.z)) / 16
     }
 
     #[derive(Default)]
@@ -1127,7 +1129,7 @@ pub mod octree_sync {
         pub fn admit(
             &mut self,
             req: &OctreeSectionRequest,
-            distance_chunks: i32,
+            distance_chunks: i64,
             now: Instant,
         ) -> Result<Admission, ExceptionMessage> {
             let fail = |kind, message: String| ExceptionMessage {
@@ -1143,7 +1145,7 @@ pub mod octree_sync {
             };
             let limiters = &mut self.limiters;
             if req.client_timestamp.is_none() {
-                if distance_chunks > cfg.max_generation_request_distance {
+                if distance_chunks > i64::from(cfg.max_generation_request_distance) {
                     return Err(fail(
                         ExceptionKind::RequestOutOfRange,
                         format!(
@@ -1172,7 +1174,7 @@ pub mod octree_sync {
                 }
                 Ok(Admission::Generation)
             } else {
-                if distance_chunks > cfg.max_sync_on_load_request_distance {
+                if distance_chunks > i64::from(cfg.max_sync_on_load_request_distance) {
                     return Err(fail(
                         ExceptionKind::RequestOutOfRange,
                         format!(
@@ -1218,7 +1220,7 @@ pub mod octree_sync {
             self.effective.is_some_and(|cfg| {
                 cfg.enable_real_time_updates
                     && chebyshev_chunk_distance(pos, block_x, block_z)
-                        <= cfg.real_time_update_distance_radius_in_chunks
+                        <= i64::from(cfg.real_time_update_distance_radius_in_chunks)
             })
         }
 
@@ -3173,18 +3175,90 @@ pub mod octree_sync {
         #[test]
         fn chebyshev_distance_and_range_limit() {
             let pos = OctreeSectionPos::new(0, 0, 0, 0);
-            assert_eq!(chebyshev_chunk_distance(pos, 10, 10), 0);
-            assert_eq!(chebyshev_chunk_distance(pos, 32 + 160, 0), 10);
-            let mut st = PlayerSyncState::new(SessionConfig::default());
-            st.on_client_config(&SessionConfig::default());
-            let req = OctreeSectionRequest {
-                future_id: 1,
-                level: LEVEL.into(),
-                pos,
-                client_timestamp: None,
-            };
-            let err = st.admit(&req, 5000, Instant::now()).unwrap_err();
-            assert_eq!(err.kind, ExceptionKind::RequestOutOfRange);
+            for ((x, z), expected) in [
+                ((0, 0), 0),
+                ((31, 31), 0),
+                ((10, 10), 0),
+                ((-15, 32), 0),
+                ((-16, 32), 1),
+                ((0, 46), 0),
+                ((0, 47), 1),
+                ((32 + 160, 0), 10),
+                ((0, -160), 10),
+            ] {
+                assert_eq!(chebyshev_chunk_distance(pos, x, z), expected);
+            }
+            let cfg = SessionConfig::default();
+            let mut st = PlayerSyncState::new(cfg);
+            st.on_client_config(&cfg);
+            for (timestamp, expected) in [
+                (None, Admission::Generation),
+                (Some(5), Admission::SyncOnLoad),
+            ] {
+                let req = OctreeSectionRequest {
+                    future_id: 1,
+                    level: LEVEL.into(),
+                    pos,
+                    client_timestamp: timestamp,
+                };
+                let now = Instant::now();
+                let edge = 32 + (4096 * 16 - 1);
+                let accepted = st
+                    .admit(&req, chebyshev_chunk_distance(pos, edge, 0), now)
+                    .unwrap();
+                assert_eq!(accepted, expected);
+                st.release(accepted);
+                let failure = st
+                    .admit(&req, chebyshev_chunk_distance(pos, edge + 16, 0), now)
+                    .unwrap_err();
+                assert_eq!(failure.kind, ExceptionKind::RequestOutOfRange);
+            }
+        }
+
+        #[test]
+        fn signed_wire_coordinate_bounds_remain_far_on_both_axes() {
+            let now = Instant::now();
+            let cfg = SessionConfig::default();
+            let origin = OctreeSectionPos::new(0, 0, 0, 0);
+            let source = Fake::of(
+                &varied_section(origin, 1),
+                DhV2CompressionMode::Uncompressed,
+            );
+            let mut registry = ServerSyncRegistry::new(cfg);
+            registry.handle(1, Message::SessionConfig(cfg), now, &source);
+            let span = i64::from(32) << MAX_OCTREE_DETAIL;
+            let expected = (((1i64 << 23) - 1) * span) / 16;
+            for coordinate in [-(1 << 23), (1 << 23) - 1] {
+                for (x, z) in [(coordinate, 0), (0, coordinate)] {
+                    let pos = OctreeSectionPos::new(MAX_OCTREE_DETAIL, x, 0, z);
+                    for timestamp in [None, Some(5)] {
+                        let bytes = Message::Request(OctreeSectionRequest {
+                            future_id: 1,
+                            level: LEVEL.into(),
+                            pos,
+                            client_timestamp: timestamp,
+                        })
+                        .encode()
+                        .unwrap();
+                        let message = Message::decode(&bytes).unwrap();
+                        let Message::Request(req) = &message else {
+                            panic!("expected a request")
+                        };
+                        assert_eq!(req.pos, pos);
+                        assert_eq!(chebyshev_chunk_distance(req.pos, 0, 0), expected);
+                        let result = registry.handle(1, message, now, &source);
+                        assert!(matches!(
+                            result.as_slice(),
+                            [Message::Exception(ExceptionMessage {
+                                kind: ExceptionKind::RequestOutOfRange,
+                                ..
+                            })]
+                        ));
+                        assert!(!registry.player(1).unwrap().wants_partial_update(pos, 0, 0));
+                    }
+                }
+            }
+            assert_eq!(source.dto_reads.load(Ordering::Relaxed), 0);
         }
     }
 }
