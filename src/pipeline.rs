@@ -533,12 +533,18 @@ impl Pipeline {
         }
     }
 
-    fn advance_intake(&mut self, io: &LodIoWorker, dir: &Path, dim: &str, final_pass: bool) {
+    fn advance_intake(
+        &mut self,
+        io: &LodIoWorker,
+        dir: &Path,
+        dim: &str,
+        final_pass: bool,
+    ) -> Vec<(OctreeSectionPos, u64)> {
         let Some(disk) = self.disk.get_mut(dim) else {
-            return;
+            return Vec::new();
         };
         if disk.pending.is_empty() {
-            return;
+            return Vec::new();
         }
         let store = self.stores.entry(dim.to_owned()).or_default();
         let needed = disk.needed(store);
@@ -559,7 +565,7 @@ impl Pipeline {
             }
         }
         if waiting {
-            return;
+            return Vec::new();
         }
         let readable = |pos| needed.contains(&pos) && !disk.failed.contains(&pos);
         let opacity = |id| self.mapper.opacity(id);
@@ -582,11 +588,16 @@ impl Pipeline {
             }
         }
         let touched = store.take_dirty();
+        let changes = touched
+            .iter()
+            .map(|&pos| (pos, store.section(pos).unwrap().revision))
+            .collect();
         self.unsaved
             .entry(dim.to_owned())
             .or_default()
             .extend(touched.iter().copied());
         self.queue(dim, touched);
+        changes
     }
 }
 
@@ -1152,14 +1163,21 @@ pub fn request_stored_sections(
 }
 
 /// Adopt completed probes and advance only work with an explicit hit or miss for each slot.
-pub fn advance_intake(host: &dyn Host, io: &LodIoWorker, world_dir: Option<&Path>, dim: &str) {
+pub fn advance_intake(
+    host: &dyn Host,
+    io: &LodIoWorker,
+    world_dir: Option<&Path>,
+    dim: &str,
+) -> Vec<(OctreeSectionPos, u64)> {
+    let Some(dir) = world_dir else {
+        return Vec::new();
+    };
     let mut p = PIPELINE.lock().unwrap();
-    if let Some(dir) = world_dir {
-        p.accept_probes(io, dir, |mapper, section, mapping| {
-            mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
-        });
-        p.advance_intake(io, dir, dim, false);
-    }
+    p.accept_probes(io, dir, |mapper, section, mapping| {
+        mapper.remap(host, &section, &mapping.blocks, &mapping.biomes)
+    });
+    // The caller publishes only after dropping PIPELINE: request handling locks sync first.
+    p.advance_intake(io, dir, dim, false)
 }
 
 /// No generation for the unloading level is admitted after this point. Read/merge work already
@@ -1435,6 +1453,51 @@ mod tests {
         assert_eq!(merged.get(0, 0, 0).block_id(), 1);
         assert_eq!(merged.get(17, 0, 0), sibling);
         assert!(merged.to_dense().into_iter().all(|v| v != remote));
+    }
+
+    #[test]
+    fn intake_reports_terrain_revisions_not_cache_reads_or_repeated_chunks() {
+        use crate::storage::RegionCache;
+        let dir = TestTempDir::new("changes");
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let mut cached = OctreeSection::new(pos);
+        cached.set(0, 0, 0, Voxel::new(1, 0, 15, 0));
+        RegionCache::default()
+            .save_octree_section(
+                &dir,
+                DIM,
+                &cached,
+                &OctreeMapping::default(),
+                DEFAULT_OCTREE_COMPRESSION,
+            )
+            .unwrap();
+        let mut disk = DiskIntake::default();
+        disk.probe(&mut p.next_probe, &io, &dir, DIM, pos, false);
+        p.disk.insert(DIM.to_owned(), disk);
+        io.flush();
+        p.accept_probes(&io, &dir, |_, section, _| section);
+        assert_eq!(
+            p.stores[DIM].section(pos).unwrap().revision,
+            cached.revision
+        );
+        assert!(p.advance_intake(&io, &dir, DIM, false).is_empty());
+
+        stage_live(&mut p, [0, 0], 2);
+        assert!(p.advance_intake(&io, &dir, DIM, false).is_empty());
+        io.flush();
+        p.accept_probes(&io, &dir, |_, section, _| section);
+        let changes = p.advance_intake(&io, &dir, DIM, false);
+        assert!(changes.contains(&(pos, p.stores[DIM].section(pos).unwrap().revision)));
+        stage_live(&mut p, [0, 0], 2);
+        assert!(p.advance_intake(&io, &dir, DIM, false).is_empty());
+
+        stage_live(&mut p, [0, 0], 0);
+        let changes = p.advance_intake(&io, &dir, DIM, false);
+        let clear = p.stores[DIM].section(pos).unwrap();
+        assert!(changes.contains(&(pos, clear.revision)));
+        assert_eq!(clear.get(0, 0, 0).block_id(), 0);
     }
 
     #[test]

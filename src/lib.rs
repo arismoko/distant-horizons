@@ -403,9 +403,11 @@ impl Hooks for DistantHorizonsMod {
         rt.inner.lock().unwrap().world_dir = world_dir;
         rt.gen_pool.ensure_started();
         pipeline::install_sync_source();
+        network::octree_sync::set_server_open(true);
     }
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
+        network::octree_sync::set_server_open(false);
         let rt = runtime();
         finish_server_stop(&rt.inner, |world_dir| {
             rt.gen_pool.shutdown_and_join();
@@ -415,7 +417,24 @@ impl Hooks for DistantHorizonsMod {
 
     fn server_stopped(&self, _host: &mut dyn ServerHost, _event: &mut mod_api::ServerStoppedEvent) {
         // Also retires admissions after a failed open or a stop which skipped level_unload.
+        network::octree_sync::set_server_open(false);
         WorldBoundary::ServerStopped.apply();
+    }
+
+    fn player_logged_out(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::PlayerLoggedOutEvent<'_>,
+    ) {
+        // Dev 2 still lists the real departing player before removing their record.
+        if let Some(player) = host
+            .players()
+            .server_players()
+            .into_iter()
+            .find(|player| player.uuid() == event.player)
+        {
+            network::octree_sync::remove_player(player);
+        }
     }
 
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
@@ -443,6 +462,7 @@ impl Hooks for DistantHorizonsMod {
         };
         rt.gen_pool.reset_dimension(dim);
         pipeline::finish_server_io(host, &rt.io, world_dir.as_deref(), Some(dim));
+        network::octree_sync::remove_level(dim);
     }
 
     fn chunk_load(&self, host: &mut dyn ServerHost, event: &mut ChunkLoadEvent<'_>) {
@@ -617,7 +637,7 @@ const SAVES_PER_TICK: usize = 32;
 fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     let rt = runtime();
     let world_dir = rt.inner.lock().unwrap().world_dir.clone();
-    pipeline::advance_intake(host, &rt.io, world_dir.as_deref(), dim);
+    let mut changes = pipeline::advance_intake(host, &rt.io, world_dir.as_deref(), dim);
     let intake_ready = !pipeline::has_pending_intake(dim);
 
     // 1. Sample a small batch of newly loaded / modified chunks via `ChunkSnapshot`.
@@ -650,7 +670,12 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         drain_gen_results(host, dim, &mut dirty_sections);
     }
     if pipeline::has_pending_intake(dim) {
-        pipeline::advance_intake(host, &rt.io, world_dir.as_deref(), dim);
+        changes.extend(pipeline::advance_intake(
+            host,
+            &rt.io,
+            world_dir.as_deref(),
+            dim,
+        ));
     }
 
     // 2. If time remains and distant generation is on, sample distant terrain around connected
@@ -750,8 +775,21 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         }
         pipeline::flush_saves(&rt.io, &dir, SAVES_PER_TICK);
     }
-    if dim == "minecraft:overworld" && host.server_is_published() {
-        network::octree_sync::server_tick(host);
+    let drain_sync = dim == "minecraft:overworld";
+    if (drain_sync || !changes.is_empty()) && host.server_is_published() {
+        let locations = players
+            .iter()
+            .filter_map(|&(p, pos)| {
+                let level = p.dimension(host)?.to_string();
+                Some((p, (level, pos[0] as i32, pos[2] as i32)))
+            })
+            .collect();
+        if !changes.is_empty() {
+            network::octree_sync::publish_changes(dim, changes, &locations);
+        }
+        if drain_sync {
+            network::octree_sync::server_tick(host, &locations);
+        }
     }
 }
 
