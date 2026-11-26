@@ -123,7 +123,8 @@ void main() {
     if (tilePx.x > 0.0) {
         vec2 originPx = vec2(float(tileOrigin & 0xFFFFu), float(tileOrigin >> 16));
         faceUV = (originPx + tilePx * 0.5) / vec2(textureSize(BlockAtlas, 0));
-        base = textureLod(BlockAtlas, faceUV, 0.0);
+        // Face colour = the tile's top mip level (one texel per tile, centred on `faceUV`).
+        base = textureLod(BlockAtlas, faceUV, min(log2(min(tilePx.x, tilePx.y)), 4.0));
     } else {
         uint avg = modelData[m + 6u + face];
         base = vec4(float(avg & 0xFFu), float((avg >> 8) & 0xFFu), float((avg >> 16) & 0xFFu), float(avg >> 24)) / 255.0;

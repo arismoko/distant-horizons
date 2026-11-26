@@ -14,12 +14,13 @@
 //! per-face geometry, UVs, sprite key and tint index), supplies sprite pixels through
 //! [`SpriteSource`] (`#4601` `RenderAssets::atlas_sprite_pixels`: frame 0, untinted RGBA8, errors
 //! `NoSuchSprite` / `NotReady` per ruling 6-8), and the Iris `block.properties` id
-//! (`RenderAssets::shader_pack_block_id`, `#5699`). Each face is rasterised into a 4×4 texel grid
-//! (the compact GPU palette; Voxy keeps 16×16 and notes 8×8 would also do, `ModelFactory` TODO at
-//! `MODEL_TEXTURE_SIZE`) plus an alpha-weighted average used by coarse detail levels.
+//! (`RenderAssets::shader_pack_block_id`, `#5699`). Each face is rasterised into a 16×16 texel grid
+//! (Voxy's `MODEL_TEXTURE_SIZE`, one sample per texel centre, 1:1 with vanilla 16×16 sprites) plus
+//! an alpha-weighted average used by flat-colour faces. The atlas the faces are painted into gets a
+//! hardware mip chain from [`build_atlas_mips`].
 //!
 //! Biome grass/foliage/water colours are not baked in: each face records a tint state and a
-//! 16-bit texel mask, and the GPU multiplies by the biome row of [`BiomeTintTable`]
+//! 16-bit mask per texel row, and the GPU multiplies by the biome row of [`BiomeTintTable`]
 //! (`quads3.vert`: `colourData[tintColour + biomeId]`). Water is `water_still.png` multiplied by
 //! the biome water colour with the alpha forced to the pack's `water_still` alpha (vanilla: 180).
 
@@ -28,8 +29,8 @@ use crate::octree::Face;
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 
-/// Texels along one edge of a baked face grid.
-pub const FACE_GRID: usize = 4;
+/// Texels along one edge of a baked face grid (Voxy `MODEL_TEXTURE_SIZE`).
+pub const FACE_GRID: usize = 16;
 /// Texels per baked face.
 pub const FACE_TEXELS: usize = FACE_GRID * FACE_GRID;
 
@@ -42,7 +43,8 @@ pub const MODEL_FLUID: u8 = 16;
 pub const MODEL_CULLS_SAME: u8 = 32;
 pub const MODEL_FULLY_OPAQUE: u8 = 64;
 
-/// Per-face GPU flag bits (`face_flags`): bits `0..16` are the tint texel mask.
+/// Per-face GPU flag bits (`face_flags`); bits `0..16` are unused (the tint texel mask is
+/// [`BakedFace::tint_mask`]).
 pub const FACE_EXISTS: u32 = 1 << 16;
 pub const FACE_OCCLUDES: u32 = 1 << 17;
 pub const FACE_CAN_BE_OCCLUDED: u32 = 1 << 18;
@@ -157,8 +159,8 @@ pub struct BakedFace {
     pub self_lighting: bool,
     /// 0 none, 1 partial, 2 full.
     pub tint_state: u8,
-    /// Texels (row-major `[b][a]`) whose colour the biome tint multiplies.
-    pub tint_mask: u16,
+    /// One mask per texel row `b`: bit `a` is set when texel `(a, b)` is multiplied by the biome tint.
+    pub tint_mask: [u16; FACE_GRID],
     /// Covered rectangle on the `0..16` scale: `[a0, a1, b0, b1]` (`faceSize`).
     pub rect: [u8; 4],
     /// `min(round(depth * 64), 62)`.
@@ -177,7 +179,7 @@ impl BakedFace {
         cutout: false,
         self_lighting: false,
         tint_state: 0,
-        tint_mask: 0,
+        tint_mask: [0; FACE_GRID],
         rect: [0; 4],
         depth: 0,
         avg: [0; 4],
@@ -277,6 +279,45 @@ impl<F: Fn(u32) -> ModelMeta> ModelLookup for F {
 #[inline]
 pub const fn pack_rgba(c: [u8; 4]) -> u32 {
     (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
+}
+
+/// Mip chain of a square RGBA8 face atlas made of `tile`-texel square tiles: `mip_levels` levels,
+/// level `l` being `side >> l` texels wide. Each level is an alpha-weighted 2x2 box filter of the
+/// previous one (fully transparent footprints stay transparent black). Tiles sit on multiples of
+/// `tile`, so as long as `tile >> (mip_levels - 1) >= 1` every 2x2 footprint lies inside one tile
+/// and no colour ever bleeds across a tile boundary (tile 16, 5 levels: 16 -> 8 -> 4 -> 2 -> 1).
+pub fn build_atlas_mips(level0: &[u8], side: usize, tile: usize, mip_levels: u32) -> Vec<Vec<u8>> {
+    debug_assert_eq!(level0.len(), side * side * 4);
+    debug_assert!(side.is_multiple_of(tile) && tile >= 1 << mip_levels.saturating_sub(1));
+    let mut levels = vec![level0.to_vec()];
+    for level in 1..mip_levels as usize {
+        let src_side = side >> (level - 1);
+        let dst_side = side >> level;
+        let src = &levels[level - 1];
+        let mut dst = vec![0u8; dst_side * dst_side * 4];
+        for y in 0..dst_side {
+            for x in 0..dst_side {
+                let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let at = ((2 * y + dy) * src_side + 2 * x + dx) * 4;
+                    let w = u32::from(src[at + 3]);
+                    r += u32::from(src[at]) * w;
+                    g += u32::from(src[at + 1]) * w;
+                    b += u32::from(src[at + 2]) * w;
+                    a += w;
+                }
+                if a > 0 {
+                    let out = (y * dst_side + x) * 4;
+                    dst[out] = ((r + a / 2) / a) as u8;
+                    dst[out + 1] = ((g + a / 2) / a) as u8;
+                    dst[out + 2] = ((b + a / 2) / a) as u8;
+                    dst[out + 3] = ((a + 2) / 4) as u8;
+                }
+            }
+        }
+        levels.push(dst);
+    }
+    levels
 }
 
 /// Row of the biome tint buffer: packed RGBA8 grass, foliage, water and padding.
@@ -492,7 +533,7 @@ fn fluid_quads(kind: FluidKind) -> Vec<BakeQuad> {
     out
 }
 
-/// Rasterise one face of the request into the 4×4 grid.
+/// Rasterise one face of the request into the 16×16 grid, one sample per texel centre.
 #[allow(clippy::too_many_arguments)]
 fn bake_face(
     face: Face,
@@ -564,96 +605,69 @@ fn bake_face(
 
     let mut cache: HashMap<String, Option<SpritePixels>> = HashMap::new();
     let mut texels = [0u32; FACE_TEXELS];
-    let mut mask = 0u16;
+    let mut mask = [0u16; FACE_GRID];
     let (mut r_sum, mut g_sum, mut b_sum, mut w_sum) = (0u64, 0u64, 0u64, 0u64);
     let (mut covered, mut tinted_texels, mut opaque_texels) = (0usize, 0usize, 0usize);
     let (mut ra0, mut ra1, mut rb0, mut rb1) = (FACE_GRID, 0usize, FACE_GRID, 0usize);
 
     for j in 0..FACE_GRID {
         for i in 0..FACE_GRID {
-            let (mut r, mut g, mut b, mut a_sum) = (0u32, 0u32, 0u32, 0u32);
-            let (mut tr, mut tg, mut tb, mut tw) = (0u32, 0u32, 0u32, 0u32);
-            let mut weight = 0u32;
-            let mut tint_votes = 0u32;
-            let mut taken = 0u32;
-            for sj in 0..2 {
-                for si in 0..2 {
-                    let pa = (i as f32 + (si as f32 + 0.5) / 2.0) / FACE_GRID as f32;
-                    let pb = (j as f32 + (sj as f32 + 0.5) / 2.0) / FACE_GRID as f32;
-                    for q in &qs {
-                        const EPS: f32 = 1e-4;
-                        if pa < q.bbox[0] - EPS
-                            || pa > q.bbox[1] + EPS
-                            || pb < q.bbox[2] - EPS
-                            || pb > q.bbox[3] + EPS
-                        {
-                            continue;
-                        }
-                        let (da, db) = (pa - q.c0.0, pb - q.c0.1);
-                        let s = ((da * q.e3.1 - db * q.e3.0) / q.det).clamp(0.0, 1.0);
-                        let t = ((q.e1.0 * db - q.e1.1 * da) / q.det).clamp(0.0, 1.0);
-                        let u = q.q.uvs[0][0]
-                            + s * (q.q.uvs[1][0] - q.q.uvs[0][0])
-                            + t * (q.q.uvs[3][0] - q.q.uvs[0][0]);
-                        let v = q.q.uvs[0][1]
-                            + s * (q.q.uvs[1][1] - q.q.uvs[0][1])
-                            + t * (q.q.uvs[3][1] - q.q.uvs[0][1]);
-                        let px = match cache
-                            .entry(q.q.sprite.clone())
-                            .or_insert_with(|| sprites(&q.q.sprite))
-                        {
-                            Some(p) => p.pixel(u, v),
-                            // Sprite pixels unavailable (`NotReady` before the first resource
-                            // generation): fall back to the static block colour.
-                            None => [flat[0], flat[1], flat[2], 255],
-                        };
-                        if px[3] == 0 {
-                            continue;
-                        }
-                        let w = px[3] as u32;
-                        r += px[0] as u32 * w;
-                        g += px[1] as u32 * w;
-                        b += px[2] as u32 * w;
-                        a_sum += w;
-                        weight += w;
-                        taken += 1;
-                        if q.tinted {
-                            tint_votes += 1;
-                            tr += px[0] as u32 * w;
-                            tg += px[1] as u32 * w;
-                            tb += px[2] as u32 * w;
-                            tw += w;
-                        }
-                        break;
-                    }
+            // Exact texel centre: one 1:1 sample per texel, crisp against vanilla's 16x16 sprites.
+            let pa = (i as f32 + 0.5) / FACE_GRID as f32;
+            let pb = (j as f32 + 0.5) / FACE_GRID as f32;
+            let mut hit: Option<([u8; 4], bool)> = None;
+            for q in &qs {
+                const EPS: f32 = 1e-4;
+                if pa < q.bbox[0] - EPS
+                    || pa > q.bbox[1] + EPS
+                    || pb < q.bbox[2] - EPS
+                    || pb > q.bbox[3] + EPS
+                {
+                    continue;
                 }
+                let (da, db) = (pa - q.c0.0, pb - q.c0.1);
+                let s = ((da * q.e3.1 - db * q.e3.0) / q.det).clamp(0.0, 1.0);
+                let t = ((q.e1.0 * db - q.e1.1 * da) / q.det).clamp(0.0, 1.0);
+                let u = q.q.uvs[0][0]
+                    + s * (q.q.uvs[1][0] - q.q.uvs[0][0])
+                    + t * (q.q.uvs[3][0] - q.q.uvs[0][0]);
+                let v = q.q.uvs[0][1]
+                    + s * (q.q.uvs[1][1] - q.q.uvs[0][1])
+                    + t * (q.q.uvs[3][1] - q.q.uvs[0][1]);
+                let px = match cache
+                    .entry(q.q.sprite.clone())
+                    .or_insert_with(|| sprites(&q.q.sprite))
+                {
+                    Some(p) => p.pixel(u, v),
+                    // Sprite pixels unavailable (`NotReady` before the first resource
+                    // generation): fall back to the static block colour.
+                    None => [flat[0], flat[1], flat[2], 255],
+                };
+                if px[3] == 0 {
+                    continue;
+                }
+                hit = Some((px, q.tinted));
+                break;
             }
-            if taken == 0 {
+            // A transparent texel of the nearest quad (e.g. the bottom of
+            // `grass_block_side_overlay`) falls through to the quad behind it, so the tinted
+            // overlay's opaque grass fringe wins and keeps its greyscale RGB unblended with the
+            // brown dirt below: the shader's greyscale partial-tint test then tints the lip green.
+            let Some((px, tinted_hit)) = hit else {
                 continue;
-            }
-            // When a texel hits a tinted overlay (e.g. grass_block_side_overlay along the top row
-            // of a 4x4 face), keep the tinted overlay's greyscale RGB unblended with the brown dirt
-            // below so the shader's greyscale partial-tint test tints the grass lip green.
-            let mut rgb = if tw > 0 && tint_votes > 0 {
-                [(tr / tw) as u8, (tg / tw) as u8, (tb / tw) as u8]
-            } else {
-                [(r / weight) as u8, (g / weight) as u8, (b / weight) as u8]
             };
+            let mut rgb = [px[0], px[1], px[2]];
             if let Some(m) = fixed_mul {
                 rgb = mix_rgb(rgb, m);
             }
-            // Uncovered subsamples count as transparent so rim texels get partial alpha.
-            let mut alpha = (a_sum / 4) as u8;
-            if let Some(wa) = water_alpha {
-                alpha = wa;
-            }
+            let alpha = water_alpha.unwrap_or(px[3]);
             texels[j * FACE_GRID + i] = pack_rgba([rgb[0], rgb[1], rgb[2], alpha]);
             covered += 1;
             if alpha == 255 {
                 opaque_texels += 1;
             }
-            if tint_votes * 2 >= taken {
-                mask |= 1 << (j * FACE_GRID + i);
+            if tinted_hit {
+                mask[j] |= 1 << i;
                 tinted_texels += 1;
             }
             ra0 = ra0.min(i);
@@ -938,7 +952,8 @@ mod tests {
         // The overlay covers the upper half (Y) of +X: partially tinted.
         let side = &m.faces[Face::PosX as usize];
         assert_eq!(side.tint_state, 1);
-        assert_eq!(side.tint_mask, 0xCCCC);
+        // Y is the first tangent of an X face: the overlay tints texel columns 8..16 of every row.
+        assert_eq!(side.tint_mask, [0xFF00; FACE_GRID]);
         assert!(t.meta_for(5).biome_coloured());
     }
 
@@ -1024,6 +1039,98 @@ mod tests {
         let avg = t.model(id).unwrap().faces[0].avg;
         assert_eq!([avg[0], avg[1], avg[2]], flat);
         assert_eq!(t.bake(&req(2, "minecraft:barrier", Vec::new()), &s), 0);
+    }
+
+    #[test]
+    fn face_grid_is_16_with_one_texel_per_sprite_pixel() {
+        assert_eq!((FACE_GRID, FACE_TEXELS), (16, 256));
+        // A 16x16 sprite with a distinct red per column maps 1:1 onto the face texels.
+        let mut rgba = Vec::new();
+        for _ in 0..16 {
+            for x in 0..16u8 {
+                rgba.extend_from_slice(&[x * 16, 0, 0, 255]);
+            }
+        }
+        let s = Sprites(HashMap::from([(
+            "col".to_string(),
+            SpritePixels {
+                width: 16,
+                height: 16,
+                rgba,
+            },
+        )]));
+        let mut t = BakedModelTable::new();
+        let id = t.bake(&req(1, "minecraft:stone", cube_quads("col", -1)), &s);
+        let face = &t.model(id).unwrap().faces[Face::PosY as usize];
+        for j in 0..FACE_GRID {
+            for i in 0..FACE_GRID {
+                assert_eq!(
+                    face.texels[j * FACE_GRID + i],
+                    pack_rgba([i as u8 * 16, 0, 0, 255])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn atlas_mips_have_exact_dimensions_and_never_bleed_across_tiles() {
+        // 2x1 tiles of 16 texels in a 32x32 atlas: left tile red, right tile blue (opaque), the
+        // rows below transparent. 5 levels: 32, 16, 8, 4, 2 texels wide, tiles 16, 8, 4, 2, 1.
+        let side = 32;
+        let mut level0 = vec![0u8; side * side * 4];
+        for y in 0..16 {
+            for x in 0..side {
+                let at = (y * side + x) * 4;
+                let c = if x < 16 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
+                level0[at..at + 4].copy_from_slice(&c);
+            }
+        }
+        let mips = build_atlas_mips(&level0, side, 16, 5);
+        assert_eq!(mips.len(), 5);
+        assert_eq!(mips[0], level0);
+        for (level, mip) in mips.iter().enumerate() {
+            let w = side >> level;
+            assert_eq!(mip.len(), w * w * 4, "level {level}");
+            let tile = 16 >> level;
+            for y in 0..w {
+                for x in 0..w {
+                    let at = (y * w + x) * 4;
+                    let expected = if y >= tile {
+                        [0, 0, 0, 0]
+                    } else if x < tile {
+                        [255, 0, 0, 255]
+                    } else {
+                        [0, 0, 255, 255]
+                    };
+                    assert_eq!(mip[at..at + 4], expected, "level {level} texel ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn atlas_mips_weight_colour_by_alpha() {
+        // One 2x2 tile in a 4x4 atlas: two opaque texels, two transparent ones with garbage RGB.
+        let side = 4;
+        let mut level0 = vec![0u8; side * side * 4];
+        let tile = [
+            [200, 100, 50, 255],
+            [9, 9, 9, 0],
+            [200, 100, 50, 255],
+            [9, 9, 9, 0],
+        ];
+        for (n, c) in tile.iter().enumerate() {
+            let at = ((n / 2) * side + n % 2) * 4;
+            level0[at..at + 4].copy_from_slice(c);
+        }
+        let mips = build_atlas_mips(&level0, side, 2, 2);
+        assert_eq!(mips[1].len(), 2 * 2 * 4);
+        assert_eq!(mips[1][0..4], [200, 100, 50, 128]);
+        assert_eq!(mips[1][4..], [0; 12]);
     }
 
     #[test]
