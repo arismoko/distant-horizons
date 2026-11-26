@@ -80,17 +80,11 @@ pub struct GenResult {
     pub outcome: GenOutcome,
 }
 
-#[derive(Clone, Copy, Default)]
-struct DimensionEpoch {
-    epoch: u64,
-    unloading: bool,
-}
-
 struct Shared {
     queue: Mutex<VecDeque<GenJob>>,
     cv: Condvar,
     in_flight: Mutex<HashMap<(String, SectionPos), u64>>,
-    dim_epochs: Mutex<HashMap<String, DimensionEpoch>>,
+    dim_epochs: Mutex<HashMap<String, u64>>,
     done: Mutex<Vec<GenResult>>,
     global_epoch: AtomicU64,
     next_job_id: AtomicU64,
@@ -238,7 +232,7 @@ impl GenWorkerPool {
 
     /// Enqueue a distant section for off-thread sampling. Returns `true` if queued,
     /// `false` if no workers are running, the pool is at capacity, or this section is in flight.
-    pub fn enqueue(
+    pub(crate) fn enqueue(
         &self,
         dimension: String,
         pos: SectionPos,
@@ -264,11 +258,7 @@ impl GenWorkerPool {
                 .dim_epochs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let epoch = epochs.get(&dimension).copied().unwrap_or_default();
-            if epoch.unloading {
-                return false;
-            }
-            epoch.epoch
+            epochs.get(&dimension).copied().unwrap_or(0)
         };
         {
             let mut in_flight = self
@@ -312,7 +302,7 @@ impl GenWorkerPool {
                 .dim_epochs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            epochs.get(dim).map_or(0, |entry| entry.epoch)
+            epochs.get(dim).copied().unwrap_or(0)
         };
 
         let mut done = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
@@ -381,26 +371,7 @@ impl GenWorkerPool {
             .retain(|res| !(res.dimension == dim && res.pos == pos));
     }
 
-    pub fn dimension_allowed(&self, dim: &str) -> bool {
-        self.shared
-            .dim_epochs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(dim)
-            .is_none_or(|entry| !entry.unloading)
-    }
-
-    pub fn allow_dimension(&self, dim: &str) {
-        self.shared
-            .dim_epochs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(dim.to_owned())
-            .or_default()
-            .unloading = false;
-    }
-
-    /// Cancel queued, running, and completed work for this level and reject more until load.
+    /// Cancel queued, running, and completed work for this level.
     pub fn reset_dimension(&self, dim: &str) {
         {
             let mut epochs = self
@@ -409,8 +380,7 @@ impl GenWorkerPool {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let entry = epochs.entry(dim.to_owned()).or_default();
-            entry.epoch = entry.epoch.wrapping_add(1);
-            entry.unloading = true;
+            *entry = entry.wrapping_add(1);
         }
         self.shared
             .queue
@@ -477,11 +447,7 @@ fn is_job_valid(shared: &Shared, job: &GenJob) -> bool {
     }
     let dim_ok = {
         let epochs = shared.dim_epochs.lock().unwrap_or_else(|e| e.into_inner());
-        epochs
-            .get(&job.dimension)
-            .map_or(job.dim_epoch == 0, |entry| {
-                !entry.unloading && entry.epoch == job.dim_epoch
-            })
+        epochs.get(&job.dimension).copied().unwrap_or(0) == job.dim_epoch
     };
     if !dim_ok {
         return false;
@@ -674,15 +640,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inactive_level_rejects_generation_until_reloaded() {
+    fn cancelling_one_level_increments_only_its_epoch() {
         let pool = GenWorkerPool::new();
-        assert!(pool.dimension_allowed("unloading"));
+        pool.reset_dimension("sibling");
         pool.reset_dimension("unloading");
-        assert!(!pool.dimension_allowed("unloading"));
-        assert!(pool.dimension_allowed("sibling"));
-        pool.allow_dimension("unloading");
-        assert!(pool.dimension_allowed("unloading"));
-        assert_eq!(pool.shared.dim_epochs.lock().unwrap()["unloading"].epoch, 1);
+        pool.reset_dimension("unloading");
+        let epochs = pool.shared.dim_epochs.lock().unwrap();
+        assert_eq!(epochs["unloading"], 2);
+        assert_eq!(epochs["sibling"], 1);
     }
 
     #[test]
