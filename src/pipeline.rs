@@ -1099,6 +1099,9 @@ pub fn ingest_distant(
 /// saves of one section). Returns how many the worker accepted; if it refuses one (unavailable
 /// or shut down) the flush stops and keeps that section and the rest unsaved. The first refusal
 /// and the first subsequent acceptance are logged. Nothing is retried within the flush.
+///
+/// Accepted is not durable: a later disk failure is logged by the I/O worker and does not
+/// re-mark the section unsaved.
 pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
     PIPELINE.lock().unwrap().flush_saves(io, world_dir, limit)
 }
@@ -1284,18 +1287,19 @@ impl Pipeline {
             })
             .map(|(dim, _)| dim.clone())
             .collect();
+        // The worker logged each failed write when it happened; only the count is summed here.
+        let mut failed = 0usize;
         if let Some(dir) = dir {
             for dim in &dims {
                 self.advance_intake(io, dir, dim, false);
             }
-            // The worker logged each failed write when it happened.
-            let _ = io.flush();
+            failed = failed.saturating_add(io.flush().err().map_or(0, |f| f.count()));
             self.accept_probes(io, dir, remap);
             for dim in &dims {
                 self.advance_intake(io, dir, dim, true);
             }
             self.flush_saves(io, dir, usize::MAX);
-            let _ = io.flush();
+            failed = failed.saturating_add(io.flush().err().map_or(0, |f| f.count()));
         } else {
             for dim in dims {
                 let disk = self.disk.get_mut(&dim).unwrap();
@@ -1309,6 +1313,13 @@ impl Pipeline {
                 }
                 disk.pending.clear();
             }
+        }
+        if failed != 0 {
+            // Barrier counts cover every dimension since the previous barrier, not this close alone.
+            eprintln!(
+                "DH: {failed} cache writes failed since the previous save barrier, up to {}",
+                unloading.map_or("server stop".to_owned(), |dim| format!("close of {dim}"))
+            );
         }
         // Full server stop drains here; the subsequent world reset reports and retires
         // any sections still unsaved. A level unload retires only that dimension now.

@@ -1566,8 +1566,8 @@ struct OctreeSaveJob {
 }
 
 /// Accepted writes that failed since the previous barrier: the first contextual error and the
-/// total count. Each write is logged by the worker when it fails, so barriers return this to
-/// their caller without logging it again.
+/// total count. Each write is logged by the worker when it fails, so a barrier's caller reports
+/// only the count.
 #[derive(Debug)]
 pub struct SaveFailure {
     section: String,
@@ -1592,6 +1592,11 @@ impl std::error::Error for SaveFailure {
 }
 
 impl SaveFailure {
+    /// Failed writes since the previous barrier.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
     /// One failed accepted write, logged now. A quarantine refusal was already logged at the
     /// failed rename.
     fn logged(section: String, cause: io::Error) -> Self {
