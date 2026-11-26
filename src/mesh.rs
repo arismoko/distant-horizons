@@ -447,7 +447,7 @@ mod octree_mesh_tests {
     fn greedy_quads_cover_each_visible_face_exactly_once() {
         use std::collections::HashMap;
         const N: usize = 32;
-        let mut s = OctreeSection::new(pos());
+        let mut s = OctreeSection::filled(pos(), Voxel::air_with_light(15, 0));
         // Terrain with a cave and an overhang.
         for x in 0..N {
             for z in 0..N {

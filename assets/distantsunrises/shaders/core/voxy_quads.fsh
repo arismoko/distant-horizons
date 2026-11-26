@@ -78,28 +78,47 @@ void main() {
         tex_alpha = c0.a;
 
         // 3-level software mip chain (4x4 -> 2x2 -> 1x1 avg) driven by screen-space UV footprint.
-        // With Linear filtering on the 4x4 tile, sampling at (0.25, 0.75) quadrant centers gives
-        // the exact 2x2 mip average with zero bleed across tile borders.
+        // For partial-tint faces (e.g. grass_block_side: greyscale grass fringe on top row + brown
+        // dirt below), test greyscale on the UNBLENDED nearest texel (`texelFetch`) so bilinear
+        // filtering between grass and dirt never strips the green grass lip, and tint greyscale
+        // texels BEFORE averaging for mip 1 / mip 2.
         vec2 duv_x = dFdx(uv);
         vec2 duv_y = dFdy(uv);
         float foot = max(length(duv_x), length(duv_y));
         float lod = clamp(log2(max(foot * tile_px.x, 1.0)), 0.0, 2.0);
 
+        ivec2 iorigin = ivec2(origin);
+        ivec2 itile = ivec2(tile_px);
         if (has_tint) {
             if (tint_kind == 4u || face_tint_state == 2u) {
                 c0.rgb *= tint;
                 avg_albedo.rgb *= tint;
             } else if (face_tint_state == 1u) {
-                bool grey0 = abs(c0.r - c0.g) < 0.06 && abs(c0.g - c0.b) < 0.06;
-                if (grey0) c0.rgb *= tint;
-                // Partial-tint faces (e.g. grass_block_side: 1/4 grass fringe + 3/4 dirt)
-                // blend smoothly toward a slightly grass-tinted earth tone at mip 2.
-                avg_albedo.rgb *= mix(vec3(1.0), tint, 0.25);
+                ivec2 nearest_px = iorigin + clamp(ivec2(floor(f * tile_px)), ivec2(0), itile - ivec2(1));
+                vec4 raw0 = texelFetch(BlockAtlas, nearest_px, 0);
+                if (abs(raw0.r - raw0.g) < 0.06 && abs(raw0.g - raw0.b) < 0.06) {
+                    c0.rgb = raw0.rgb * tint;
+                }
             }
         }
 
         if (lod <= 0.01) {
             albedo = c0;
+        } else if (has_tint && face_tint_state == 1u) {
+            // Partial-tint mip 1/2: sample unblended texels across the 4x4 tile, tint each
+            // greyscale grass-fringe texel first, then average so distant slopes keep their green
+            // grass lip instead of turning solid brown dirt.
+            vec4 acc = vec4(0.0);
+            vec4 q0 = texelFetch(BlockAtlas, iorigin + ivec2(0, 0), 0);
+            vec4 q1 = texelFetch(BlockAtlas, iorigin + ivec2(itile.x - 1, 0), 0);
+            vec4 q2 = texelFetch(BlockAtlas, iorigin + ivec2(0, itile.y - 1), 0);
+            vec4 q3 = texelFetch(BlockAtlas, iorigin + ivec2(itile.x - 1, itile.y - 1), 0);
+            if (abs(q0.r - q0.g) < 0.06 && abs(q0.g - q0.b) < 0.06) q0.rgb *= tint;
+            if (abs(q1.r - q1.g) < 0.06 && abs(q1.g - q1.b) < 0.06) q1.rgb *= tint;
+            if (abs(q2.r - q2.g) < 0.06 && abs(q2.g - q2.b) < 0.06) q2.rgb *= tint;
+            if (abs(q3.r - q3.g) < 0.06 && abs(q3.g - q3.b) < 0.06) q3.rgb *= tint;
+            acc = 0.25 * (q0 + q1 + q2 + q3);
+            albedo = mix(c0, acc, clamp(lod * 0.5, 0.0, 1.0));
         } else {
             // Exact 2x2 mip (mip 1) from the four quadrant centers of the 4x4 tile.
             vec2 q00 = (origin + vec2(0.25, 0.25) * tile_px) / atlas_px;
@@ -110,15 +129,8 @@ void main() {
             vec4 s10 = textureLod(BlockAtlas, q10, 0.0);
             vec4 s01 = textureLod(BlockAtlas, q01, 0.0);
             vec4 s11 = textureLod(BlockAtlas, q11, 0.0);
-            if (has_tint) {
-                if (tint_kind == 4u || face_tint_state == 2u) {
-                    s00.rgb *= tint; s10.rgb *= tint; s01.rgb *= tint; s11.rgb *= tint;
-                } else if (face_tint_state == 1u) {
-                    if (abs(s00.r - s00.g) < 0.06 && abs(s00.g - s00.b) < 0.06) s00.rgb *= tint;
-                    if (abs(s10.r - s10.g) < 0.06 && abs(s10.g - s10.b) < 0.06) s10.rgb *= tint;
-                    if (abs(s01.r - s01.g) < 0.06 && abs(s01.g - s01.b) < 0.06) s01.rgb *= tint;
-                    if (abs(s11.r - s11.g) < 0.06 && abs(s11.g - s11.b) < 0.06) s11.rgb *= tint;
-                }
+            if (has_tint && (tint_kind == 4u || face_tint_state == 2u)) {
+                s00.rgb *= tint; s10.rgb *= tint; s01.rgb *= tint; s11.rgb *= tint;
             }
             vec4 c1 = 0.25 * (s00 + s10 + s01 + s11);
             if (lod <= 1.0) {
