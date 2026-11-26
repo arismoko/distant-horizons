@@ -23,8 +23,8 @@
 use crate::dh_v2::{self, DhV2CompressionMode};
 use crate::lod::{ExtraSpan, LodColumn, LodSection, MAX_DETAIL, SECTION_CELLS, SectionPos};
 use crate::octree::{
-    ColumnFootprint, MAX_OCTREE_DETAIL, OctreeError, OctreeSection, OctreeSectionPos, RleSection,
-    Run, SECTION_VOLUME, Voxel,
+    ColumnFootprint, MAX_OCTREE_DETAIL, OctreeError, OctreeRecord, OctreeSection, OctreeSectionPos,
+    RleSection, Run, SECTION_VOLUME, Voxel,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -591,8 +591,15 @@ pub fn encode_octree_section(
     mapping: &OctreeMapping,
     mode: DhV2CompressionMode,
 ) -> Result<Vec<u8>, OctreeCodecError> {
-    let rle = section.to_rle();
+    encode_octree_record(&section.into(), mapping, mode)
+}
 
+fn encode_octree_record(
+    section: &OctreeRecord,
+    mapping: &OctreeMapping,
+    mode: DhV2CompressionMode,
+) -> Result<Vec<u8>, OctreeCodecError> {
+    let rle = &section.rle;
     let mut data = Vec::with_capacity(
         64 + rle.palette.len() * 4 + rle.runs.len() * 4 + ColumnFootprint::BYTE_LEN,
     );
@@ -641,10 +648,10 @@ pub fn encode_octree_section(
     out.extend_from_slice(MAGIC_V3);
     out.push(OCTREE_FORMAT_VERSION);
     out.push(mode as u8);
-    out.push(section.pos.detail);
-    out.extend_from_slice(&section.pos.x.to_be_bytes());
-    out.extend_from_slice(&section.pos.y.to_be_bytes());
-    out.extend_from_slice(&section.pos.z.to_be_bytes());
+    out.push(rle.pos.detail);
+    out.extend_from_slice(&rle.pos.x.to_be_bytes());
+    out.extend_from_slice(&rle.pos.y.to_be_bytes());
+    out.extend_from_slice(&rle.pos.z.to_be_bytes());
     out.extend_from_slice(&section.revision.to_be_bytes());
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(&data);
@@ -1468,20 +1475,35 @@ impl RegionCache {
         mapping: &OctreeMapping,
         mode: DhV2CompressionMode,
     ) -> io::Result<()> {
-        let path = octree_region_path(world_dir, dimension, section.pos);
+        self.write_octree(
+            world_dir,
+            dimension,
+            section.pos,
+            section.footprint.is_empty() && section.is_empty(),
+            || encode_octree_section(section, mapping, mode),
+        )
+    }
+
+    fn write_octree(
+        &mut self,
+        world_dir: &Path,
+        dimension: &str,
+        pos: OctreeSectionPos,
+        untouched_air: bool,
+        encode: impl FnOnce() -> Result<Vec<u8>, OctreeCodecError>,
+    ) -> io::Result<()> {
+        let path = octree_region_path(world_dir, dimension, pos);
         self.check_write_allowed(&path)?;
-        let (_, _, _, slot_idx) = octree_region_slot(section.pos);
+        let (_, _, _, slot_idx) = octree_region_slot(pos);
         // Probe without creating a region, after queue coalescing and any in-flight write.
-        if section.footprint.is_empty()
-            && section.is_empty()
+        if untouched_air
             && !self
                 .get_region(&path, false)?
                 .is_some_and(|reg| reg.slots[slot_idx].len != 0)
         {
             return Ok(());
         }
-        let record = encode_octree_section(section, mapping, mode)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let record = encode().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crc = octree_record_crc(&record)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record too short"))?;
         let Some(reg) = self.get_region(&path, true)? else {
@@ -1542,7 +1564,7 @@ type SaveKey = (PathBuf, String, SectionPos);
 type OctreeSaveKey = (PathBuf, String, OctreeSectionPos);
 
 struct OctreeSaveJob {
-    section: OctreeSection,
+    section: OctreeRecord,
     mapping: OctreeMapping,
     mode: DhV2CompressionMode,
 }
@@ -1665,11 +1687,23 @@ impl LodIoWorker {
         mapping: OctreeMapping,
         mode: DhV2CompressionMode,
     ) {
+        self.queue_octree_record(world_dir, dimension, (&section).into(), mapping, mode);
+    }
+
+    /// Queue already-canonical runs; compression and region writes stay on the worker.
+    pub(crate) fn queue_octree_record(
+        &self,
+        world_dir: PathBuf,
+        dimension: String,
+        section: OctreeRecord,
+        mapping: OctreeMapping,
+        mode: DhV2CompressionMode,
+    ) {
         let mut st = self.shared.state.lock().unwrap();
         if st.shutdown {
             return;
         }
-        let key = (world_dir, dimension, section.pos);
+        let key = (world_dir, dimension, section.rle.pos);
         if !st.pending_octree_saves.contains_key(&key) {
             st.octree_save_order.push_back(key.clone());
         }
@@ -1807,13 +1841,11 @@ fn run_io_worker(shared: Arc<IoShared>, mut cache: RegionCache) {
         match task {
             Task::Exit => break,
             Task::OctreeSave((world_dir, dimension, pos), job) => {
-                let res = cache.save_octree_section(
-                    &world_dir,
-                    &dimension,
-                    &job.section,
-                    &job.mapping,
-                    job.mode,
-                );
+                let untouched_air = job.section.footprint.is_empty()
+                    && job.section.rle.palette.iter().all(|voxel| voxel.is_air());
+                let res = cache.write_octree(&world_dir, &dimension, pos, untouched_air, || {
+                    encode_octree_record(&job.section, &job.mapping, job.mode)
+                });
                 if let Err(ref e) = res
                     && !RegionWriteRefused::matches(e)
                 {

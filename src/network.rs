@@ -724,7 +724,16 @@ pub mod octree_sync {
             mode: DhV2CompressionMode,
             created: i64,
         ) -> Result<Self, SyncError> {
-            let rle = section.to_rle();
+            Self::from_rle(&section.to_rle(), section.revision, mapping, mode, created)
+        }
+
+        pub(crate) fn from_rle(
+            rle: &RleSection,
+            revision: u64,
+            mapping: &[MappingEntry],
+            mode: DhV2CompressionMode,
+            created: i64,
+        ) -> Result<Self, SyncError> {
             let mut raw = Vec::with_capacity(8 + rle.palette.len() * 8 + rle.runs.len() * 4);
             put_i32(&mut raw, rle.palette.len() as i32);
             for v in &rle.palette {
@@ -743,13 +752,13 @@ pub mod octree_sync {
                 put_string(&mut map_raw, &e.name)?;
             }
             Ok(Self {
-                pos: section.pos,
+                pos: rle.pos,
                 checksum: crc32fast::hash(&raw) as i32,
                 data: compress(&raw, mode)?,
                 mapping: compress(&map_raw, mode)?,
                 format_version: OCTREE_DTO_FORMAT_V1,
                 compression: mode,
-                last_modified: section.revision as i64,
+                last_modified: revision as i64,
                 created,
             })
         }
