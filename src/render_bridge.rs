@@ -679,7 +679,7 @@ pub fn prepare_draws(
     let quad_params = quad_params_bytes(
         view_proj,
         camera.position,
-        near_dh,
+        camera.near,
         far_dh,
         (frame.vanilla_far_blocks * frame.config.overdraw_prevention).max(0.0),
         frame.sun_brightness,

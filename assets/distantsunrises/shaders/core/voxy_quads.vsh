@@ -13,7 +13,7 @@ layout(std140) uniform QuadParams {
     mat4 view_proj;        // camera-relative, jittered (world.jittered)
     ivec4 base_section;    // xyz = camera block >> 5
     vec4 camera_sub_pos;   // xyz = camera - base_section*32
-    vec4 depth_and_light;  // x = near_dh, y = far_dh, z = clip_dist (blocks, 0 = off), w = sun brightness
+    vec4 depth_and_light;  // x = camera near (depth = near / w), y = far_dh, z = clip_dist (blocks, 0 = off), w = sun brightness
     vec4 fog;              // x = start, y = end, z = falloff mode, w = spherical (0/1)
     vec4 fog_color;        // sRGB
     uvec4 flags;           // x = is_hdr, y = shading, z = debug mode, w = unused
@@ -72,11 +72,9 @@ void main() {
     vec3 world = local * lod_scale + vec3(section << 5) - camera_sub_pos.xyz;
 
     vec4 clip = view_proj * vec4(world, 1.0);
-    // Reversed-Z on [near_dh, far_dh]: w = near -> 1, w = far -> 0 (keeps LODs from fighting
-    // vanilla's far plane; matches the previous renderer's depth replacement).
-    float near_dh = depth_and_light.x;
-    float far_dh = depth_and_light.y;
-    clip.z = (near_dh * far_dh - near_dh * clip.w) / max(far_dh - near_dh, 1.0);
+    // The world's reversed depth over an infinite far plane (depth = near / w), so LOD and vanilla
+    // geometry order correctly where they overlap and nothing clips at vanilla's far plane.
+    clip.z = depth_and_light.x;
     gl_Position = clip;
 
     // Model entry: tint kind selects biome LUT column or a constant.
