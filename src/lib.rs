@@ -725,7 +725,7 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             .iter()
             .filter_map(|&(p, pos)| {
                 let level = p.dimension(host)?.to_string();
-                Some((p, (level, pos[0] as i32, pos[2] as i32)))
+                Some((p, network::octree_sync::PlayerLocation::new(level, pos)))
             })
             .collect();
         if !changes.is_empty() {
