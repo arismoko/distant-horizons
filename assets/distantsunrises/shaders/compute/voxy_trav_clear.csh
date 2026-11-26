@@ -16,10 +16,17 @@ layout(std430) buffer DispatchOut {
     uint pad;
 } dispatch_out;
 
+#ifdef HIZ_PROOF
+#include "hiz_proof.glsl"
+#endif
+
 void main() {
     queue_out.count = 0u;
     dispatch_out.wg_x = 0u;
     dispatch_out.wg_y = 1u;
     dispatch_out.wg_z = 1u;
     dispatch_out.pad = 0u;
+#ifdef HIZ_PROOF
+    atomicAdd(hiz_proof.trav_clears, 1u);
+#endif
 }

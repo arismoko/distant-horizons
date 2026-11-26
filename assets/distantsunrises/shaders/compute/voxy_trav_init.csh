@@ -31,6 +31,10 @@ layout(std430) buffer DispatchA {
     uint pad;
 } dispatch_a;
 
+#ifdef HIZ_PROOF
+#include "hiz_proof.glsl"
+#endif
+
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id == 0u) {
@@ -41,6 +45,10 @@ void main() {
         dispatch_a.wg_y = 1u;
         dispatch_a.wg_z = 1u;
         dispatch_a.pad = 0u;
+#ifdef HIZ_PROOF
+        hiz_proof.trav_init_ran = 1u;
+        if (rc != 0u) hiz_proof.trav_expected = 1u;
+#endif
     }
     if (id < counts.x) {
         visible_flags[id] = 0u;

@@ -10,7 +10,7 @@ use crate::config::{
     KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE, KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED,
     KEY_SSAO_QUALITY, KEY_THREAD_PRESET, KEY_VERTICAL_QUALITY, MOD_ID, ThreadPreset, setting_key,
 };
-use crate::render_bridge::{runtime, stats};
+use crate::render_bridge::{arm_hiz_proof, runtime, stats};
 use mod_api::{
     ClientCommandRegistration, ClientHost, ClientSetupContext, Command, CommandArgumentValue,
     CommandInvocation, KeyConflictContext, KeyRegistration, ModKeyMappingRef, Registrar,
@@ -292,6 +292,20 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
         },
         "heightfog" => handle_bool_setting(host, KEY_HEIGHT_FOG_ENABLED, "heightfog", arg),
         "debug" => {
+            if arg.is_some_and(|mode| mode.eq_ignore_ascii_case("hiz")) {
+                let message = match arm_hiz_proof() {
+                    Ok(Some(serial)) => {
+                        format!("Hi-Z capture {serial} armed for the next eligible frame.")
+                    }
+                    Ok(None) => "A Hi-Z capture is already armed or in flight.".to_owned(),
+                    Err(err) => {
+                        eprintln!("distantsunrises: could not arm Hi-Z capture: {err}");
+                        format!("Could not arm Hi-Z capture: {err}")
+                    }
+                };
+                let _ = host.chat_line(Text::literal(message));
+                return;
+            }
             let parsed = match arg.map(str::to_ascii_lowercase).as_deref() {
                 Some("off" | "none" | "0") => {
                     Some((DEBUG_OFF, "distantsunrises.setting.debug.off"))

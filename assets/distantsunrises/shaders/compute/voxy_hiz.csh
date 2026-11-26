@@ -17,6 +17,11 @@ layout(std140) uniform HizParams {
 uniform sampler2D HizSource;
 layout(r32f) uniform writeonly image2D HizDest;
 
+#ifdef HIZ_PROOF
+#include "hiz_proof.glsl"
+layout(std140) uniform HizProofParams { uvec4 proof_index; };
+#endif
+
 void main() {
     ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(dst, dst_size))) {
@@ -39,4 +44,7 @@ void main() {
     }
 #endif
     imageStore(HizDest, dst, vec4(d));
+#ifdef HIZ_PROOF
+    if (all(equal(dst, ivec2(0)))) atomicOr(hiz_proof.mips_written, 1u << proof_index.x);
+#endif
 }

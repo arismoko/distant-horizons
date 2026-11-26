@@ -47,6 +47,10 @@ layout(std430) buffer TransSortMeta {
 layout(std430) buffer TransSortEntries { uvec2 trans_entries[]; };
 uniform sampler2D HizPyramid;
 
+#ifdef HIZ_PROOF
+#include "hiz_proof.glsl"
+#endif
+
 ivec3 section_pos(uvec2 p) {
     int y = (int(p.x) << 4) >> 24;
     int x = (int(p.y) << 4) >> 8;
@@ -84,7 +88,11 @@ bool outside_frustum(vec3 mn, vec3 mx) {
 }
 
 // Screen-space AABB of the box against the pyramid; true if fully hidden by vanilla depth.
-bool occluded_by_hiz(vec3 mn, vec3 mx) {
+bool occluded_by_hiz(vec3 mn, vec3 mx
+#ifdef HIZ_PROOF
+                     , uvec2 key, uint id
+#endif
+) {
     if (hiz.w == 0) return false;
     vec3 smin = vec3(1e30);
     vec3 smax = vec3(-1e30);
@@ -118,7 +126,11 @@ bool occluded_by_hiz(vec3 mn, vec3 mx) {
     // Reversed-Z: the box's nearest point has the LARGEST depth. Sky texels are 0, so a footprint
     // containing sky never occludes (far_occluder = 0).
     float nearest = max(smax.z, 0.0);
-    return far_occluder > 0.0 && far_occluder >= nearest;
+    bool occluded = far_occluder > 0.0 && far_occluder >= nearest;
+#ifdef HIZ_PROOF
+    if (occluded) record_hiz_reject(true, key, id, level, nearest, far_occluder, lo, hi);
+#endif
+    return occluded;
 }
 
 void main() {
@@ -139,7 +151,15 @@ void main() {
     vec3 mn = corner + vec3(aabb_off) * scale;
     vec3 mx = mn + vec3(aabb_size) * scale;
 
-    bool visible = live && visible_flags[id] != 0u && !outside_frustum(mn, mx) && !occluded_by_hiz(mn, mx);
+    bool visible = live && visible_flags[id] != 0u && !outside_frustum(mn, mx)
+        && !occluded_by_hiz(mn, mx
+#ifdef HIZ_PROOF
+            , meta.a.xy, id
+#endif
+        );
+#ifdef HIZ_PROOF
+    if (id == 0u) hiz_proof.cmdgen_ran = 1u;
+#endif
 
     // Face bucket visibility from the section's position relative to the camera section
     // (a face pointing away from the camera cannot be seen), per Voxy cmdgen's `msk`.

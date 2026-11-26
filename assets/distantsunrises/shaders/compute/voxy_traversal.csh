@@ -51,6 +51,11 @@ layout(std430) buffer RequestBuffer {
 } req_out;
 uniform sampler2D HizPyramid;
 
+#ifdef HIZ_PROOF
+#include "hiz_proof.glsl"
+layout(std140) uniform HizProofParams { uvec4 proof_index; };
+#endif
+
 ivec3 section_pos(uvec2 p) {
     int y = (int(p.x) << 4) >> 24;
     int x = (int(p.y) << 4) >> 8;
@@ -79,7 +84,11 @@ bool outside_frustum(vec3 mn, vec3 mx) {
     return false;
 }
 
-bool occluded_by_hiz(vec3 mn, vec3 mx) {
+bool occluded_by_hiz(vec3 mn, vec3 mx
+#ifdef HIZ_PROOF
+                     , uvec2 key, uint id
+#endif
+) {
     if (hiz.w == 0) return false;
     vec3 smin = vec3(1e30);
     vec3 smax = vec3(-1e30);
@@ -108,7 +117,11 @@ bool occluded_by_hiz(vec3 mn, vec3 mx) {
         }
     }
     float nearest = max(smax.z, 0.0);
-    return far_occluder > 0.0 && far_occluder >= nearest;
+    bool occluded = far_occluder > 0.0 && far_occluder >= nearest;
+#ifdef HIZ_PROOF
+    if (occluded) record_hiz_reject(false, key, id, level, nearest, far_occluder, lo, hi);
+#endif
+    return occluded;
 }
 
 void main() {
@@ -130,7 +143,14 @@ void main() {
     vec3 mn = corner + vec3(aabb_off) * scale;
     vec3 mx = mn + vec3(aabb_size) * scale;
 
-    if (outside_frustum(mn, mx) || occluded_by_hiz(mn, mx)) {
+#ifdef HIZ_PROOF
+    if (gid == 0u) atomicOr(hiz_proof.trav_ran, 1u << proof_index.x);
+#endif
+    if (outside_frustum(mn, mx) || occluded_by_hiz(mn, mx
+#ifdef HIZ_PROOF
+        , n.a.xy, node_idx
+#endif
+    )) {
         return;
     }
 
@@ -169,6 +189,10 @@ void main() {
                 if (slot < max_q) {
                     queue_out.items[slot] = child_base + ci;
                     atomicMax(dispatch_out.wg_x, (slot + 64u) >> 6);
+#ifdef HIZ_PROOF
+                    // Slot zero makes the following indirect dispatch nonempty.
+                    if (slot == 0u) atomicOr(hiz_proof.trav_expected, 2u << proof_index.x);
+#endif
                 }
             }
         }

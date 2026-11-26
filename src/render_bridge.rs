@@ -3,6 +3,9 @@
 //!
 //! No `wgpu` types and no `[native.*]`: everything goes through Sunrise's general render API.
 
+mod hiz_proof;
+pub(crate) use hiz_proof::arm as arm_hiz_proof;
+
 use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
 use crate::gen_worker::GenWorkerPool;
@@ -193,6 +196,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
         StorageImageAccess,
     };
     let nearest = || Sampler::new(SamplerFilter::Nearest, SamplerAddress::ClampToEdge);
+    use hiz_proof::{Kernel, register_pair};
     let hiz_layout = || {
         BindGroupLayout::builder()
             .uniform_buffer("HizParams", 16)
@@ -203,62 +207,57 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     access: StorageImageAccess::WriteOnly,
                 },
             ))
-            .build()
-            .expect("static hiz layout")
     };
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_hiz_copy"), id(SHADER_HIZ))
-            .bind_group_layout(hiz_layout())
-            .define("HIZ_FROM_WORLD_DEPTH")
-            .build(),
+    register_pair(
+        event,
+        "distantsunrises:voxy_hiz_copy",
+        SHADER_HIZ,
+        hiz_layout(),
+        Kernel::Mip0,
     );
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_hiz_reduce"), id(SHADER_HIZ))
-            .bind_group_layout(hiz_layout())
-            .build(),
+    register_pair(
+        event,
+        "distantsunrises:voxy_hiz_reduce",
+        SHADER_HIZ,
+        hiz_layout(),
+        Kernel::Reduce,
     );
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_trav_init"), id(SHADER_TRAV_INIT))
-            .bind_group_layout(
-                BindGroupLayout::builder()
-                    .uniform_buffer("TravInitParams", 16)
-                    .entry(storage("RootBuffer", true, 4))
-                    .entry(storage("VisibilityBuffer", false, 4))
-                    .entry(storage("QueueA", false, 20))
-                    .entry(storage("RequestBuffer", false, 24))
-                    .entry(storage("DispatchA", false, 16))
-                    .build()
-                    .expect("static trav_init layout"),
-            )
-            .build(),
+    register_pair(
+        event,
+        "distantsunrises:voxy_trav_init",
+        SHADER_TRAV_INIT,
+        BindGroupLayout::builder()
+            .uniform_buffer("TravInitParams", 16)
+            .entry(storage("RootBuffer", true, 4))
+            .entry(storage("VisibilityBuffer", false, 4))
+            .entry(storage("QueueA", false, 20))
+            .entry(storage("RequestBuffer", false, 24))
+            .entry(storage("DispatchA", false, 16)),
+        Kernel::Init,
     );
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_trav_clear"), id(SHADER_TRAV_CLEAR))
-            .bind_group_layout(
-                BindGroupLayout::builder()
-                    .entry(storage("QueueOut", false, 20))
-                    .entry(storage("DispatchOut", false, 16))
-                    .build()
-                    .expect("static trav_clear layout"),
-            )
-            .build(),
+    register_pair(
+        event,
+        "distantsunrises:voxy_trav_clear",
+        SHADER_TRAV_CLEAR,
+        BindGroupLayout::builder()
+            .entry(storage("QueueOut", false, 20))
+            .entry(storage("DispatchOut", false, 16)),
+        Kernel::Clear,
     );
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_traversal"), id(SHADER_TRAVERSAL))
-            .bind_group_layout(
-                BindGroupLayout::builder()
-                    .uniform_buffer("TraversalParams", 128)
-                    .entry(storage("NodeBuffer", true, 32))
-                    .entry(storage("QueueIn", true, 20))
-                    .entry(storage("QueueOut", false, 20))
-                    .entry(storage("DispatchOut", false, 16))
-                    .entry(storage("VisibilityBuffer", false, 4))
-                    .entry(storage("RequestBuffer", false, 24))
-                    .sampler("HizPyramid", nearest())
-                    .build()
-                    .expect("static traversal layout"),
-            )
-            .build(),
+    register_pair(
+        event,
+        "distantsunrises:voxy_traversal",
+        SHADER_TRAVERSAL,
+        BindGroupLayout::builder()
+            .uniform_buffer("TraversalParams", 128)
+            .entry(storage("NodeBuffer", true, 32))
+            .entry(storage("QueueIn", true, 20))
+            .entry(storage("QueueOut", false, 20))
+            .entry(storage("DispatchOut", false, 16))
+            .entry(storage("VisibilityBuffer", false, 4))
+            .entry(storage("RequestBuffer", false, 24))
+            .sampler("HizPyramid", nearest()),
+        Kernel::Traversal,
     );
     event.compute_pipeline(
         ComputePipeline::builder(
@@ -273,22 +272,20 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
         )
         .build(),
     );
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_cmdgen"), id(SHADER_CMDGEN))
-            .bind_group_layout(
-                BindGroupLayout::builder()
-                    .uniform_buffer("CmdgenParams", 112)
-                    .entry(storage("SectionBuffer", true, 32))
-                    .entry(storage("VisibilityBuffer", true, 4))
-                    .entry(storage("OpaqueCommands", false, 20))
-                    .entry(storage("TranslucentCommands", false, 20))
-                    .entry(storage("TransSortMeta", false, 2056))
-                    .entry(storage("TransSortEntries", false, 8))
-                    .sampler("HizPyramid", nearest())
-                    .build()
-                    .expect("static cmdgen layout"),
-            )
-            .build(),
+    register_pair(
+        event,
+        "distantsunrises:voxy_cmdgen",
+        SHADER_CMDGEN,
+        BindGroupLayout::builder()
+            .uniform_buffer("CmdgenParams", 112)
+            .entry(storage("SectionBuffer", true, 32))
+            .entry(storage("VisibilityBuffer", true, 4))
+            .entry(storage("OpaqueCommands", false, 20))
+            .entry(storage("TranslucentCommands", false, 20))
+            .entry(storage("TransSortMeta", false, 2056))
+            .entry(storage("TransSortEntries", false, 8))
+            .sampler("HizPyramid", nearest()),
+        Kernel::Cmdgen,
     );
     event.compute_pipeline(
         ComputePipeline::builder(
@@ -337,6 +334,7 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
             )
             .build(),
     );
+    hiz_proof::register_capture(event);
     event.register(
         mod_api::RenderPipeline::new(
             id(PIPELINE_SSAO_APPLY),
@@ -706,6 +704,7 @@ fn create_quad_mesh(
 /// uploads pending sections and flushes metadata. Call from `client_tick_pre`. Errors are logged
 /// through [`report`]; the frame goes on without them.
 pub fn upload_pending(host: &mut dyn mod_api::ClientHost, config: ArenaConfig) {
+    hiz_proof::poll(host);
     report("arena upload", try_upload_pending(host, config));
 }
 
@@ -849,6 +848,7 @@ pub fn setup_compute(
     camera: &CameraMatrices,
     graph: &mut dyn mod_api::FrameGraphContext,
 ) {
+    use hiz_proof::Kernel;
     use mod_api::{
         ComputePassDescriptor, DrawBindings, FrameTarget, RenderLevelStage, TextureSource,
     };
@@ -913,6 +913,7 @@ pub fn setup_compute(
         .after_stage(RenderLevelStage::AfterOpaqueBlocks)
         .before_stage(OPAQUE_STAGE);
     let slices = arena.slices;
+    let mut proof = hiz_proof::prepare(host, camera, &hiz);
     let added = graph.add_compute_pass(desc, &mut |ctx| {
         let groups = |n: u32| n.div_ceil(HIZ_WORKGROUP);
         let (mut sw, mut sh) = (w, h);
@@ -936,12 +937,24 @@ pub fn setup_compute(
                 .storage_image("HizDest", hiz.dest(level));
             report(
                 "hiz dispatch",
-                ctx.dispatch(
+                hiz_proof::dispatch(
+                    &mut proof,
+                    if level == 0 {
+                        Kernel::Mip0
+                    } else {
+                        Kernel::Reduce
+                    },
+                    level,
                     if level == 0 { copy } else { reduce },
-                    &bindings,
-                    [groups(dw), groups(dh), 1],
+                    bindings,
+                    |pipe, bind| ctx.dispatch(pipe, bind, [groups(dw), groups(dh), 1]),
                 ),
             );
+            if level == 0
+                && let Some(proof) = &mut proof
+            {
+                proof.copy_mip0(ctx, &hiz);
+            }
             (sw, sh) = (dw, dh);
         }
         let init_threads = sections.max(root_count).max(1);
@@ -962,10 +975,15 @@ pub fn setup_compute(
             .storage_buffer("DispatchA", slices.dispatch_a);
         report(
             "trav_init dispatch",
-            ctx.dispatch(
+            hiz_proof::dispatch(
+                &mut proof,
+                Kernel::Init,
+                0,
                 trav_init,
-                &init_bindings,
-                [init_threads.div_ceil(TRAV_WORKGROUP), 1, 1],
+                init_bindings,
+                |pipe, bind| {
+                    ctx.dispatch(pipe, bind, [init_threads.div_ceil(TRAV_WORKGROUP), 1, 1])
+                },
             ),
         );
         let (base, sub) = camera_split(camera.position);
@@ -1007,7 +1025,14 @@ pub fn setup_compute(
                 .storage_buffer("DispatchOut", d_out);
             report(
                 "trav_clear dispatch",
-                ctx.dispatch(trav_clear, &tclear_bindings, [1, 1, 1]),
+                hiz_proof::dispatch(
+                    &mut proof,
+                    Kernel::Clear,
+                    0,
+                    trav_clear,
+                    tclear_bindings,
+                    |pipe, bind| ctx.dispatch(pipe, bind, [1, 1, 1]),
+                ),
             );
             let trav_bindings = DrawBindings::new()
                 .inline_uniform("TraversalParams", &trav_params)
@@ -1020,7 +1045,14 @@ pub fn setup_compute(
                 .texture("HizPyramid", hiz.all_mips());
             report(
                 "traversal dispatch_indirect",
-                ctx.dispatch_indirect(traversal, &trav_bindings, d_in_ref, 0),
+                hiz_proof::dispatch(
+                    &mut proof,
+                    Kernel::Traversal,
+                    u32::from(iter),
+                    traversal,
+                    trav_bindings,
+                    |pipe, bind| ctx.dispatch_indirect(pipe, bind, d_in_ref, 0),
+                ),
             );
         }
         // The finished request buffer is read back without blocking; one readback is in flight at
@@ -1059,10 +1091,13 @@ pub fn setup_compute(
             .texture("HizPyramid", hiz.all_mips());
         report(
             "cmdgen dispatch",
-            ctx.dispatch(
+            hiz_proof::dispatch(
+                &mut proof,
+                Kernel::Cmdgen,
+                0,
                 cmdgen,
-                &bindings,
-                [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
+                bindings,
+                |pipe, bind| ctx.dispatch(pipe, bind, [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1]),
             ),
         );
         let prefix_bindings =
@@ -1084,8 +1119,14 @@ pub fn setup_compute(
                 [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
             ),
         );
+        if let Some(proof) = &mut proof {
+            proof.request_readback(host);
+        }
     });
     report("add_compute_pass", added);
+    if let Some(proof) = proof {
+        proof.finish(host);
+    }
 
     // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
     // `frame_graph_setup` runs before `prepare_render_buffers` (sunrise `gfx/draw_frame.rs`), so
