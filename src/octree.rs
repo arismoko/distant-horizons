@@ -301,15 +301,43 @@ pub struct RleSection {
     pub runs: Vec<Run>,
 }
 
-/// A 32×32×32 paletted voxel section. Storage is `Uniform` (one palette entry, no index array)
-/// until a second distinct voxel is written, then a dense `u16` palette-index array.
+const OCTANT_EDGE: usize = SECTION_EDGE / 2;
+const OCTANT_VOLUME: usize = OCTANT_EDGE * OCTANT_EDGE * OCTANT_EDGE;
+
+#[derive(Clone, Debug)]
+enum OctantIndices {
+    Uniform(u16),
+    Dense(Box<[u16]>),
+}
+
+impl OctantIndices {
+    #[inline]
+    fn get(&self, offset: usize) -> u16 {
+        match self {
+            Self::Uniform(pi) => *pi,
+            Self::Dense(indices) => indices[offset],
+        }
+    }
+
+    fn dense_mut(&mut self) -> &mut [u16] {
+        if let Self::Uniform(pi) = self {
+            *self = Self::Dense(vec![*pi; OCTANT_VOLUME].into_boxed_slice());
+        }
+        match self {
+            Self::Dense(indices) => indices,
+            Self::Uniform(_) => unreachable!(),
+        }
+    }
+}
+
+/// A 32×32×32 paletted voxel section. Each aligned 16³ octant can hold a single palette index,
+/// even when its neighbours use a different value (e.g. sky-lit air beside unwritten air).
 #[derive(Clone, Debug)]
 pub struct OctreeSection {
     pub pos: OctreeSectionPos,
     palette: Vec<Voxel>,
     lookup: HashMap<Voxel, u16>,
-    /// `None` = every voxel is `palette[0]`.
-    indices: Option<Vec<u16>>,
+    octants: [OctantIndices; 8],
     pub revision: u64,
 }
 
@@ -321,13 +349,11 @@ impl OctreeSection {
 
     /// A section where every voxel is `voxel`.
     pub fn filled(pos: OctreeSectionPos, voxel: Voxel) -> Self {
-        let mut lookup = HashMap::new();
-        lookup.insert(voxel, 0);
         Self {
             pos,
             palette: vec![voxel],
-            lookup,
-            indices: None,
+            lookup: HashMap::from([(voxel, 0)]),
+            octants: std::array::from_fn(|_| OctantIndices::Uniform(0)),
             revision: 0,
         }
     }
@@ -337,20 +363,42 @@ impl OctreeSection {
         x < SECTION_EDGE && y < SECTION_EDGE && z < SECTION_EDGE
     }
 
+    /// Split an in-range section coordinate into an octant and its x-fastest offset.
+    #[inline]
+    fn address(x: usize, y: usize, z: usize) -> (usize, usize) {
+        let mask = OCTANT_EDGE - 1;
+        (
+            child_index(x >> 4, y >> 4, z >> 4),
+            ((y & mask) * OCTANT_EDGE + (z & mask)) * OCTANT_EDGE + (x & mask),
+        )
+    }
+
+    #[inline]
+    fn coords(idx: usize) -> (usize, usize, usize) {
+        (idx & 31, idx >> 10, (idx >> 5) & 31)
+    }
+
     /// Voxel at local `(x, y, z)`; out-of-range coordinates read as air.
     pub fn get(&self, x: usize, y: usize, z: usize) -> Voxel {
         if !Self::in_range(x, y, z) {
             return Voxel::AIR;
         }
-        self.get_linear(voxel_index(x, y, z))
+        let (octant, offset) = Self::address(x, y, z);
+        self.palette[self.octants[octant].get(offset) as usize]
     }
 
-    #[inline]
-    fn get_linear(&self, idx: usize) -> Voxel {
-        match &self.indices {
-            None => self.palette[0],
-            Some(ix) => self.palette[ix[idx] as usize],
+    fn palette_index(&mut self, voxel: Voxel) -> u16 {
+        if let Some(&pi) = self.lookup.get(&voxel) {
+            return pi;
         }
+        // Overwrites leave unused entries behind. At most SECTION_VOLUME entries can be live.
+        if self.palette.len() > SECTION_VOLUME {
+            self.compact();
+        }
+        let pi = self.palette.len() as u16;
+        self.palette.push(voxel);
+        self.lookup.insert(voxel, pi);
+        pi
     }
 
     /// Write a voxel. Returns `false` (and changes nothing) for out-of-range coordinates or an
@@ -359,30 +407,35 @@ impl OctreeSection {
         if !Self::in_range(x, y, z) {
             return false;
         }
-        let idx = voxel_index(x, y, z);
-        if self.get_linear(idx) == voxel {
+        let (octant, offset) = Self::address(x, y, z);
+        if self.palette[self.octants[octant].get(offset) as usize] == voxel {
             return false;
         }
-        let pi = match self.lookup.get(&voxel) {
-            Some(&p) => p,
-            None => {
-                // Overwrites leave unused entries behind; compacting at one section's volume
-                // keeps the palette within the u16 index (at most 32768 live entries).
-                if self.palette.len() > SECTION_VOLUME {
-                    self.compact();
-                }
-                let p = self.palette.len() as u16;
-                self.palette.push(voxel);
-                self.lookup.insert(voxel, p);
-                p
-            }
-        };
-        let ix = self
-            .indices
-            .get_or_insert_with(|| vec![0u16; SECTION_VOLUME]);
-        ix[idx] = pi;
+        let pi = self.palette_index(voxel);
+        self.octants[octant].dense_mut()[offset] = pi;
         self.revision += 1;
         true
+    }
+
+    /// Replace an aligned 16³ octant. Already-uniform data needs only one comparison; mixed
+    /// data counts changed voxels to keep the same revision as individual writes.
+    pub(crate) fn fill_octant(&mut self, octant: usize, voxel: Voxel) {
+        let changed = match &self.octants[octant] {
+            OctantIndices::Uniform(pi) => {
+                if self.palette[*pi as usize] == voxel {
+                    return;
+                }
+                OCTANT_VOLUME
+            }
+            OctantIndices::Dense(indices) => indices
+                .iter()
+                .filter(|&&pi| self.palette[pi as usize] != voxel)
+                .count(),
+        };
+        if changed != 0 {
+            self.octants[octant] = OctantIndices::Uniform(self.palette_index(voxel));
+            self.revision += changed as u64;
+        }
     }
 
     /// Fill the vertical span `y0..y1` (local, clamped to the section) of column `(x, z)` with one
@@ -392,30 +445,28 @@ impl OctreeSection {
         if x >= SECTION_EDGE || z >= SECTION_EDGE || y0 >= end {
             return;
         }
-        if self.indices.is_none() && self.palette[0] == voxel {
-            return;
-        }
-        let pi = match self.lookup.get(&voxel) {
-            Some(&p) => p,
-            None => {
-                if self.palette.len() > SECTION_VOLUME {
-                    self.compact();
-                }
-                let p = self.palette.len() as u16;
-                self.palette.push(voxel);
-                self.lookup.insert(voxel, p);
-                p
-            }
-        };
-        let ix = self
-            .indices
-            .get_or_insert_with(|| vec![0u16; SECTION_VOLUME]);
+        let mut pi = None;
         let mut changed = false;
-        for y in y0..end {
-            let idx = voxel_index(x, y, z);
-            if ix[idx] != pi {
-                ix[idx] = pi;
-                changed = true;
+        for (start, stop) in [(y0, end.min(OCTANT_EDGE)), (y0.max(OCTANT_EDGE), end)] {
+            if start >= stop {
+                continue;
+            }
+            let (octant, offset) = Self::address(x, start, z);
+            if let OctantIndices::Uniform(old) = self.octants[octant]
+                && self.palette[old as usize] == voxel
+            {
+                continue;
+            }
+            let target = *pi.get_or_insert_with(|| self.palette_index(voxel));
+            let indices = self.octants[octant].dense_mut();
+            for i in (offset..)
+                .step_by(OCTANT_EDGE * OCTANT_EDGE)
+                .take(stop - start)
+            {
+                if indices[i] != target {
+                    indices[i] = target;
+                    changed = true;
+                }
             }
         }
         if changed {
@@ -425,40 +476,67 @@ impl OctreeSection {
 
     /// All 32,768 voxels in linear (`voxel_index`) order.
     pub fn to_dense(&self) -> Vec<Voxel> {
-        match &self.indices {
-            None => vec![self.palette[0]; SECTION_VOLUME],
-            Some(ix) => ix.iter().map(|&i| self.palette[i as usize]).collect(),
+        let mut dense = Vec::with_capacity(SECTION_VOLUME);
+        for y in 0..SECTION_EDGE {
+            for z in 0..SECTION_EDGE {
+                for x in [0, OCTANT_EDGE] {
+                    let (octant, offset) = Self::address(x, y, z);
+                    match &self.octants[octant] {
+                        OctantIndices::Uniform(pi) => {
+                            dense.extend(std::iter::repeat_n(
+                                self.palette[*pi as usize],
+                                OCTANT_EDGE,
+                            ));
+                        }
+                        OctantIndices::Dense(indices) => {
+                            dense.extend(
+                                indices[offset..offset + OCTANT_EDGE]
+                                    .iter()
+                                    .map(|&pi| self.palette[pi as usize]),
+                            );
+                        }
+                    }
+                }
+            }
         }
+        dense
     }
 
     /// Build from 32,768 voxels in linear order (extra voxels ignored, missing ones air).
     pub fn from_dense(pos: OctreeSectionPos, voxels: &[Voxel]) -> Self {
         let mut s = Self::new(pos);
-        for (i, &v) in voxels.iter().take(SECTION_VOLUME).enumerate() {
-            if v != Voxel::AIR || s.indices.is_some() {
-                let (x, y, z) = (i & 31, i >> 10, (i >> 5) & 31);
-                s.set(x, y, z, v);
+        for i in 0..SECTION_VOLUME {
+            let voxel = voxels.get(i).copied().unwrap_or(Voxel::AIR);
+            let (x, y, z) = Self::coords(i);
+            let (octant, offset) = Self::address(x, y, z);
+            if offset == 0 {
+                s.octants[octant] = OctantIndices::Uniform(s.palette_index(voxel));
+            } else if s.palette[s.octants[octant].get(offset) as usize] != voxel {
+                let pi = s.palette_index(voxel);
+                s.octants[octant].dense_mut()[offset] = pi;
             }
         }
-        s.revision = 0;
         s
     }
 
     /// Number of non-air voxels.
     pub fn non_air_count(&self) -> usize {
-        match &self.indices {
-            None => {
-                if self.palette[0].is_air() {
-                    0
-                } else {
-                    SECTION_VOLUME
+        self.octants
+            .iter()
+            .map(|indices| match indices {
+                OctantIndices::Uniform(pi) => {
+                    if self.palette[*pi as usize].is_air() {
+                        0
+                    } else {
+                        OCTANT_VOLUME
+                    }
                 }
-            }
-            Some(ix) => ix
-                .iter()
-                .filter(|&&i| !self.palette[i as usize].is_air())
-                .count(),
-        }
+                OctantIndices::Dense(indices) => indices
+                    .iter()
+                    .filter(|&&pi| !self.palette[pi as usize].is_air())
+                    .count(),
+            })
+            .sum()
     }
 
     /// `true` when every voxel is air (light may still differ).
@@ -470,62 +548,76 @@ impl OctreeSection {
         self.palette.len()
     }
 
-    /// Drop unused palette entries and collapse to uniform storage when possible.
+    /// Drop unused palette entries and collapse uniform octants.
     pub fn compact(&mut self) {
-        let dense = self.to_dense();
-        let mut palette: Vec<Voxel> = Vec::new();
-        let mut lookup: HashMap<Voxel, u16> = HashMap::new();
-        let mut indices = Vec::with_capacity(SECTION_VOLUME);
-        for v in dense {
-            let p = *lookup.entry(v).or_insert_with(|| {
-                palette.push(v);
+        let mut remap = vec![None; self.palette.len()];
+        let mut palette = Vec::new();
+        let mut map = |pi: u16| {
+            *remap[pi as usize].get_or_insert_with(|| {
+                palette.push(self.palette[pi as usize]);
                 (palette.len() - 1) as u16
-            });
-            indices.push(p);
-        }
-        self.indices = if palette.len() == 1 {
-            None
-        } else {
-            Some(indices)
+            })
         };
-        self.palette = palette;
-        self.lookup = lookup;
-    }
-
-    /// Run-length encode (after compaction of the palette).
-    pub fn to_rle(&self) -> RleSection {
-        let mut c = self.clone();
-        c.compact();
-        let mut runs: Vec<Run> = Vec::new();
-        match &c.indices {
-            None => runs.push(Run {
-                palette_index: 0,
-                length: SECTION_VOLUME as u16,
-            }),
-            Some(ix) => {
-                let mut cur = ix[0];
-                let mut len: u32 = 0;
-                for &i in ix {
-                    if i == cur {
-                        len += 1;
+        for octant in &mut self.octants {
+            match octant {
+                OctantIndices::Uniform(pi) => *pi = map(*pi),
+                OctantIndices::Dense(indices) => {
+                    let first = indices[0];
+                    if indices.iter().all(|&pi| pi == first) {
+                        *octant = OctantIndices::Uniform(map(first));
                     } else {
-                        runs.push(Run {
-                            palette_index: cur,
-                            length: len as u16,
-                        });
-                        cur = i;
-                        len = 1;
+                        indices.iter_mut().for_each(|pi| *pi = map(*pi));
                     }
                 }
-                runs.push(Run {
-                    palette_index: cur,
-                    length: len as u16,
-                });
+            }
+        }
+        self.lookup = palette
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v, i as u16))
+            .collect();
+        self.palette = palette;
+    }
+
+    /// Run-length encode in x-fastest order, numbering palette entries by first use.
+    pub fn to_rle(&self) -> RleSection {
+        let mut remap = vec![None; self.palette.len()];
+        let mut palette = Vec::new();
+        let mut runs: Vec<Run> = Vec::new();
+        for y in 0..SECTION_EDGE {
+            for z in 0..SECTION_EDGE {
+                for x in [0, OCTANT_EDGE] {
+                    let (octant, offset) = Self::address(x, y, z);
+                    let mut push = |pi: u16, length: u16| {
+                        let palette_index = *remap[pi as usize].get_or_insert_with(|| {
+                            palette.push(self.palette[pi as usize]);
+                            (palette.len() - 1) as u16
+                        });
+                        if let Some(last) = runs.last_mut()
+                            && last.palette_index == palette_index
+                        {
+                            last.length += length;
+                        } else {
+                            runs.push(Run {
+                                palette_index,
+                                length,
+                            });
+                        }
+                    };
+                    match &self.octants[octant] {
+                        OctantIndices::Uniform(pi) => push(*pi, OCTANT_EDGE as u16),
+                        OctantIndices::Dense(indices) => {
+                            for &pi in &indices[offset..offset + OCTANT_EDGE] {
+                                push(pi, 1);
+                            }
+                        }
+                    }
+                }
             }
         }
         RleSection {
-            pos: c.pos,
-            palette: c.palette,
+            pos: self.pos,
+            palette,
             runs,
         }
     }
@@ -546,19 +638,20 @@ impl OctreeSection {
         {
             return Err(OctreeError::PaletteIndexOutOfRange);
         }
-        let mut indices = Vec::with_capacity(SECTION_VOLUME);
-        for r in &rle.runs {
-            indices.extend(std::iter::repeat_n(r.palette_index, r.length as usize));
+        if let [run] = rle.runs.as_slice() {
+            return Ok(Self::filled(
+                rle.pos,
+                rle.palette[run.palette_index as usize],
+            ));
         }
-        let mut s = Self {
-            pos: rle.pos,
-            palette: rle.palette.clone(),
-            lookup: HashMap::new(),
-            indices: Some(indices),
-            revision: 0,
-        };
-        s.compact();
-        Ok(s)
+        let dense: Vec<_> = rle
+            .runs
+            .iter()
+            .flat_map(|r| {
+                std::iter::repeat_n(rle.palette[r.palette_index as usize], r.length as usize)
+            })
+            .collect();
+        Ok(Self::from_dense(rle.pos, &dense))
     }
 }
 
@@ -920,6 +1013,57 @@ mod tests {
         assert_eq!(s.non_air_count(), 1);
         assert!(!s.set(32, 0, 0, Voxel::new(STONE, 0, 0, 0)));
         assert!(s.get(40, 0, 0).is_air());
+    }
+
+    #[test]
+    fn sky_lit_octant_is_compact_beside_unwritten_air() {
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let mut s = OctreeSection::new(pos);
+        let lit = Voxel::air_with_light(15, 0);
+        let slot = child_index(1, 1, 0);
+        s.fill_octant(slot, lit);
+        assert!(
+            s.octants
+                .iter()
+                .all(|o| matches!(o, OctantIndices::Uniform(_)))
+        );
+        assert_eq!(s.get(16, 16, 0), lit);
+        assert_eq!(s.get(15, 16, 0), Voxel::AIR);
+        assert_eq!(s.get(16, 15, 0), Voxel::AIR);
+        assert_eq!(s.get(16, 16, 16), Voxel::AIR);
+        assert!(s.is_empty(), "no geometry just because air is lit");
+        let dense = s.to_dense();
+        for y in 0..32 {
+            for z in 0..32 {
+                for x in 0..32 {
+                    let want = if x >= 16 && y >= 16 && z < 16 {
+                        lit
+                    } else {
+                        Voxel::AIR
+                    };
+                    assert_eq!(dense[voxel_index(x, y, z)], want);
+                }
+            }
+        }
+        let decoded = OctreeSection::from_rle(&s.to_rle()).unwrap();
+        assert_eq!(decoded.to_dense(), dense);
+        assert!(
+            decoded
+                .octants
+                .iter()
+                .all(|o| matches!(o, OctantIndices::Uniform(_)))
+        );
+
+        s.set(20, 20, 0, Voxel::new(STONE, 0, 15, 0));
+        s.set(31, 20, 15, Voxel::new(LOG, 0, 15, 0));
+        assert!(matches!(s.octants[slot], OctantIndices::Dense(_)));
+        let revision = s.revision;
+        s.fill_octant(slot, lit);
+        assert!(matches!(s.octants[slot], OctantIndices::Uniform(_)));
+        assert_eq!(s.revision, revision + 2);
+        assert_eq!(s.to_dense(), dense);
+        s.fill_octant(slot, lit);
+        assert_eq!(s.revision, revision + 2);
     }
 
     #[test]

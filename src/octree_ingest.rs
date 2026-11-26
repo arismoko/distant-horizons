@@ -20,12 +20,13 @@
 //!   is still empty, so lower-detail data never replaces real data; the source priority here
 //!   keeps the same guarantee for chunk-level provenance.
 //!
-//! Empty (uniform-air) vanilla sections are skipped in O(1) through
-//! [`ChunkVoxelSource::section_uniform_block`]; the target region is only cleared when a section
-//! already exists there (a block broken since the last ingest must not leave stale voxels).
+//! A uniform-air vanilla section maps to one aligned octant. Open sky is stored as lit air,
+//! distinct from the dark/unwritten air around it, without allocating voxel indices. Covered
+//! uniform air clears an existing octant but doesn't create a new section.
 
 use crate::octree::{
-    MAX_OCTREE_DETAIL, OctreeSection, OctreeSectionPos, SECTION_EDGE, Voxel, downsample_2x2x2_onto,
+    MAX_OCTREE_DETAIL, OctreeSection, OctreeSectionPos, SECTION_EDGE, Voxel, child_index,
+    downsample_2x2x2_onto,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
@@ -389,7 +390,6 @@ pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
         let uniform = snap.section_uniform_block(index);
         let uniform_id = uniform.map(&mut *block_id);
         if uniform_id == Some(0) {
-            // Uniform air: nothing to write; clear only where earlier data exists.
             let sky_open = open.iter().all(|&o| o);
             if sky_open || store.sections.contains_key(&pos) {
                 let air = if sky_open {
@@ -397,15 +397,12 @@ pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
                 } else {
                     Voxel::AIR
                 };
-                store.write(pos, |s| {
-                    for ly in 0..VANILLA_SECTION {
-                        for lz in 0..VANILLA_SECTION {
-                            for lx in 0..VANILLA_SECTION {
-                                s.set(off_x + lx, off_y + ly, off_z + lz, air);
-                            }
-                        }
-                    }
-                });
+                let octant = child_index(
+                    off_x / VANILLA_SECTION,
+                    off_y / VANILLA_SECTION,
+                    off_z / VANILLA_SECTION,
+                );
+                store.write(pos, |s| s.fill_octant(octant, air));
             }
             continue;
         }
@@ -689,7 +686,52 @@ mod tests {
     }
 
     #[test]
-    fn uniform_air_sections_are_skipped_in_o1() {
+    fn first_and_repeated_open_sky_ingest_keep_light_without_dirtying_on_repeat() {
+        use crate::octree::{Face, NeighborBorders};
+
+        let empty = MockChunk::new();
+        let mut covered = MockChunk::new();
+        covered.put(1, 50, 1, STONE);
+        let mut store = OctreeIngestStore::new();
+        assert!(ingest(&mut store, [0, 0], &covered, IngestSource::Loaded));
+        store.propagate_dirty(&|_| 15);
+
+        // This open-sky chunk is across a section boundary from the covered one.
+        let pos = OctreeSectionPos::new(0, -1, 1, 0);
+        assert!(ingest(&mut store, [-1, 0], &empty, IngestSource::Loaded));
+        assert_eq!(store.dirty_count(), 2);
+        let lit = Voxel::air_with_light(15, 0);
+        let section = store.section(pos).unwrap();
+        assert!(section.is_empty());
+        assert_eq!(section.get(31, 0, 0), lit);
+        assert_eq!(section.get(31, 0, 16), Voxel::AIR);
+        let revision = section.revision;
+        let borders = NeighborBorders::from_neighbors(std::array::from_fn(|i| {
+            (i == Face::NegX as usize).then_some(section)
+        }));
+        assert_eq!(borders.get(Face::NegX, 0, 0, 0), Some(lit));
+        assert_eq!(borders.get(Face::NegX, 0, 0, 16), Some(Voxel::AIR));
+        assert_eq!(store.voxel_at(0, 32, 0), Voxel::AIR);
+
+        let mips = store.propagate_dirty(&|_| 15);
+        let parent = pos.parent().unwrap();
+        assert!(mips.contains(&parent));
+        // Purely air ancestors are omitted, but the existing light reducer still reads lit input.
+        let downsampled = crate::octree::downsample_2x2x2(
+            parent,
+            &parent.children().unwrap().map(|p| store.section(p)),
+            &|_| 15,
+        );
+        assert_eq!(downsampled.get(24, 16, 0), lit);
+        assert!(ingest(&mut store, [-1, 0], &empty, IngestSource::Loaded));
+        assert_eq!(empty.block_calls.get(), 0);
+        assert_eq!(store.section(pos).unwrap().revision, revision);
+        assert_eq!(store.dirty_count(), 0);
+        assert!(store.propagate_dirty(&|_| 15).is_empty());
+    }
+
+    #[test]
+    fn uniform_air_clears_stale_blocks_without_sampling_each_voxel() {
         let mut c = MockChunk::new();
         c.put(1, 50, 1, STONE); // only section 3 has data
         let mut store = OctreeIngestStore::new();
@@ -702,7 +744,7 @@ mod tests {
         // A later all-air snapshot clears the stale voxel.
         let empty = MockChunk::new();
         ingest(&mut store, [0, 0], &empty, IngestSource::Loaded);
-        assert!(store.voxel_at(1, 50, 1).is_air());
+        assert_eq!(store.voxel_at(1, 50, 1), Voxel::air_with_light(15, 0));
         assert_eq!(empty.block_calls.get(), 0);
     }
 
