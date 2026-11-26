@@ -763,6 +763,30 @@ mod tests {
     }
 
     #[test]
+    fn batched_ingest_propagates_once_without_duplicate_ancestors() {
+        let mut c = MockChunk::new();
+        c.put(1, 1, 1, STONE);
+        let mut store = OctreeIngestStore::new();
+        // Chunks 0 and 2 land in sibling sections (x = 0 and x = 1) that share every ancestor.
+        assert!(ingest(&mut store, [0, 0], &c, IngestSource::Loaded));
+        assert!(ingest(&mut store, [2, 0], &c, IngestSource::Loaded));
+        let touched = store.propagate_dirty(&|_| 15);
+        assert_eq!(store.dirty_count(), 0);
+        let unique: HashSet<_> = touched.iter().copied().collect();
+        assert_eq!(unique.len(), touched.len(), "one propagation, no repeats");
+        assert!(touched.iter().filter(|p| p.detail == 0).count() >= 2);
+        for detail in 1..=MAX_OCTREE_DETAIL {
+            assert_eq!(
+                touched.iter().filter(|p| p.detail == detail).count(),
+                1,
+                "sibling sections share one ancestor at detail {detail}"
+            );
+        }
+        // A second propagation has nothing left to do.
+        assert!(store.propagate_dirty(&|_| 15).is_empty());
+    }
+
+    #[test]
     fn dirty_sections_propagate_to_every_parent_level() {
         let mut c = MockChunk::new();
         c.put(1, 1, 1, STONE);

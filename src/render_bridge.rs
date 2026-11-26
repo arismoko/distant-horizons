@@ -12,7 +12,7 @@ use crate::storage::{IoResponse, LodIoWorker};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------------------------
@@ -516,6 +516,11 @@ struct SsaoTarget {
 
 static SSAO: Mutex<Option<SsaoTarget>> = Mutex::new(None);
 
+/// Whether the SSAO compute pass has been added to the frame graph for the current target. False
+/// after (re)allocating the target and at the start of every `setup_compute`, so `ssao_apply`
+/// never multiplies the screen by an uninitialised or stale AO image.
+static SSAO_WRITTEN: AtomicBool = AtomicBool::new(false);
+
 impl SsaoTarget {
     fn dest(&self) -> mod_api::StorageImageBinding {
         mod_api::StorageImageBinding::new(self.target, 0, 0)
@@ -538,6 +543,7 @@ fn ensure_ssao(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<SsaoTar
     if let Some(old) = slot.take() {
         let _ = old.target.release(host);
     }
+    SSAO_WRITTEN.store(false, Ordering::Release);
     let desc = RenderTargetDescriptor::new(size)
         .color_target(RenderTargetFormat::R32Float)
         .mip_levels(1)
@@ -650,11 +656,13 @@ fn try_upload_pending(
         };
         // A refused atlas leaves every model on its flat colour: tile size stays in the table, so
         // keep trying next time rather than drawing from a missing texture.
-        if done.is_ok() {
+        let wrote_atlas = done.is_ok();
+        if wrote_atlas {
             ATLAS_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        // A failed table write is retried next frame unless newer tables were queued meanwhile.
-        if wrote_models.is_none() || wrote_tints.is_none() {
+        // A failed table or atlas write is retried next frame unless newer tables were queued
+        // meanwhile.
+        if wrote_models.is_none() || wrote_tints.is_none() || !wrote_atlas {
             let mut slot = PENDING_TABLES.lock().unwrap();
             if slot.is_none() {
                 *slot = Some((models, tints, atlas));
@@ -741,6 +749,8 @@ pub fn setup_compute(
     use mod_api::{
         ComputePassDescriptor, DrawBindings, FrameTarget, RenderLevelStage, TextureSource,
     };
+    // Every early return below leaves SSAO unwritten for the next frame's `ssao_apply`.
+    SSAO_WRITTEN.store(false, Ordering::Release);
     let Some(frame) = FRAME.lock().unwrap().clone() else {
         return;
     };
@@ -984,7 +994,9 @@ pub fn setup_compute(
                 ),
             );
         });
-        report("add_ssao_compute_pass", added_ssao);
+        if report("add_ssao_compute_pass", added_ssao).is_some() {
+            SSAO_WRITTEN.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -1066,6 +1078,8 @@ pub fn prepare_draws(
             assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
         )
         && let Some(ssao_target) = ensure_ssao(host, win_size)
+        // Checked after `ensure_ssao`, which clears the flag when it reallocates the target.
+        && SSAO_WRITTEN.load(Ordering::Acquire)
     {
         let bindings = DrawBindings::new().texture("SsaoTex", ssao_target.source());
         if let Some(batch) = report(
@@ -1422,13 +1436,30 @@ pub fn sun_brightness_from_day_time(day_time: i64, dimension: &str) -> f32 {
     sun_brightness_from_day_time_and_weather(day_time, dimension, 0.0, 0.0)
 }
 
-/// Logs the first few errors of a render call the frame cannot recover from, then stays quiet.
-fn report<T, E: std::fmt::Debug>(what: &str, result: Result<T, E>) -> Option<T> {
-    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Messages logged per `report` call site before it goes quiet.
+const REPORT_LIMIT_PER_SITE: u32 = 20;
+
+/// Counts one more message for `what` and says whether it is still under the per-site limit.
+fn take_report_slot(counts: &mut HashMap<&'static str, u32>, what: &'static str) -> bool {
+    let logged = counts.entry(what).or_insert(0);
+    if *logged < REPORT_LIMIT_PER_SITE {
+        *logged += 1;
+        true
+    } else {
+        false
+    }
+}
+
+/// Logs the first few errors of each render call site the frame cannot recover from, then keeps
+/// that site quiet; one noisy site never silences unrelated errors.
+fn report<T, E: std::fmt::Debug>(what: &'static str, result: Result<T, E>) -> Option<T> {
+    static LOGGED: LazyLock<Mutex<HashMap<&'static str, u32>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     match result {
         Ok(v) => Some(v),
         Err(e) => {
-            if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
+            let log = take_report_slot(&mut LOGGED.lock().unwrap_or_else(|p| p.into_inner()), what);
+            if log {
                 eprintln!("distantsunrises: {what} failed: {e:?}");
             }
             None
@@ -1439,6 +1470,18 @@ fn report<T, E: std::fmt::Debug>(what: &str, result: Result<T, E>) -> Option<T> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_limit_is_per_call_site() {
+        let mut counts = HashMap::new();
+        for _ in 0..REPORT_LIMIT_PER_SITE {
+            assert!(take_report_slot(&mut counts, "noisy"));
+        }
+        assert!(!take_report_slot(&mut counts, "noisy"));
+        assert!(!take_report_slot(&mut counts, "noisy"));
+        // Another site still logs after "noisy" is silenced.
+        assert!(take_report_slot(&mut counts, "quiet"));
+    }
 
     #[test]
     fn weather_dims_overworld_sun_brightness_but_not_nether_or_end() {

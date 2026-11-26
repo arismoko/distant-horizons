@@ -1061,21 +1061,18 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
     }
 
     // G4 full 3D chunks (trees & features in detail-0 near/mid ring).
-    let generated: Vec<([i32; 2], Option<mod_api::ChunkSnapshot>)> = results
-        .iter_mut()
-        .flat_map(|r| std::mem::take(&mut r.generated_chunks))
-        .map(|(pos, snap)| (pos, Some(snap)))
-        .collect();
-    for (chunk, snapshot) in &generated {
-        if let Some(snapshot) = snapshot {
-            pipeline::ingest_chunk(
-                host,
-                dim,
-                *chunk,
-                snapshot,
-                pipeline::SnapshotSource::Distant,
-            );
+    // One batch per finished job (up to 16 chunks): a single `PIPELINE` lock and a single
+    // `propagate_dirty` instead of one per chunk.
+    let mut generated: Vec<([i32; 2], Option<mod_api::ChunkSnapshot>)> = Vec::new();
+    for r in results.iter_mut() {
+        let chunks = std::mem::take(&mut r.generated_chunks);
+        if chunks.is_empty() {
+            continue;
         }
+        let batch: Vec<([i32; 2], &mod_api::ChunkSnapshot)> =
+            chunks.iter().map(|(pos, snap)| (*pos, snap)).collect();
+        pipeline::ingest_chunks_batch(host, dim, &batch, pipeline::SnapshotSource::Distant);
+        generated.extend(chunks.into_iter().map(|(pos, snap)| (pos, Some(snap))));
     }
     if !generated.is_empty() {
         ingest_chunk_snapshots(host, dim, &generated, dirty_sections);
