@@ -1299,6 +1299,7 @@ impl Pipeline {
 
 /// Client side of `octree_sync`: adopt what the server sent and ask for sections around `center`
 /// that the store lacks (at most `budget` new requests; a cached timestamp is not tracked).
+/// Nothing is adopted or demanded until the play world's session config has been queued.
 pub fn client_sync(
     host: &mut dyn ClientHost,
     dim: &str,
@@ -1306,6 +1307,9 @@ pub fn client_sync(
     radius: i32,
     budget: usize,
 ) {
+    if !crate::network::octree_sync::client_configure(host) {
+        return;
+    }
     let events = crate::network::octree_sync::drain_client_events();
     {
         let mut guard = PIPELINE.lock().unwrap();

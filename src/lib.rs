@@ -591,15 +591,13 @@ fn poll_remote_octree(host: &mut dyn ClientHost) {
     if !enabled {
         return;
     }
-    network::octree_sync::client_demand_after_config(host, |host| {
-        pipeline::client_sync(
-            host,
-            &dim,
-            camera,
-            STORED_RADIUS_SECTIONS,
-            SYNC_REQUESTS_PER_TICK,
-        );
-    });
+    pipeline::client_sync(
+        host,
+        &dim,
+        camera,
+        STORED_RADIUS_SECTIONS,
+        SYNC_REQUESTS_PER_TICK,
+    );
 }
 
 fn sync_client_config(host: &dyn Host) {
