@@ -1012,10 +1012,19 @@ fn sample_distant_sections(
         };
 
         let saved_reader = host.level(dim).and_then(|l| l.saved_chunk_reader(host));
-        if rt
-            .gen_pool
-            .enqueue(dim.to_owned(), pos, gen_handle, saved_reader, cells)
-        {
+        let feature_stage = match config.distant_generation_mode {
+            2 => Some(mod_api::GenerationStage::Features),
+            3 => Some(mod_api::GenerationStage::Light),
+            _ => None,
+        };
+        if rt.gen_pool.enqueue(
+            dim.to_owned(),
+            pos,
+            gen_handle,
+            saved_reader,
+            feature_stage,
+            cells,
+        ) {
             ran_any = true;
         } else {
             break;
@@ -1049,6 +1058,27 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
     }
     if !saved.is_empty() {
         ingest_chunk_snapshots(host, dim, &saved, dirty_sections);
+    }
+
+    // G4 full 3D chunks (trees & features in detail-0 near/mid ring).
+    let generated: Vec<([i32; 2], Option<mod_api::ChunkSnapshot>)> = results
+        .iter_mut()
+        .flat_map(|r| std::mem::take(&mut r.generated_chunks))
+        .map(|(pos, snap)| (pos, Some(snap)))
+        .collect();
+    for (chunk, snapshot) in &generated {
+        if let Some(snapshot) = snapshot {
+            pipeline::ingest_chunk(
+                host,
+                dim,
+                *chunk,
+                snapshot,
+                pipeline::SnapshotSource::Distant,
+            );
+        }
+    }
+    if !generated.is_empty() {
+        ingest_chunk_snapshots(host, dim, &generated, dirty_sections);
     }
 
     for res in &results {

@@ -179,7 +179,7 @@ impl Default for DhConfig {
             horizontal_quality: 1,
             vertical_quality: 1,
             distant_generation: true,
-            distant_generation_mode: 1,
+            distant_generation_mode: 2,
             cave_culling_enabled: true,
             cave_culling_height: 60,
             fog_enabled: true,

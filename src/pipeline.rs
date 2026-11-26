@@ -350,11 +350,13 @@ impl Pipeline {
     }
 }
 
-/// Which source a snapshot came from: G1 (live chunk) or G3 (saved Anvil chunk).
+/// Which source a snapshot came from: G1 (live chunk), G3 (saved Anvil chunk), or G4 (detached
+/// full-chunk generation with trees/features).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotSource {
     Loaded,
     Saved,
+    Distant,
 }
 
 /// Ingest one chunk snapshot into `dim`'s octree store (server thread) and queue the touched
@@ -371,17 +373,30 @@ pub fn ingest_chunk(
     let p = &mut *guard;
     let store = p.stores.entry(dim.to_owned()).or_default();
     let mapper = std::cell::RefCell::new(&mut p.mapper);
-    let ingest = match source {
-        SnapshotSource::Loaded => ingest_chunk_snapshot,
-        SnapshotSource::Saved => ingest_saved_chunk,
+    let accepted = match source {
+        SnapshotSource::Loaded => ingest_chunk_snapshot(
+            store,
+            chunk,
+            snapshot,
+            &mut |state| mapper.borrow_mut().block(host, state),
+            &mut |biome| mapper.borrow_mut().biome(biome),
+        ),
+        SnapshotSource::Saved => ingest_saved_chunk(
+            store,
+            chunk,
+            snapshot,
+            &mut |state| mapper.borrow_mut().block(host, state),
+            &mut |biome| mapper.borrow_mut().biome(biome),
+        ),
+        SnapshotSource::Distant => crate::octree_ingest::ingest_chunk(
+            store,
+            chunk,
+            snapshot,
+            crate::octree_ingest::IngestSource::Distant,
+            &mut |state| mapper.borrow_mut().block(host, state),
+            &mut |biome| mapper.borrow_mut().biome(biome),
+        ),
     };
-    let accepted = ingest(
-        store,
-        chunk,
-        snapshot,
-        &mut |state| mapper.borrow_mut().block(host, state),
-        &mut |biome| mapper.borrow_mut().biome(biome),
-    );
     if accepted {
         let mapper = &p.mapper;
         let touched = p
