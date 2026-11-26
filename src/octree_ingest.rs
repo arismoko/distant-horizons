@@ -344,7 +344,10 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
     let (sx, sz) = (ox.div_euclid(edge), oz.div_euclid(edge));
     let (off_x, off_z) = (ox.rem_euclid(edge) as usize, oz.rem_euclid(edge) as usize);
 
-    for index in 0..snap.section_count() {
+    // Top-down: air above a column's highest block sees the open sky, whatever lighting says (a
+    // chunk that is not lit yet reads 0, which draws every face beside it black).
+    let mut open = [true; VANILLA_SECTION * VANILLA_SECTION];
+    for index in (0..snap.section_count()).rev() {
         let y0 = snap.min_y() + (index * VANILLA_SECTION) as i32;
         let pos = OctreeSectionPos::new(0, sx, y0.div_euclid(edge), sz);
         let off_y = y0.rem_euclid(edge) as usize;
@@ -353,12 +356,18 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
         let uniform_id = uniform.map(&mut *block_id);
         if uniform_id == Some(0) {
             // Uniform air: nothing to write; clear only where earlier data exists.
-            if store.sections.contains_key(&pos) {
+            let sky_open = open.iter().all(|&o| o);
+            if sky_open || store.sections.contains_key(&pos) {
+                let air = if sky_open {
+                    Voxel::air_with_light(15, 0)
+                } else {
+                    Voxel::AIR
+                };
                 store.write(pos, |s| {
                     for ly in 0..VANILLA_SECTION {
                         for lz in 0..VANILLA_SECTION {
                             for lx in 0..VANILLA_SECTION {
-                                s.set(off_x + lx, off_y + ly, off_z + lz, Voxel::AIR);
+                                s.set(off_x + lx, off_y + ly, off_z + lz, air);
                             }
                         }
                     }
@@ -379,7 +388,7 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
         }
 
         store.write(pos, |s| {
-            for ly in 0..VANILLA_SECTION {
+            for ly in (0..VANILLA_SECTION).rev() {
                 let y = y0 + ly as i32;
                 for lz in 0..VANILLA_SECTION {
                     for lx in 0..VANILLA_SECTION {
@@ -387,7 +396,15 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
                             Some(id) => id,
                             None => snap.block(lx, y, lz).map_or(0, &mut *block_id),
                         };
-                        let (sky, blk) = snap.light(lx, y, lz);
+                        let (mut sky, blk) = snap.light(lx, y, lz);
+                        let column_open = &mut open[lz * VANILLA_SECTION + lx];
+                        if id == 0 {
+                            if *column_open {
+                                sky = 15;
+                            }
+                        } else {
+                            *column_open = false;
+                        }
                         let voxel = if id == 0 {
                             Voxel::air_with_light(sky, blk)
                         } else {
