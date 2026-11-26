@@ -432,10 +432,14 @@ impl OctreeSection {
                 .filter(|&&pi| self.palette[pi as usize] != voxel)
                 .count(),
         };
-        if changed != 0 {
-            self.octants[octant] = OctantIndices::Uniform(self.palette_index(voxel));
-            self.revision += changed as u64;
-        }
+        // Even an equal dense octant can be collapsed without changing its logical revision.
+        self.octants[octant] = OctantIndices::Uniform(self.palette_index(voxel));
+        self.revision += changed as u64;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_uniform_octant(&self, octant: usize) -> bool {
+        matches!(self.octants[octant], OctantIndices::Uniform(_))
     }
 
     /// Fill the vertical span `y0..y1` (local, clamped to the section) of column `(x, z)` with one

@@ -731,6 +731,44 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_compacts_equal_sky_octant_from_surface_columns() {
+        let mut store = OctreeIngestStore::new();
+        let mut columns = Vec::new();
+        let mut live = MockChunk::new();
+        for z in 0..VANILLA_SECTION {
+            for x in 0..VANILLA_SECTION {
+                columns.push(column(x as i32, z as i32, 15, None, STONE));
+                for y in 0..16 {
+                    live.put(x, y, z, STONE);
+                }
+            }
+        }
+        ingest_distant_columns(&mut store, &columns, WATER, STONE, &mut |b| b, &mut |_| 7);
+        store.propagate_dirty(&|_| 15);
+
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let sky = child_index(0, 1, 0);
+        let section = store.section(pos).unwrap();
+        assert!(!section.is_uniform_octant(sky));
+        let voxels = section.to_dense();
+        let revision = section.revision;
+
+        assert!(ingest(&mut store, [0, 0], &live, IngestSource::Loaded));
+        let section = store.section(pos).unwrap();
+        assert!(section.is_uniform_octant(sky));
+        assert_eq!(section.revision, revision);
+        assert_eq!(section.to_dense(), voxels);
+        // The live fixture has taller sky than the estimate, but did not dirty this section.
+        assert!(!store.propagate_dirty(&|_| 15).contains(&pos));
+
+        assert!(ingest(&mut store, [0, 0], &live, IngestSource::Loaded));
+        let section = store.section(pos).unwrap();
+        assert!(section.is_uniform_octant(sky));
+        assert_eq!(section.revision, revision);
+        assert_eq!(store.dirty_count(), 0);
+    }
+
+    #[test]
     fn uniform_air_clears_stale_blocks_without_sampling_each_voxel() {
         let mut c = MockChunk::new();
         c.put(1, 50, 1, STONE); // only section 3 has data
