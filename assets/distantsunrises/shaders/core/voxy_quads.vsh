@@ -80,6 +80,25 @@ void main() {
     // Model entry: tint kind selects biome LUT column or a constant.
     uint mbase = model_id * 16u;
     uint mflags = models[mbase + 12u];
+    bool double_sided = (mflags & 8u) != 0u;
+    // Exact per-quad backface culling for single-sided faces (keeps `.cull(false)` safe for
+    // double-sided foliage while never drawing undersides or back walls from the wrong side).
+    if (!double_sided) {
+        bool back = (face == 0u && world.y < 0.0)
+            || (face == 1u && world.y > 0.0)
+            || (face == 2u && world.z < 0.0)
+            || (face == 3u && world.z > 0.0)
+            || (face == 4u && world.x < 0.0)
+            || (face == 5u && world.x > 0.0);
+        if (back) {
+            gl_Position = vec4(0.0);
+            inter = uvec4(0u);
+            uv = vec2(0.0);
+            rel_pos = vec3(0.0);
+            face_shade = 1.0;
+            return;
+        }
+    }
     uint tint_kind = (mflags >> 4) & 15u;
     uint tint = 0xFFFFFFFFu;
     if (tint_kind == 4u) {

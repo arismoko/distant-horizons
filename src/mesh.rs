@@ -285,6 +285,14 @@ pub fn mesh_octree_section_masked(
                         {
                             continue;
                         }
+                    } else if neighbor.is_none()
+                        && ((face == Face::NegY && section.pos.y == 0)
+                            || (section.pos.detail >= 1 && face != Face::PosY))
+                    {
+                        // Never emit underside faces into unloaded void below the solid floor
+                        // (`y = 0`), and at coarse LODs (detail >= 1) never emit giant vertical
+                        // side walls along the unloaded outer edge of the generated world.
+                        continue;
                     }
                     if let Some(nv) = neighbor
                         && !nv.is_air()
