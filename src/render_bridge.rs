@@ -505,10 +505,18 @@ struct SsaoTarget {
 
 static SSAO: Mutex<Option<SsaoTarget>> = Mutex::new(None);
 
-/// Whether the SSAO compute pass has been added to the frame graph for the current target. False
-/// after (re)allocating the target and at the start of every `setup_compute`, so `ssao_apply`
-/// never multiplies the screen by an uninitialised or stale AO image.
+/// Whether this frame's `setup_compute` admitted the SSAO clear pass *and* the SSAO compute pass
+/// into the frame graph for the current target. Admission proves nothing about what the compute
+/// pass writes (a refused or invalid dispatch, an early-out, a skipped slot): the guarantee that
+/// `ssao_apply` multiplies by the identity in those cases is the render-pass attachment clear to
+/// [`SSAO_IDENTITY`], ordered before the compute pass. The flag only says that clear exists for
+/// this target this frame. It is false after (re)allocating the target and at the start of every
+/// `setup_compute`, and `prepare_draws` consumes it, so one admission feeds at most one apply draw
+/// and an apply never runs from a frame whose graph setup did not run.
 static SSAO_WRITTEN: AtomicBool = AtomicBool::new(false);
+
+/// The multiplicative identity of `voxy_ssao_apply` (AO = 1.0 is discarded by the shader).
+const SSAO_IDENTITY: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 
 impl SsaoTarget {
     fn dest(&self) -> mod_api::StorageImageBinding {
@@ -1031,12 +1039,29 @@ pub fn setup_compute(
     report("add_compute_pass", added);
 
     // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
-    // Uses the target ensured during `prepare_draws` so a resize never frees a handle already
-    // bound by this frame's `ssao_apply` draw.
+    // The target is ensured here, in graph setup, which the engine runs before
+    // `prepare_render_buffers`; `prepare_draws` only re-resolves it (a size change in between
+    // clears `SSAO_WRITTEN`, so no apply draw uses a target without this frame's clear).
     if frame.config.ssao_enabled
         && let (Ok(ssao_pipe), Some(ssao_target)) = (
             assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
             ensure_ssao(host, [w, h]),
+        )
+        // A render pass with no draws only clears its attachment. It runs in the first graph slot,
+        // before the world passes, and the compute pass below depends on it (same target written,
+        // registered later, plus an explicit `after_pass`), so a fresh or stale target is the
+        // identity whenever the producer does not overwrite it this frame. Without the clear the
+        // producer is not scheduled, so there is nothing to apply.
+        && let Some(clear_pass) = report(
+            "add_ssao_clear_pass",
+            graph.add_pass(
+                mod_api::FramePassDescriptor::new(
+                    "distantsunrises:ssao_clear",
+                    FrameTarget::Mod(ssao_target.target),
+                )
+                .clear_color_0(SSAO_IDENTITY),
+                &mut |_| {},
+            ),
         )
     {
         let clip_dist = vanilla_clip_dist(&frame);
@@ -1052,6 +1077,7 @@ pub fn setup_compute(
         let ssao_desc = ComputePassDescriptor::new("distantsunrises:ssao")
             .reads(FrameTarget::MainDepth)
             .writes(FrameTarget::Mod(ssao_target.target))
+            .after_pass(clear_pass)
             .after_stage(OPAQUE_STAGE)
             .before_stage(TRANSLUCENT_STAGE);
         let added_ssao = graph.add_compute_pass(ssao_desc, &mut |ctx| {
@@ -1152,8 +1178,10 @@ pub fn prepare_draws(
             assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
         )
         && let Some(ssao_target) = ensure_ssao(host, win_size)
-        // Checked after `ensure_ssao`, which clears the flag when it reallocates the target.
-        && SSAO_WRITTEN.load(Ordering::Acquire)
+        // Checked after `ensure_ssao`, which clears the flag when it reallocates the target (a
+        // target made after this frame's graph setup has no clear recorded). Consumed so a later
+        // frame whose setup did not run cannot reuse it.
+        && SSAO_WRITTEN.swap(false, Ordering::AcqRel)
     {
         let bindings = DrawBindings::new().texture("SsaoTex", ssao_target.source());
         if let Some(batch) = report(
