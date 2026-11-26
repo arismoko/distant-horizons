@@ -8,9 +8,13 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(std140) uniform SsaoParams {
     vec4 proj_info;  // x = proj[0][0], y = proj[1][1], z = near, w = clip_dist
     ivec4 viewport;  // xy = width, height; zw = unused
+    uvec4 stamp;     // xy = this submission's publication serial (never 0); zw = unused
 };
 
 uniform sampler2D WorldDepthTex;
+// One invocation publishes `stamp.xy` here; `voxy_ssao_apply.fsh` draws only where it reads the
+// serial it expects, so an output this dispatch never wrote is never applied.
+layout(std430) buffer SsaoStamp { uvec2 published; };
 layout(r32f) uniform writeonly image2D SsaoOut;
 
 // 8 evenly spaced screen-space directions.
@@ -39,6 +43,11 @@ vec3 view_pos_at(ivec2 px, out float view_z) {
 }
 
 void main() {
+    // Before every early return below. Invocation (0, 0) always lies inside the viewport, and the
+    // dispatch's writes become visible to the later draw pass as a whole.
+    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
+        published = stamp.xy;
+    }
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= viewport.x || px.y >= viewport.y) return;
 
