@@ -1549,7 +1549,6 @@ pub(crate) struct DhStats {
     pub resident_sections: u64,
     pub generated_columns: u64,
     pub saved_sections: u64,
-    pub frames_drawn: u64,
 }
 
 /// Shared runtime state accessible from `Hooks` and the stage renderer.
@@ -1558,7 +1557,6 @@ pub(crate) struct DhRuntime {
     pub section_high_water: AtomicU64,
     pub resident_sections: AtomicU64,
     pub saved_sections: AtomicU64,
-    pub frames_drawn: AtomicU64,
     pub io: LodIoWorker,
     pub gen_pool: GenWorkerPool,
     pub inner: Mutex<DhState>,
@@ -1658,7 +1656,6 @@ pub(crate) fn runtime() -> &'static Arc<DhRuntime> {
             section_high_water: AtomicU64::new(0),
             resident_sections: AtomicU64::new(0),
             saved_sections: AtomicU64::new(0),
-            frames_drawn: AtomicU64::new(0),
             io: LodIoWorker::spawn(),
             gen_pool: GenWorkerPool::new(),
             inner: Mutex::new(DhState::default()),
@@ -1712,7 +1709,6 @@ pub fn record_frame_stats(section_high_water: u64, resident_sections: u64) {
         .store(section_high_water, Ordering::Relaxed);
     rt.resident_sections
         .store(resident_sections, Ordering::Relaxed);
-    rt.frames_drawn.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Forgets the last prepared arena occupancy at a lifecycle change (arena retired or emptied,
@@ -1753,7 +1749,6 @@ pub(crate) fn stats() -> DhStats {
         resident_sections: rt.resident_sections.load(Ordering::Relaxed),
         generated_columns,
         saved_sections: rt.saved_sections.load(Ordering::Relaxed),
-        frames_drawn: rt.frames_drawn.load(Ordering::Relaxed),
     }
 }
 
