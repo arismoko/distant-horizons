@@ -1004,11 +1004,11 @@ pub fn prepare_draws(
     let rd_blocks = frame.config.render_distance_blocks().max(256.0);
     let far_dh = (rd_blocks * 1.4).max(1024.0);
     let atlas_id = id(ATLAS_TEXTURE);
-    // Align clip square to vanilla's (2*RD + 1) chunk grid centered on the camera chunk
-    // (half-extent = RD*16 + 8 blocks, minus 1 block so there is no gap at the seam).
+    // Match vanilla's circular loaded chunk radius around the camera chunk (RD*16 - 2 blocks so
+    // diagonal corners where vanilla has no chunks never open sky holes; exact per-chunk AABB
+    // cutout wires in once #5911 merges).
     let clip_dist = if frame.config.overdraw_prevention > 0.0 {
-        ((frame.vanilla_far_blocks + 8.0) * frame.config.overdraw_prevention.max(0.98) - 1.0)
-            .max(0.0)
+        (frame.vanilla_far_blocks * frame.config.overdraw_prevention.max(0.98) - 2.0).max(0.0)
     } else {
         0.0
     };

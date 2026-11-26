@@ -48,13 +48,13 @@ void main() {
     bool cutout = (mflags & 4u) != 0u;
     uint tint_kind = (mflags >> 4) & 15u;
 
-    // Clip region: vanilla's loaded chunk square is centered on the camera's 16x16 chunk
+    // Clip region: vanilla's loaded chunk area is circular around the camera's 16x16 chunk
     // (until #5911 provides exact per-chunk AABB depth bounds); `clip_dist = 0` disables.
     float clip_dist = depth_and_light.z;
     if (clip_dist > 0.0) {
         vec2 cam_in_chunk = fract(camera_sub_pos.xz / 16.0) * 16.0;
         vec2 rel_chunk_center = rel_pos.xz + (cam_in_chunk - vec2(8.0));
-        if (max(abs(rel_chunk_center.x), abs(rel_chunk_center.y)) < clip_dist) {
+        if (length(rel_chunk_center) < clip_dist) {
             discard;
         }
     }
