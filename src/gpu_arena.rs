@@ -364,6 +364,28 @@ pub const GPU_TRAV_QUEUE_BYTES: u64 = (4 + GPU_TRAV_QUEUE_CAP as u64) * 4;
 /// Size in bytes of one indirect compute dispatch buffer (`wg_x, wg_y, wg_z, pad`).
 pub const GPU_DISPATCH_BYTES: u64 = 16;
 
+/// Most finer-node requests `voxy_traversal.csh` records per frame.
+pub const GPU_MAX_REQUESTS: u32 = 256;
+/// Size in bytes of the request buffer: `uvec4(count, 0, 0, 0)` header + `uvec2(pos0, pos1)` per
+/// request.
+pub const GPU_REQUEST_BUF_BYTES: u64 = 16 + GPU_MAX_REQUESTS as u64 * 8;
+
+/// Decodes a `RequestBuffer` readback (`voxy_traversal.csh`) into `(detail, [x, y, z])` section
+/// positions. The shader's `count` also counts requests it had no room for, so it is clamped to
+/// [`GPU_MAX_REQUESTS`] and to the entries the bytes actually hold.
+pub fn decode_gpu_requests(bytes: &[u8]) -> Vec<(u8, [i32; 3])> {
+    let word = |i: usize| {
+        let b = bytes.get(i * 4..i * 4 + 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let Some(count) = word(0) else {
+        return Vec::new();
+    };
+    (0..count.min(GPU_MAX_REQUESTS) as usize)
+        .map_while(|n| Some(unpack_section_pos([word(4 + n * 2)?, word(5 + n * 2)?])))
+        .collect()
+}
+
 /// One 32-byte node in `NodeBuffer` for `voxy_traversal.csh`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuNode {
@@ -510,6 +532,7 @@ pub struct ArenaSlices {
     pub dispatch_b: StorageBufferSlice,
     pub models: StorageBufferSlice,
     pub biome_tints: StorageBufferSlice,
+    pub requests: StorageBufferSlice,
 }
 
 /// The persistent GPU buffers plus their CPU-side allocators.
@@ -542,6 +565,9 @@ pub struct GpuArena {
     pub models: StorageBufferRef,
     /// Biome tint LUT: grass, foliage, water `0x00BBGGRR` per 9-bit biome id.
     pub biome_tints: StorageBufferRef,
+    /// Finer-node requests of `voxy_traversal.csh` (`count`, pad, `uvec2` positions), read back
+    /// to the CPU without blocking (`copy_src`).
+    pub requests: StorageBufferRef,
     /// Whole-buffer slices for set-1 bindings.
     pub slices: ArenaSlices,
     max_sections: u32,
@@ -633,6 +659,10 @@ impl GpuArena {
         let biome_bytes = BIOME_COUNT * 3 * 4;
         let models = make(host, StorageBufferDescriptor::new(model_bytes))?;
         let biome_tints = make(host, StorageBufferDescriptor::new(biome_bytes))?;
+        let requests = make(
+            host,
+            StorageBufferDescriptor::new(GPU_REQUEST_BUF_BYTES).copy_src(),
+        )?;
         let slices = ArenaSlices {
             quads: quads.slice(0, geometry_bytes),
             sections: sections.slice(0, n * SECTION_METADATA_BYTES),
@@ -649,11 +679,13 @@ impl GpuArena {
             dispatch_b: dispatch_b.slice(0, GPU_DISPATCH_BYTES),
             models: models.slice(0, model_bytes),
             biome_tints: biome_tints.slice(0, biome_bytes),
+            requests: requests.slice(0, GPU_REQUEST_BUF_BYTES),
         };
         Ok(Self {
             slices,
             models,
             biome_tints,
+            requests,
             quads,
             sections,
             opaque_commands,
@@ -872,6 +904,7 @@ impl GpuArena {
         self.dispatch_b.release(&*host)?;
         self.models.release(&*host)?;
         self.biome_tints.release(&*host)?;
+        self.requests.release(&*host)?;
         Ok(())
     }
 }
@@ -1019,6 +1052,57 @@ mod tests {
         assert_eq!(m.b, [1 | 2 << 16, 3 | 4 << 16, 5 | 6 << 16, 7 | 8 << 16]);
         assert_eq!(m.to_bytes().len(), 32);
         assert_eq!(SectionAabb::FULL.pack() >> 15, 0b11111_11111_11111);
+    }
+
+    fn request_bytes(count: u32, items: &[(u8, [i32; 3])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for w in [count, 0, 0, 0] {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        for &(level, [x, y, z]) in items {
+            for w in pack_section_pos(level, x, y, z) {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gpu_request_buffer_is_header_plus_256_positions() {
+        assert_eq!(GPU_REQUEST_BUF_BYTES, 16 + 256 * 8);
+    }
+
+    #[test]
+    fn decode_gpu_requests_empty() {
+        assert!(decode_gpu_requests(&[]).is_empty());
+        assert!(decode_gpu_requests(&[1, 0, 0]).is_empty());
+        assert!(decode_gpu_requests(&request_bytes(0, &[])).is_empty());
+    }
+
+    #[test]
+    fn decode_gpu_requests_normal() {
+        let items = [(0u8, [-3, 2, 5]), (3, [12345, -1, -99991])];
+        assert_eq!(decode_gpu_requests(&request_bytes(2, &items)), items);
+    }
+
+    #[test]
+    fn decode_gpu_requests_clamps_overflowing_count() {
+        let items = vec![(1u8, [7, 3, -7]); GPU_MAX_REQUESTS as usize];
+        let mut bytes = request_bytes(1000, &items);
+        assert_eq!(bytes.len() as u64, GPU_REQUEST_BUF_BYTES);
+        // Bytes past the buffer's end are never read even if the shader claims more.
+        bytes.extend_from_slice(&[0xFF; 64]);
+        assert_eq!(decode_gpu_requests(&bytes), items);
+    }
+
+    #[test]
+    fn decode_gpu_requests_stops_at_truncated_bytes() {
+        let items = [(2u8, [1, 2, 3]), (4, [-4, 5, -6]), (0, [9, 9, 9])];
+        let mut bytes = request_bytes(3, &items);
+        assert_eq!(decode_gpu_requests(&bytes).len(), 3);
+        // Cut the third entry in half: only the two whole entries decode.
+        bytes.truncate(16 + 2 * 8 + 4);
+        assert_eq!(decode_gpu_requests(&bytes), items[..2]);
     }
 
     #[test]

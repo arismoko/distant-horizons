@@ -1,6 +1,7 @@
 #version 450
 // Initialize GPU hierarchical traversal for the frame:
-// clears per-section visibility flags and seeds QueueA + DispatchA from RootBuffer.
+// clears per-section visibility flags, resets the finer-node request counter and seeds
+// QueueA + DispatchA from RootBuffer.
 layout(local_size_x = 64) in;
 
 layout(std140) uniform TravInitParams {
@@ -16,6 +17,13 @@ layout(std430) buffer QueueA {
     uint pad2;
     uint items[];
 } queue_a;
+layout(std430) buffer RequestBuffer {
+    uint count;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uvec2 items[];
+} req_out;
 layout(std430) buffer DispatchA {
     uint wg_x;
     uint wg_y;
@@ -26,6 +34,7 @@ layout(std430) buffer DispatchA {
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id == 0u) {
+        req_out.count = 0u;
         uint rc = min(counts.y, counts.z);
         queue_a.count = rc;
         dispatch_a.wg_x = (rc + 63u) >> 6;
