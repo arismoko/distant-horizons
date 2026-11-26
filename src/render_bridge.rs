@@ -651,18 +651,28 @@ pub fn prepare_draws(
     let assets = host.render_assets();
     let view_proj = camera.view_projection();
     let near_dh = 8.0;
-    let far_dh = (frame.config.render_distance_blocks() * 1.4).max(1024.0);
+    let rd_blocks = frame.config.render_distance_blocks().max(256.0);
+    let far_dh = (rd_blocks * 1.4).max(1024.0);
     let atlas_id = id(ATLAS_TEXTURE);
+    // Do not encroach inside vanilla's loaded chunk radius (until #5911 provides exact per-chunk
+    // AABB depth bounds): start LOD cutout at the outer edge of the vanilla render distance.
+    let clip_dist = if frame.config.overdraw_prevention > 0.0 {
+        (frame.vanilla_far_blocks * frame.config.overdraw_prevention.max(0.98) - 1.0).max(0.0)
+    } else {
+        0.0
+    };
+    // Atmospheric haze + smooth far-horizon fade over the real LOD radius (matching Voxy
+    // `NormalRenderPipeline.java`: environmental fog + 90%-100% horizon fade).
+    let fog_start = (rd_blocks * 0.45).max(frame.vanilla_far_blocks + 32.0);
+    let fog_end = rd_blocks.max(fog_start + 64.0);
     let quad_params = quad_params_bytes(
         view_proj,
         camera.position,
         camera.near,
         far_dh,
-        (frame.vanilla_far_blocks * frame.config.overdraw_prevention).max(0.0),
+        clip_dist,
         frame.sun_brightness,
-        // DH's own far fog: vanilla's environmental end is about the vanilla render distance, where
-        // the LOD starts, so using it would fog every LOD quad into the sky colour.
-        [far_dh * 0.75, far_dh, 0.0, 0.0],
+        [fog_start, fog_end, 2.0, 0.0],
         frame.fog_color,
         false, // frames store vanilla gamma; no sRGB decode in the shader
         frame.config.shading_enabled,

@@ -254,9 +254,11 @@ pub fn mesh_octree_section(
                     };
                     if meta.fluid() {
                         // Never emit vertical water walls or undersides into an unloaded border,
-                        // and skip coarse-LOD water undersides so distant water stays a clean sheet.
+                        // and at coarse LODs (detail >= 1) emit only `+Y` water surfaces so
+                        // detail-0/detail-1 sea-level steps and coarse hillside springs do not
+                        // produce vertical blue ribbons or floating blobs.
                         if (neighbor.is_none() && face != Face::PosY)
-                            || (section.pos.detail >= 1 && face == Face::NegY)
+                            || (section.pos.detail >= 1 && face != Face::PosY)
                         {
                             continue;
                         }

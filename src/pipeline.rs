@@ -72,13 +72,15 @@ impl Mapper {
         id
     }
 
-    /// The octree id of `key`'s first (default) state; air and unknown blocks are `0`.
+    /// The octree id of `key`'s vanilla default state (`Block.defaultBlockState`, e.g.
+    /// `grass_block[snowy=false]` rather than ordinal 0 `snowy=true`); air and unknown blocks
+    /// are `0`.
     fn block_key(&mut self, host: &dyn Host, key: BlockKey) -> u32 {
-        match host
-            .block_states()
-            .states_of(key)
-            .and_then(|r| r.iter().next())
-        {
+        match host.block_state_default(key).or_else(|| {
+            host.block_states()
+                .states_of(key)
+                .and_then(|r| r.iter().next())
+        }) {
             Some(state) => self.block(host, state),
             None => 0,
         }
