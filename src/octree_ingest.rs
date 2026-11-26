@@ -190,27 +190,6 @@ impl OctreeIngestStore {
         }
     }
 
-    fn set_voxel(&mut self, x: i32, y: i32, z: i32, voxel: Voxel) {
-        let edge = SECTION_EDGE as i32;
-        let pos = OctreeSectionPos::new(
-            0,
-            x.div_euclid(edge),
-            y.div_euclid(edge),
-            z.div_euclid(edge),
-        );
-        let (lx, ly, lz) = (
-            x.rem_euclid(edge) as usize,
-            y.rem_euclid(edge) as usize,
-            z.rem_euclid(edge) as usize,
-        );
-        if voxel.is_air() && voxel == Voxel::AIR && !self.sections.contains_key(&pos) {
-            return;
-        }
-        self.write(pos, |s| {
-            s.set(lx, ly, lz, voxel);
-        });
-    }
-
     /// Insert a section loaded from disk or the network when nothing newer holds its position.
     /// Not marked dirty: the caller queues it for meshing.
     pub fn adopt_section(&mut self, section: OctreeSection) -> bool {

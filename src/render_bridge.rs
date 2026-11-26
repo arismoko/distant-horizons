@@ -37,9 +37,12 @@ pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
 pub const SHADER_TRANS_CLEAR: &str = "distantsunrises:voxy_trans_clear";
 pub const SHADER_TRANS_PREFIX: &str = "distantsunrises:voxy_trans_prefix";
 pub const SHADER_TRANS_SCATTER: &str = "distantsunrises:voxy_trans_scatter";
+pub const SHADER_SSAO: &str = "distantsunrises:voxy_ssao";
+pub const SHADER_SSAO_APPLY: &str = "distantsunrises:core/voxy_ssao_apply";
 
 pub const PIPELINE_OPAQUE: &str = "distantsunrises:voxy_opaque";
 pub const PIPELINE_TRANSLUCENT: &str = "distantsunrises:voxy_translucent";
+pub const PIPELINE_SSAO_APPLY: &str = "distantsunrises:voxy_ssao_apply";
 pub const PIPELINE_PACK_TERRAIN: &str = "distantsunrises:voxy_pack_terrain";
 pub const PIPELINE_PACK_WATER: &str = "distantsunrises:voxy_pack_water";
 pub const PIPELINE_PACK_SHADOW: &str = "distantsunrises:voxy_pack_shadow";
@@ -269,6 +272,47 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
         )
         .build(),
     );
+    event.compute_pipeline(
+        ComputePipeline::builder(id("distantsunrises:voxy_ssao"), id(SHADER_SSAO))
+            .bind_group_layout(
+                BindGroupLayout::builder()
+                    .uniform_buffer("SsaoParams", 32)
+                    .sampler(
+                        "WorldDepthTex",
+                        SamplerFilter::Nearest,
+                        SamplerAddress::ClampToEdge,
+                    )
+                    .entry(mod_api::BindEntry::new(
+                        "SsaoOut",
+                        mod_api::BindingKind::StorageImage {
+                            access: StorageImageAccess::WriteOnly,
+                        },
+                    ))
+                    .build()
+                    .expect("static ssao layout"),
+            )
+            .build(),
+    );
+    event.register(
+        mod_api::RenderPipeline::new(
+            id(PIPELINE_SSAO_APPLY),
+            id(SHADER_SSAO_APPLY),
+            mod_api::PipelineBlend::Translucent,
+            mod_api::WorldDepth::Ignored,
+        )
+        .topology(mod_api::PrimitiveTopology::Triangles)
+        .cull(false)
+        .bind_group_layout(
+            BindGroupLayout::builder()
+                .sampler(
+                    "SsaoTex",
+                    SamplerFilter::Nearest,
+                    SamplerAddress::ClampToEdge,
+                )
+                .build()
+                .expect("static ssao_apply layout"),
+        ),
+    );
 }
 
 /// Writes `v` as little-endian f32s / u32s / i32s into a std140 byte buffer.
@@ -410,6 +454,46 @@ fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<(HizTarg
     let made = HizTarget { target, size, mips };
     *slot = Some(HizTarget { ..made });
     Some((made, true))
+}
+
+/// Mod-owned `R32Float` SSAO output target, resized with the viewport.
+struct SsaoTarget {
+    target: mod_api::RenderTargetRef,
+    size: [u32; 2],
+}
+
+static SSAO: Mutex<Option<SsaoTarget>> = Mutex::new(None);
+
+impl SsaoTarget {
+    fn dest(&self) -> mod_api::StorageImageBinding {
+        mod_api::StorageImageBinding::new(self.target, 0, 0)
+    }
+    fn source(&self) -> mod_api::TextureSource<'static> {
+        mod_api::TextureSource::RenderTargetColorMip(mod_api::RenderTargetMipView::single(
+            self.target,
+            0,
+            0,
+        ))
+    }
+}
+
+fn ensure_ssao(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<SsaoTarget> {
+    use mod_api::{RenderTargetDescriptor, RenderTargetFormat, StorageImageAccess};
+    let mut slot = SSAO.lock().unwrap();
+    if let Some(s) = slot.as_ref().filter(|s| s.size == size) {
+        return Some(SsaoTarget { ..*s });
+    }
+    if let Some(old) = slot.take() {
+        let _ = old.target.release(host);
+    }
+    let desc = RenderTargetDescriptor::new(size)
+        .color_target(RenderTargetFormat::R32Float)
+        .mip_levels(1)
+        .storage(StorageImageAccess::WriteOnly);
+    let target = host.create_render_target(&desc).ok()?;
+    let made = SsaoTarget { target, size };
+    *slot = Some(SsaoTarget { ..made });
+    Some(made)
 }
 
 /// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
@@ -716,6 +800,47 @@ pub fn setup_compute(
         );
     });
     report("add_compute_pass", added);
+
+    // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
+    if let (Ok(ssao_pipe), Some(ssao_target)) = (
+        assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
+        ensure_ssao(host, [w, h]),
+    ) {
+        let clip_dist = if frame.config.overdraw_prevention > 0.0 {
+            (frame.vanilla_far_blocks * frame.config.overdraw_prevention.max(0.98) - 1.0).max(0.0)
+        } else {
+            0.0
+        };
+        let ssao_params = Std140(Vec::with_capacity(32))
+            .f32s(&[
+                camera.projection[0].abs().max(1e-4),
+                camera.projection[5].abs().max(1e-4),
+                camera.near,
+                clip_dist,
+            ])
+            .i32s(&[w as i32, h as i32, 0, 0])
+            .0;
+        let ssao_desc = ComputePassDescriptor::new("distantsunrises:ssao")
+            .reads(FrameTarget::MainDepth)
+            .writes(FrameTarget::Mod(ssao_target.target))
+            .after_stage(OPAQUE_STAGE)
+            .before_stage(TRANSLUCENT_STAGE);
+        let added_ssao = graph.add_compute_pass(ssao_desc, &mut |ctx| {
+            let bindings = DrawBindings::new()
+                .inline_uniform("SsaoParams", &ssao_params)
+                .texture("WorldDepthTex", TextureSource::WorldDepth)
+                .storage_image("SsaoOut", ssao_target.dest());
+            report(
+                "ssao dispatch",
+                ctx.dispatch(
+                    ssao_pipe,
+                    &bindings,
+                    [w.div_ceil(HIZ_WORKGROUP), h.div_ceil(HIZ_WORKGROUP), 1],
+                ),
+            );
+        });
+        report("add_ssao_compute_pass", added_ssao);
+    }
 }
 
 /// Prepares this frame's two indirect draws (opaque in [`OPAQUE_STAGE`], translucent in
@@ -783,6 +908,25 @@ pub fn prepare_draws(
         .to_bytes()
     };
     let s = arena.slices;
+    // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws.
+    if let (Ok(ssao_apply), Some(ssao_src)) = (
+        assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
+        SSAO.lock().unwrap().as_ref().map(SsaoTarget::source),
+    ) {
+        let bindings = DrawBindings::new().texture("SsaoTex", ssao_src);
+        if let Some(batch) = report(
+            "ssao_apply draw",
+            context.draw_mesh(
+                TRANSLUCENT_STAGE,
+                ssao_apply,
+                state.quad_mesh,
+                mod_api::MeshDraw::indexed(0..3, 0),
+                &bindings,
+            ),
+        ) {
+            PREPARED.lock().unwrap().push((TRANSLUCENT_STAGE, batch));
+        }
+    }
     for (stage, plain, pack, cmds, count) in [
         (
             OPAQUE_STAGE,

@@ -48,9 +48,10 @@ void main() {
     bool cutout = (mflags & 4u) != 0u;
     uint tint_kind = (mflags >> 4) & 15u;
 
-    // Clip radius: the vanilla chunk area is not redrawn (clip_dist = 0 disables).
+    // Clip region: the vanilla chunk area is a Chebyshev square around the camera chunk
+    // (until #5911 provides exact per-chunk AABB depth bounds); `clip_dist = 0` disables.
     float clip_dist = depth_and_light.z;
-    if (clip_dist > 0.0 && length(rel_pos.xz) < clip_dist) {
+    if (clip_dist > 0.0 && max(abs(rel_pos.x), abs(rel_pos.z)) < clip_dist) {
         discard;
     }
 
