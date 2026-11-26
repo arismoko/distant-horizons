@@ -1866,35 +1866,25 @@ pub mod octree_sync {
         }
     }
 
-    /// Run `demand` only once the current play world has locally queued its initial session
-    /// config (`ServerPlayerState.java:62-65`). A refused send leaves intake closed and demands
-    /// nothing; the next eligible tick tries the same config again.
-    pub fn client_demand_after_config<H: ClientHost + ?Sized>(
-        host: &mut H,
-        demand: impl FnOnce(&mut H),
-    ) {
+    /// Open the current play world's intake by locally queueing its initial session config
+    /// (`ServerPlayerState.java:62-65`); true once queued, and on every later call. A refused
+    /// send leaves intake closed and the next eligible tick tries the same config again.
+    /// `pipeline::client_sync` calls this before it demands any section.
+    pub fn client_configure<H: ClientHost + ?Sized>(host: &mut H) -> bool {
         let channel = octree_sync_channel_id();
-        demand_after_config(
-            client_intake(),
-            host,
-            |host, bytes| host.send_payload_to_server(&channel, bytes),
-            demand,
-        );
+        configure_via(client_intake(), host, |host, bytes| {
+            host.send_payload_to_server(&channel, bytes)
+        })
     }
 
-    fn demand_after_config<H: ?Sized>(
+    fn configure_via<H: ?Sized>(
         intake: &Mutex<ClientIntake>,
         host: &mut H,
         send: impl FnOnce(&mut H, PayloadBytes) -> Result<PayloadAccepted, PayloadSendError>,
-        demand: impl FnOnce(&mut H),
-    ) {
+    ) -> bool {
         // The host send is nonblocking and cannot call the raw handler inline. Hold the same
-        // guard as receive so a fast reply cannot arrive before intake is opened, and release
-        // it before demand, which takes the intake lock again.
-        let configured = intake.lock().unwrap().configure(|bytes| send(host, bytes));
-        if configured {
-            demand(host);
-        }
+        // guard as receive so a fast reply cannot arrive before intake is opened.
+        intake.lock().unwrap().configure(|bytes| send(host, bytes))
     }
 
     /// Forget the per-play-world state at a lifetime boundary.
@@ -1980,62 +1970,42 @@ pub mod octree_sync {
         }
 
         #[test]
-        fn section_demand_waits_for_the_config_gate_to_accept() {
+        fn client_gate_stays_closed_until_the_same_config_is_queued_once() {
             #[derive(Default)]
             struct Link {
                 accept: bool,
                 sent: Vec<Vec<u8>>,
-                demanded: usize,
             }
-            let pos = OctreeSectionPos::new(0, 0, 0, 0);
             let intake = Mutex::new(ClientIntake::default());
             let tick = |link: &mut Link| {
-                demand_after_config(
-                    &intake,
-                    link,
-                    |link, bytes| {
-                        link.sent.push(bytes.0);
-                        if link.accept {
-                            Ok(PayloadAccepted::Queued)
-                        } else {
-                            Err(PayloadSendError::Backpressure)
-                        }
-                    },
-                    |link| {
-                        link.demanded += 1;
-                        intake
-                            .lock()
-                            .unwrap()
-                            .session
-                            .request(LEVEL, pos, None)
-                            .unwrap();
-                    },
-                );
+                configure_via(&intake, link, |link, bytes| {
+                    link.sent.push(bytes.0);
+                    if link.accept {
+                        Ok(PayloadAccepted::Queued)
+                    } else {
+                        Err(PayloadSendError::Backpressure)
+                    }
+                })
             };
             let mut link = Link::default();
             for refused in 1..=2 {
-                tick(&mut link);
+                assert!(!tick(&mut link), "refused config must not open the gate");
                 assert_eq!(link.sent.len(), refused);
-                assert_eq!(link.demanded, 0, "refused config must not demand sections");
-                let closed = intake.lock().unwrap();
-                assert!(!closed.open && closed.session.pending.is_empty());
+                assert!(!intake.lock().unwrap().open);
             }
             assert_eq!(link.sent[0], link.sent[1]);
 
             link.accept = true;
-            tick(&mut link);
+            assert!(tick(&mut link));
             assert_eq!(link.sent.len(), 3);
             assert_eq!(link.sent[2], link.sent[0]);
-            assert_eq!(link.demanded, 1);
             assert!(intake.lock().unwrap().open);
-            tick(&mut link);
+            assert!(tick(&mut link));
             assert_eq!(
                 link.sent.len(),
                 3,
                 "an open play world never resends config"
             );
-            assert_eq!(link.demanded, 2);
-            assert_eq!(intake.lock().unwrap().session.pending.len(), 2);
         }
 
         #[test]
