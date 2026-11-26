@@ -765,15 +765,14 @@ fn queue_save(
     dirty: &HashSet<SectionPos>,
 ) {
     for &pos in dirty {
-        if let Some(sec) = store.sections.get_mut(&pos) {
-            if sec.dirty_save
-                && sec.populated > 0
-                && let Some(dir) = save_root
-            {
-                sec.dirty_save = false;
-                rt.io
-                    .request_save(dir.clone(), dimension.to_owned(), sec.clone());
-            }
+        if let Some(sec) = store.sections.get_mut(&pos)
+            && sec.dirty_save
+            && sec.populated > 0
+            && let Some(dir) = save_root
+        {
+            sec.dirty_save = false;
+            rt.io
+                .request_save(dir.clone(), dimension.to_owned(), sec.clone());
         }
     }
 }
