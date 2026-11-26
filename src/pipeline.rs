@@ -667,17 +667,43 @@ pub(crate) fn client_level_unload(dim: &str) {
     crate::render_bridge::clear_sections(Some(dim));
 }
 
+/// Rebuild locally owned meshes, and refresh server copies only in the viewed dimension.
+pub(crate) fn clear_client_cache(dim: &str, remote: bool) -> (usize, usize) {
+    let mut p = PIPELINE.lock().unwrap();
+    if remote && let Some(requested) = p.requested.get_mut(dim) {
+        crate::network::octree_sync::retain_client_pending_requests(dim, requested);
+    }
+    MESH_WORKER.clear_dim(dim);
+    let counts = p.clear_client_cache(dim, remote);
+    crate::render_bridge::clear_sections(Some(dim));
+    counts
+}
+
 impl Pipeline {
-    fn retire_client_rendering(&mut self, dim: &str) {
+    fn clear_client_cache(&mut self, dim: &str, remote: bool) -> (usize, usize) {
+        let dropped = if remote {
+            let unsaved = self.unsaved.get(dim);
+            self.stores
+                .get_mut(dim)
+                .map_or(0, |store| store.evict_sections_except(unsaved))
+        } else {
+            0
+        };
+        self.dirty.remove(dim);
+        self.queued.remove(dim);
+        (self.retire_client_rendering(dim), dropped)
+    }
+
+    fn retire_client_rendering(&mut self, dim: &str) -> usize {
         self.section_epoch.retain(|(d, _), _| d != dim);
         self.rendered.remove(dim);
-        if let Some(positions) = self
-            .stores
-            .get(dim)
-            .map(OctreeIngestStore::section_positions)
-        {
-            self.queue(dim, positions);
-        }
+        let Some(store) = self.stores.get(dim) else {
+            return 0;
+        };
+        let positions = store.section_positions();
+        let count = positions.len();
+        self.queue(dim, positions);
+        count
     }
 }
 
@@ -1846,6 +1872,64 @@ mod tests {
         assert!(p.unsaved[DIM].contains(&pos));
         assert!(p.disk[DIM].hits.contains(&pos));
         assert!(p.requested[DIM].contains(&pos));
+    }
+
+    #[test]
+    fn clear_requeues_local_or_unsaved_sections_and_only_retires_active_rendering() {
+        let other = "minecraft:the_nether";
+        let unsaved = OctreeSectionPos::new(0, 0, 0, 0);
+        let cached = OctreeSectionPos::new(0, 1, 0, 0);
+        let stale_queue = OctreeSectionPos::new(0, 2, 0, 0);
+        let stone = Voxel::new(1, 0, 12, 0);
+        for remote in [false, true] {
+            let mut p = Pipeline::default();
+            for dim in [DIM, other] {
+                let store = p.stores.entry(dim.into()).or_default();
+                for pos in [unsaved, cached] {
+                    store.replace_section(OctreeSection::filled(pos, stone));
+                    p.section_epoch.insert((dim.into(), pos), 8);
+                }
+                p.unsaved.entry(dim.into()).or_default().insert(unsaved);
+                p.rendered
+                    .insert(dim.into(), HashSet::from([unsaved, cached]));
+                p.queue(dim, [stale_queue]);
+            }
+            p.next_epoch = 8;
+            stage_live(&mut p, [0, 0], 1);
+
+            let expected = if remote {
+                HashSet::from([unsaved])
+            } else {
+                HashSet::from([unsaved, cached])
+            };
+            assert_eq!(
+                p.clear_client_cache(DIM, remote),
+                (expected.len(), 2 - expected.len())
+            );
+            assert_eq!(
+                p.stores[DIM]
+                    .section_positions()
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+            assert_eq!(p.stores[DIM].section(unsaved).unwrap().get(0, 0, 0), stone);
+            assert_eq!(p.unsaved[DIM], HashSet::from([unsaved]));
+            assert_eq!(p.disk[DIM].pending.len(), 1);
+            assert_eq!(p.queued[DIM], expected);
+            assert_eq!(p.dirty[DIM].len(), expected.len());
+            assert_eq!(
+                p.dirty[DIM].iter().copied().collect::<HashSet<_>>(),
+                expected
+            );
+            assert!(!p.rendered.contains_key(DIM));
+            assert!(!p.section_epoch.keys().any(|(dim, _)| dim == DIM));
+            assert_eq!(p.next_epoch, 8);
+            assert_eq!(p.stores[other].section_positions().len(), 2);
+            assert_eq!(p.queued[other], HashSet::from([stale_queue]));
+            assert_eq!(p.rendered[other], HashSet::from([unsaved, cached]));
+            assert_eq!(p.section_epoch[&(other.into(), cached)], 8);
+        }
     }
 
     #[test]

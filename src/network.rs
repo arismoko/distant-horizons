@@ -39,7 +39,7 @@ pub mod octree_sync {
         ClientHost, HandlerThread, IPayloadContext, IPayloadHandler, PayloadAccepted, PayloadBytes,
         PayloadHandleError, PayloadId, PayloadSendError, PlayerRef, Registrar, ServerHost,
     };
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::hash::Hash;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -1663,6 +1663,14 @@ pub mod octree_sync {
             self.next_future = self.next_future.wrapping_add(1);
         }
 
+        fn retain_pending_requests(&self, level: &str, requested: &mut HashSet<OctreeSectionPos>) {
+            *requested = self
+                .pending
+                .values()
+                .filter_map(|(dim, pos)| (dim == level && requested.contains(pos)).then_some(*pos))
+                .collect();
+        }
+
         pub fn on_message(
             &mut self,
             bytes: &[u8],
@@ -1808,6 +1816,20 @@ pub mod octree_sync {
     fn client_intake() -> &'static Mutex<ClientIntake> {
         static INTAKE: OnceLock<Mutex<ClientIntake>> = OnceLock::new();
         INTAKE.get_or_init(|| Mutex::new(ClientIntake::default()))
+    }
+
+    /// Keep only marks with an outstanding future in the current dimension. The callback
+    /// removes the future and enqueues its event under the same lock. A reply already queued
+    /// here needs no mark: client_sync applies queued events before selecting requests.
+    pub(crate) fn retain_client_pending_requests(
+        level: &str,
+        requested: &mut HashSet<OctreeSectionPos>,
+    ) {
+        client_intake()
+            .lock()
+            .unwrap()
+            .session
+            .retain_pending_requests(level, requested);
     }
 
     /// Events decoded by the network executor, drained by the render side.
@@ -2245,7 +2267,6 @@ pub mod octree_sync {
         fn refused_scan_and_gpu_requests_remain_selectable_until_they_queue() {
             use crate::octree_ingest::OctreeIngestStore;
             use crate::pipeline::request_remote_sections;
-            use std::collections::HashSet;
 
             let now = Instant::now();
             for from_gpu in [false, true] {
@@ -2355,6 +2376,112 @@ pub mod octree_sync {
                 assert_eq!(received.to_rle(), section.to_rle());
                 assert_eq!(received.revision, section.revision);
             }
+        }
+
+        #[test]
+        fn clearing_request_marks_preserves_pending_future_but_reselects_missing_completed_key() {
+            use crate::octree_ingest::OctreeIngestStore;
+            use crate::pipeline::request_remote_sections;
+
+            let now = Instant::now();
+            let pos = OctreeSectionPos::new(1, 0, 0, 0);
+            let demand = [(pos.detail, [pos.x, pos.y, pos.z])];
+            let mut intake = ClientIntake::default();
+            let source = Fake::of(&varied_section(pos, 1), DhV2CompressionMode::Uncompressed);
+            let mut registry = ServerSyncRegistry::new(SessionConfig::default());
+            registry.set_open(true);
+            assert!(intake.configure(|cfg| {
+                registry
+                    .receive(|| Ok(1), Message::decode(&cfg.0).unwrap(), now, &source)
+                    .unwrap();
+                Ok(PayloadAccepted::Queued)
+            }));
+            assert!(intake.send_request(LEVEL, pos, None, |bytes| {
+                registry
+                    .receive(|| Ok(1), Message::decode(&bytes.0).unwrap(), now, &source)
+                    .unwrap();
+                Ok(PayloadAccepted::Queued)
+            }));
+            let mut requested = HashSet::from([pos]);
+            intake
+                .session
+                .retain_pending_requests(LEVEL, &mut requested);
+            request_remote_sections(None, &mut requested, [0.0; 3], 0, 1, demand, |key| {
+                assert_ne!(
+                    key, pos,
+                    "clear must not send a second future for the pending key"
+                );
+                false
+            });
+            assert_eq!(requested, HashSet::from([pos]));
+            assert_eq!(intake.session.next_future, 1);
+            assert_eq!(
+                intake.session.pending.get(&0),
+                Some(&(LEVEL.to_owned(), pos))
+            );
+
+            for bytes in &wire_tick(&mut registry, &HashMap::new(), &source)[&1] {
+                intake.receive(bytes, now, || true).unwrap();
+            }
+            assert!(intake.session.pending.is_empty());
+            // The callback has finished, but client_sync has not drained the valid reply.
+            // Clearing at this boundary must not discard the event.
+            let mut queued_marks = requested.clone();
+            intake
+                .session
+                .retain_pending_requests(LEVEL, &mut queued_marks);
+            assert!(queued_marks.is_empty());
+            let events = std::mem::take(&mut intake.events);
+            let [ClientEvent::Section { level, section, .. }] = events.as_slice() else {
+                panic!("clear lost the already queued reply");
+            };
+            assert_eq!(level, LEVEL);
+            assert_eq!(section.pos, pos);
+
+            let mut store = OctreeIngestStore::new();
+            store.replace_section(section.clone());
+            request_remote_sections(
+                Some(&store),
+                &mut queued_marks,
+                [0.0; 3],
+                0,
+                1,
+                demand,
+                |key| {
+                    assert_ne!(key, pos, "the queued reply satisfies refresh");
+                    false
+                },
+            );
+
+            // A clear after adoption instead drops the resident copy and its completed mark.
+            intake
+                .session
+                .retain_pending_requests(LEVEL, &mut requested);
+            assert_eq!(store.evict_sections_except(None), 1);
+            request_remote_sections(
+                Some(&store),
+                &mut requested,
+                [0.0; 3],
+                0,
+                1,
+                demand,
+                |key| {
+                    assert_eq!(key, pos);
+                    intake.send_request(LEVEL, key, None, |bytes| {
+                        let Message::Request(req) = Message::decode(&bytes.0).unwrap() else {
+                            panic!("expected a fresh request");
+                        };
+                        assert_eq!(req.future_id, 1);
+                        assert_eq!(req.pos, pos);
+                        Ok(PayloadAccepted::Queued)
+                    })
+                },
+            );
+            assert_eq!(requested, HashSet::from([pos]));
+            assert_eq!(
+                intake.session.pending.get(&1),
+                Some(&(LEVEL.to_owned(), pos))
+            );
         }
 
         #[test]

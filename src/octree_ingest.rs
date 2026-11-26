@@ -227,6 +227,31 @@ impl OctreeIngestStore {
         self.sections.insert(section.pos, section);
     }
 
+    /// Evict resident sections except protected edits. Chunk source priority is per input chunk,
+    /// not per section; only section-specific records for actually evicted keys are forgotten.
+    pub(crate) fn evict_sections_except(
+        &mut self,
+        protected: Option<&HashSet<OctreeSectionPos>>,
+    ) -> usize {
+        let mut evicted = HashSet::new();
+        self.sections.retain(|pos, _| {
+            if protected.is_some_and(|set| set.contains(pos)) {
+                return true;
+            }
+            evicted.insert(*pos);
+            false
+        });
+        self.dirty.retain(|pos| !evicted.contains(pos));
+        self.restored.retain(|pos| !evicted.contains(pos));
+        let edge = SECTION_EDGE as i32;
+        self.distant_column_ys.retain(|&(x, z), ys| {
+            let (sx, sz) = (x.div_euclid(edge), z.div_euclid(edge));
+            ys.retain(|&sy| !evicted.contains(&OctreeSectionPos::new(0, sx, sy, sz)));
+            !ys.is_empty()
+        });
+        evicted.len()
+    }
+
     /// Slots a direct estimate can touch, including the previous surface span on a re-sample.
     pub(crate) fn estimate_positions(
         &self,
@@ -598,6 +623,32 @@ mod tests {
     const LEAVES: u32 = 3;
     const WATER: u32 = 4;
     const DIRT: u32 = 5;
+
+    #[test]
+    fn selective_eviction_forgets_only_the_removed_section_bookkeeping() {
+        let mut store = OctreeIngestStore::default();
+        let kept = OctreeSectionPos::new(0, -1, 0, 0);
+        let dropped = OctreeSectionPos::new(0, -1, 1, 0);
+        for pos in [kept, dropped] {
+            store.adopt_cached(OctreeSection::new(pos));
+            store.dirty.insert(pos);
+        }
+        store
+            .distant_column_ys
+            .insert((-1, 0), BTreeSet::from([0, 1]));
+        store.distant_column_ys.insert((-2, 0), BTreeSet::from([1]));
+        store.distant_column_ys.insert((0, 0), BTreeSet::from([1]));
+        store.chunk_sources.insert([-1, 0], IngestSource::Loaded);
+
+        assert_eq!(store.evict_sections_except(Some(&HashSet::from([kept]))), 1);
+        assert_eq!(store.section_positions(), vec![kept]);
+        assert_eq!(store.dirty, HashSet::from([kept]));
+        assert_eq!(store.restored, HashSet::from([kept]));
+        assert_eq!(store.distant_column_ys[&(-1, 0)], BTreeSet::from([0]));
+        assert!(!store.distant_column_ys.contains_key(&(-2, 0)));
+        assert_eq!(store.distant_column_ys[&(0, 0)], BTreeSet::from([1]));
+        assert_eq!(store.source_of([-1, 0]), Some(IngestSource::Loaded));
+    }
 
     /// 4 sections tall chunk (y 0..64) backed by a sparse map.
     struct MockChunk {

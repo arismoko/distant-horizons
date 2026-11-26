@@ -50,7 +50,11 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
 - **Public API.** `src/api.rs` offers `LodWorldGenerator` overrides, `RemoteLodProvider` clients,
   column and section submission, `FullDataSourceV2` decoding and cache queries.
 - **Client UI.** Mod settings (`Options > Mods`), `/ds` and `/distantsunrises` client commands,
-  controls keybinds, and F3 debug entries.
+  controls keybinds, and F3 debug entries. `/ds clear` and **Clear Dimension LOD Cache** only
+  refresh the active dimension. For an integrated world (including the LAN host), they keep
+  resident terrain and rebuild its meshes.
+  On a remote server they drop cached server sections and fetch them again as needed, keeping and
+  remeshing unsaved sections during the clear. Neither action deletes disk files.
 
 ## Differences from the original
 

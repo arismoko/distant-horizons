@@ -90,14 +90,8 @@ impl DhKeybinds {
         if let Some(m) = self.clear_cache
             && m.consume_click(host).unwrap_or(false)
         {
-            let cleared = clear_active_dimension_cache();
-            let _ = host.set_overlay_message(
-                Text::translate(
-                    "distantsunrises.command.cleared",
-                    vec![Text::literal(cleared.to_string())],
-                ),
-                false,
-            );
+            let message = clear_active_dimension_cache(host);
+            let _ = host.set_overlay_message(message, false);
         }
     }
 }
@@ -466,11 +460,8 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
             }
         },
         "clear" => {
-            let cleared = clear_active_dimension_cache();
-            let _ = host.chat_line(Text::translate(
-                "distantsunrises.command.cleared",
-                vec![Text::literal(cleared.to_string())],
-            ));
+            let message = clear_active_dimension_cache(host);
+            let _ = host.chat_line(message);
         }
         "remesh" => {
             let count = crate::pipeline::invalidate_models();
@@ -634,18 +625,22 @@ fn send_status(host: &mut dyn ClientHost) {
     ));
 }
 
-/// Drop cached sections and meshes for the active dimension so they rebuild cleanly.
-pub fn clear_active_dimension_cache() -> usize {
-    let rt = runtime();
-    let mut st = rt.inner.lock().unwrap();
-    let dim = st.active_dimension.clone();
-    let removed = st
-        .dimensions
-        .remove(&dim)
-        .map(|d| d.sections.len())
-        .unwrap_or(0);
-    st.remote_requested.remove(&dim);
-    removed
+/// Refresh only live octree terrain; leave provider data and disk state alone.
+fn clear_active_dimension_cache(host: &dyn ClientHost) -> Text {
+    let (rebuild, dropped) = host
+        .client_session()
+        .client_server()
+        .map_or((0, 0), |server| {
+            let dim = runtime().inner.lock().unwrap().active_dimension.clone();
+            crate::pipeline::clear_client_cache(&dim, !server.integrated_local)
+        });
+    Text::translate(
+        "distantsunrises.command.cleared",
+        vec![
+            Text::literal(rebuild.to_string()),
+            Text::literal(dropped.to_string()),
+        ],
+    )
 }
 
 #[cfg(test)]
