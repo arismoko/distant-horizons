@@ -6,8 +6,9 @@
 //! - a section's metadata record is 32 bytes (`SECTION_METADATA_SIZE = 32`, two `uvec4`s),
 //! - a section's quads are split into 8 buckets (translucent, double-sided, then the six faces
 //!   down/up/north/south/west/east) whose 16-bit counts live in the metadata record,
-//! - section ids come from a bitset allocator over `maxSectionCount` (Voxy: `1 << 20`,
-//!   `VoxyRenderSystem.java:119`), and freed ids get a zeroed metadata record,
+//! - Voxy uses a bitset allocator over `1 << 20` section ids (`VoxyRenderSystem.java:119`).
+//!   We cap section ids at `VOXY_MAX_SECTIONS = 1 << 19` so `opaque_commands` fits within
+//!   128 MiB, track freed ids in a `BTreeSet` free list, and zero their metadata records,
 //! - geometry is sub-allocated from one arena by a free list that returns the allocation size on
 //!   free (`AllocationArena`).
 //!
@@ -35,7 +36,10 @@ pub const QUAD_BYTES: u64 = 8;
 pub const SECTION_METADATA_BYTES: u64 = 32;
 /// Bytes per indexed indirect command: vanilla `RenderPass.INDIRECT_INDEXED_DRAW_SIZE = 20`.
 pub const DRAW_INDEXED_INDIRECT_BYTES: u64 = 20;
-/// Voxy's `maxSectionCount` (`VoxyRenderSystem.java:119`).
+/// Voxy passes `1 << 20` as `maxSectionCount` (`VoxyRenderSystem.java:119`). We use half
+/// that cap (`1 << 19`): `opaque_commands` takes `n * 7 * 20` bytes, or 140 MiB at `1 << 20`
+/// versus 70 MiB at `1 << 19`, and must fit the 128 MiB default
+/// `max_storage_buffer_binding_size` (commit `b6cde62e3b`).
 pub const VOXY_MAX_SECTIONS: u32 = 1 << 19;
 /// Quad buckets per section: translucent, double-sided, down, up, north, south, west, east.
 pub const BUCKETS: usize = 8;
@@ -727,7 +731,9 @@ impl GpuArena {
         self.max_sections
     }
 
-    /// Sections cmdgen must visit (`indirect_lookup`-free: ids are dense up to this mark).
+    /// Exclusive upper bound on live section ids. `voxy_cmdgen.csh` visits slots below this
+    /// mark without an indirect lookup. Freed interior ids leave holes with zeroed metadata
+    /// until reused; the mark shrinks only when trailing ids are freed.
     pub fn section_high_water(&self) -> u32 {
         self.ids.high_water()
     }
