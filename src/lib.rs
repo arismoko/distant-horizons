@@ -200,9 +200,14 @@ impl Hooks for DistantHorizonsMod {
 
     fn client_level_load(&self, host: &mut dyn ClientHost, event: &mut ClientLevelLoadEvent<'_>) {
         sync_client_config(host);
-        let mut st = runtime().inner.lock().unwrap();
-        st.active_dimension = event.dimension.to_owned();
-        st.client_loaded_chunks.clear();
+        {
+            let mut st = runtime().inner.lock().unwrap();
+            st.active_dimension = event.dimension.to_owned();
+            st.client_loaded_chunks.clear();
+        }
+        // Dev 2 loads the new dimension before unloading the old one; same-level respawns
+        // fire neither hook. The old dimension's residency can be retired independently.
+        pipeline::requeue_dimension(event.dimension);
     }
 
     fn client_level_unload(
@@ -219,6 +224,8 @@ impl Hooks for DistantHorizonsMod {
         network::octree_sync::client_reset();
         if is_remote {
             pipeline::clear_all();
+        } else {
+            pipeline::forget_gpu_residency(event.dimension);
         }
         let mut st = runtime().inner.lock().unwrap();
         if is_remote {
@@ -268,7 +275,8 @@ impl Hooks for DistantHorizonsMod {
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
         if host.on(MOD_ID) {
             let dim = runtime().inner.lock().unwrap().active_dimension.clone();
-            pipeline::client_tick(host, &dim);
+            let active_dim = host.level(&dim).is_some().then_some(dim.as_str());
+            pipeline::client_tick(host, active_dim);
             render_bridge::upload_pending(
                 host,
                 gpu_arena::ArenaConfig {

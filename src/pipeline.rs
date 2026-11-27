@@ -347,12 +347,17 @@ fn has_non_empty_descendant(store: &OctreeIngestStore, pos: OctreeSectionPos) ->
 impl Pipeline {
     fn clear_dimension(&mut self, dim: &str) {
         self.stores.remove(dim);
-        self.dirty.remove(dim);
-        self.queued.remove(dim);
-        self.section_epoch.retain(|(d, _), _| d != dim);
-        self.rendered.remove(dim);
+        self.forget_gpu_residency(dim);
         self.unsaved.remove(dim);
         self.requested.remove(dim);
+    }
+
+    fn forget_gpu_residency(&mut self, dim: &str) {
+        self.dirty.remove(dim);
+        self.queued.remove(dim);
+        self.rendered.remove(dim);
+        // Keep next_epoch so a job already popped by the worker cannot match on return.
+        self.section_epoch.retain(|(d, _), _| d != dim);
     }
 
     fn clear_all(&mut self) {
@@ -453,16 +458,25 @@ impl Pipeline {
         }
     }
 
+    fn requeue_dimension(&mut self, dim: &str) -> usize {
+        let Some(positions) = self
+            .stores
+            .get(dim)
+            .map(OctreeIngestStore::section_positions)
+        else {
+            return 0;
+        };
+        let count = positions.len();
+        self.queue(dim, positions);
+        count
+    }
+
     /// Queues every stored section of every dimension; returns how many.
     fn queue_all(&mut self) -> usize {
         let dims: Vec<String> = self.stores.keys().cloned().collect();
-        let mut queued = 0;
-        for dim in dims {
-            let positions = self.stores[&dim].section_positions();
-            queued += positions.len();
-            self.queue(&dim, positions);
-        }
-        queued
+        dims.into_iter()
+            .map(|dim| self.requeue_dimension(&dim))
+            .sum()
     }
 
     /// The GPU arena is gone, so nothing counts as uploaded: drop residency and pre-reset worker
@@ -504,6 +518,63 @@ impl Pipeline {
                     }
                 }
             }
+        }
+    }
+
+    fn apply_mesh_completions(
+        &mut self,
+        active_dim: Option<&str>,
+        completions: Vec<MeshDone>,
+        mut submit: impl FnMut(crate::render_bridge::SectionKey, BuiltSection),
+    ) {
+        let mut remesh_ancestors: Vec<(String, OctreeSectionPos)> = Vec::new();
+        for (done_dim, pos, epoch, built) in completions {
+            if self.section_epoch.get(&(done_dim.clone(), pos)).copied() != Some(epoch) {
+                continue;
+            }
+            if active_dim != Some(done_dim.as_str()) {
+                self.section_epoch.remove(&(done_dim, pos));
+                continue;
+            }
+            let has_quads = !built.is_empty();
+            let key = (done_dim.clone(), pos.detail, [pos.x, pos.y, pos.z]);
+            submit(key, built);
+            if !has_quads {
+                // The matching epoch is the newest job for `pos`: an empty result retires the entry.
+                self.section_epoch.remove(&(done_dim.clone(), pos));
+            }
+            let changed = if has_quads {
+                self.rendered
+                    .entry(done_dim.clone())
+                    .or_default()
+                    .insert(pos)
+            } else {
+                self.rendered
+                    .get_mut(&done_dim)
+                    .is_some_and(|live| live.remove(&pos))
+            };
+            if changed {
+                let mut anc = pos.parent();
+                while let Some(a) = anc {
+                    let should_requeue = if has_quads {
+                        self.rendered
+                            .get(&done_dim)
+                            .is_some_and(|live| live.contains(&a))
+                            || self.section_epoch.contains_key(&(done_dim.clone(), a))
+                    } else {
+                        self.stores
+                            .get(&done_dim)
+                            .is_some_and(|s| s.section(a).is_some_and(|sec| !sec.is_empty()))
+                    };
+                    if should_requeue {
+                        remesh_ancestors.push((done_dim.clone(), a));
+                    }
+                    anc = a.parent();
+                }
+            }
+        }
+        for (anc_dim, anc_pos) in remesh_ancestors {
+            self.queue(&anc_dim, [anc_pos]);
         }
     }
 }
@@ -619,6 +690,18 @@ pub fn clear_dimension(dim: &str) {
     let mut p = PIPELINE.lock().unwrap();
     p.clear_dimension(dim);
     MESH_WORKER.clear_dim(dim);
+}
+
+/// Retires a departing client's meshes while keeping the integrated server's octree and disk state.
+pub fn forget_gpu_residency(dim: &str) {
+    let mut p = PIPELINE.lock().unwrap();
+    p.forget_gpu_residency(dim);
+    MESH_WORKER.clear_dim(dim);
+}
+
+/// Queues the entering dimension's retained sections for upload; returns how many.
+pub fn requeue_dimension(dim: &str) -> usize {
+    PIPELINE.lock().unwrap().requeue_dimension(dim)
 }
 
 /// Drops the closed world's sections, player positions and queued mesh work.
@@ -821,14 +904,18 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
 }
 
 /// Client tick: bake pending block models, upload the model and biome tables when they grew, then
-/// mesh dirty sections of `dim` into the GPU arena queue.
-pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
+/// mesh dirty sections of the active level into the GPU arena queue.
+pub fn client_tick(host: &mut dyn ClientHost, active_dim: Option<&str>) {
     // Non-blocking lock: if the server thread is ingesting a distant batch, skip this tick rather
     // than stalling the main render thread.
     let Ok(mut guard) = PIPELINE.try_lock() else {
         return;
     };
     let p = &mut *guard;
+    let Some(dim) = active_dim else {
+        p.apply_mesh_completions(None, MESH_WORKER.drain_done(), |_, _| {});
+        return;
+    };
 
     let sprites = AtlasSprites { host };
     let mut baked_now = 0;
@@ -864,47 +951,7 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         return;
     }
 
-    let mut remesh_ancestors: Vec<(String, OctreeSectionPos)> = Vec::new();
-    for (done_dim, pos, epoch, built) in MESH_WORKER.drain_done() {
-        if p.section_epoch.get(&(done_dim.clone(), pos)).copied() != Some(epoch) {
-            continue;
-        }
-        let has_quads = !built.is_empty();
-        let key = (done_dim.clone(), pos.detail, [pos.x, pos.y, pos.z]);
-        submit_built_section(key, built);
-        if !has_quads {
-            // The matching epoch is the newest job for `pos`: an empty result retires the entry.
-            p.section_epoch.remove(&(done_dim.clone(), pos));
-        }
-        let changed = if has_quads {
-            p.rendered.entry(done_dim.clone()).or_default().insert(pos)
-        } else {
-            p.rendered
-                .get_mut(&done_dim)
-                .is_some_and(|live| live.remove(&pos))
-        };
-        if changed {
-            let mut anc = pos.parent();
-            while let Some(a) = anc {
-                let should_requeue = if has_quads {
-                    p.rendered
-                        .get(&done_dim)
-                        .is_some_and(|live| live.contains(&a))
-                } else {
-                    p.stores
-                        .get(&done_dim)
-                        .is_some_and(|s| s.section(a).is_some_and(|sec| !sec.is_empty()))
-                };
-                if should_requeue {
-                    remesh_ancestors.push((done_dim.clone(), a));
-                }
-                anc = a.parent();
-            }
-        }
-    }
-    for (anc_dim, anc_pos) in remesh_ancestors {
-        p.queue(&anc_dim, [anc_pos]);
-    }
+    p.apply_mesh_completions(Some(dim), MESH_WORKER.drain_done(), submit_built_section);
 
     let metas = Arc::clone(&p.meta_snapshot);
     let mut pending = MESH_WORKER.pending_len();
@@ -1437,6 +1484,194 @@ mod tests {
             !is_render_leaf(&store, parent_pos),
             "parent is no longer rendered once a finer child exists"
         );
+    }
+
+    #[test]
+    fn forget_gpu_residency_and_requeue_dimension_preserve_store_and_requeue() {
+        let (overworld, nether) = ("minecraft:overworld", "minecraft:the_nether");
+        let parent = OctreeSectionPos::new(1, 0, 2, 0);
+        let child = parent.children().unwrap()[0];
+        let nether_pos = OctreeSectionPos::new(0, 1, 2, 3);
+        let missing = OctreeSectionPos::new(0, 6, 7, 8);
+        let voxel = Voxel::new(1, 0, 15, 0);
+        let mut p = Pipeline {
+            next_epoch: 10,
+            ..Default::default()
+        };
+        for (dim, positions, live, epoch) in [
+            (overworld, &[child, parent][..], child, 9),
+            (nether, &[nether_pos][..], nether_pos, 10),
+        ] {
+            let store = p.stores.entry(dim.to_owned()).or_default();
+            for &pos in positions {
+                store.adopt_section(OctreeSection::filled(pos, voxel));
+            }
+            p.queue(dim, positions.iter().copied());
+            p.unsaved
+                .insert(dim.to_owned(), positions.iter().copied().collect());
+            p.requested.insert(dim.to_owned(), HashSet::from([missing]));
+            p.rendered.insert(dim.to_owned(), HashSet::from([live]));
+            p.section_epoch.insert((dim.to_owned(), live), epoch);
+        }
+        assert_ne!(covered_rendered_mask(&p.rendered[overworld], parent), 0);
+
+        p.forget_gpu_residency(overworld);
+
+        assert!(!p.dirty.contains_key(overworld));
+        assert!(!p.queued.contains_key(overworld));
+        assert!(!p.rendered.contains_key(overworld));
+        assert_eq!(
+            p.section_epoch,
+            HashMap::from([((nether.to_owned(), nether_pos), 10)])
+        );
+        assert_eq!(p.next_epoch, 10);
+        for (dim, expected) in [
+            (overworld, HashSet::from([child, parent])),
+            (nether, HashSet::from([nether_pos])),
+        ] {
+            let store = &p.stores[dim];
+            assert_eq!(
+                store
+                    .section_positions()
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+            for &pos in &expected {
+                assert_eq!(store.section(pos).unwrap().get(0, 0, 0), voxel);
+            }
+            assert_eq!(p.unsaved[dim], expected);
+            assert_eq!(p.requested[dim], HashSet::from([missing]));
+        }
+        assert_eq!(p.dirty[nether], VecDeque::from([nether_pos]));
+        assert_eq!(p.queued[nether], HashSet::from([nether_pos]));
+        assert_eq!(p.rendered[nether], HashSet::from([nether_pos]));
+
+        assert_eq!(p.requeue_dimension(overworld), 2);
+        assert_eq!(p.dirty[overworld].len(), 2);
+        assert_eq!(
+            p.dirty[overworld].iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([child, parent])
+        );
+        assert_eq!(p.queued[overworld], HashSet::from([child, parent]));
+        let live = p.rendered.entry(overworld.to_owned()).or_default();
+        assert_eq!(covered_rendered_mask(live, parent), 0);
+        assert_eq!(p.requeue_dimension("minecraft:the_end"), 0);
+    }
+
+    fn nonempty_mesh_done(dim: &str, pos: OctreeSectionPos, epoch: u64) -> MeshDone {
+        let mut built = empty_section(pos);
+        built.quads.push(crate::gpu_arena::PackedQuad::default());
+        built.counts[0] = 1;
+        (dim.to_owned(), pos, epoch, built)
+    }
+
+    #[test]
+    fn apply_mesh_completions_requeues_in_flight_parent_after_child_finishes_first() {
+        let overworld = "minecraft:overworld";
+        let parent = OctreeSectionPos::new(1, 0, 2, 0);
+        let child = parent.children().unwrap()[0];
+        let key = |pos: OctreeSectionPos| (overworld.to_owned(), pos.detail, [pos.x, pos.y, pos.z]);
+        let voxel = Voxel::new(1, 0, 15, 0);
+
+        for separate_ticks in [true, false] {
+            // Both jobs were dispatched before either was rendered, so the parent was unmasked.
+            let mut p = Pipeline {
+                next_epoch: 2,
+                section_epoch: HashMap::from([
+                    ((overworld.to_owned(), child), 1),
+                    ((overworld.to_owned(), parent), 2),
+                ]),
+                ..Pipeline::default()
+            };
+            let store = p.stores.entry(overworld.to_owned()).or_default();
+            for pos in [child, parent] {
+                assert!(store.adopt_section(OctreeSection::filled(pos, voxel)));
+            }
+            let child_done = nonempty_mesh_done(overworld, child, 1);
+            let parent_done = nonempty_mesh_done(overworld, parent, 2);
+            let mut submitted = Vec::new();
+            if separate_ticks {
+                p.apply_mesh_completions(Some(overworld), vec![child_done], |key, _| {
+                    submitted.push(key)
+                });
+                assert_eq!(submitted, [key(child)]);
+                assert_eq!(p.rendered[overworld], HashSet::from([child]));
+                assert_eq!(p.dirty[overworld], VecDeque::from([parent]));
+                assert_eq!(p.queued[overworld], HashSet::from([parent]));
+
+                p.apply_mesh_completions(Some(overworld), vec![parent_done], |key, _| {
+                    submitted.push(key)
+                });
+            } else {
+                p.apply_mesh_completions(
+                    Some(overworld),
+                    vec![child_done, parent_done],
+                    |key, _| submitted.push(key),
+                );
+            }
+            assert_eq!(submitted, [key(child), key(parent)]);
+            assert_eq!(p.rendered[overworld], HashSet::from([child, parent]));
+            assert_eq!(p.dirty[overworld], VecDeque::from([parent]));
+            assert_eq!(p.queued[overworld], HashSet::from([parent]));
+            assert_ne!(covered_rendered_mask(&p.rendered[overworld], parent), 0);
+        }
+    }
+
+    #[test]
+    fn apply_mesh_completions_drops_inactive_dimension_and_no_active_level() {
+        let (overworld, nether, end) = (
+            "minecraft:overworld",
+            "minecraft:the_nether",
+            "minecraft:the_end",
+        );
+        let [pos_ow, pos_ne, pos_end, pos_stale] =
+            [1, 2, 3, 4].map(|x| OctreeSectionPos::new(0, x, 0, 0));
+        let mut p = Pipeline {
+            section_epoch: HashMap::from([
+                ((overworld.to_owned(), pos_ow), 1),
+                ((nether.to_owned(), pos_ne), 2),
+                ((end.to_owned(), pos_end), 3),
+                ((nether.to_owned(), pos_stale), 9),
+            ]),
+            ..Default::default()
+        };
+        let mut submitted = Vec::new();
+        p.apply_mesh_completions(
+            Some(nether),
+            vec![
+                nonempty_mesh_done(overworld, pos_ow, 1),
+                nonempty_mesh_done(nether, pos_ne, 2),
+                nonempty_mesh_done(nether, pos_stale, 8),
+            ],
+            |key, _| submitted.push(key),
+        );
+        assert_eq!(
+            submitted,
+            [(
+                nether.to_owned(),
+                pos_ne.detail,
+                [pos_ne.x, pos_ne.y, pos_ne.z]
+            )]
+        );
+        let rendered = HashMap::from([(nether.to_owned(), HashSet::from([pos_ne]))]);
+        assert_eq!(p.rendered, rendered);
+        assert!(
+            !p.section_epoch
+                .contains_key(&(overworld.to_owned(), pos_ow))
+        );
+        assert_eq!(p.section_epoch.get(&(nether.to_owned(), pos_ne)), Some(&2));
+        assert_eq!(
+            p.section_epoch.get(&(nether.to_owned(), pos_stale)),
+            Some(&9)
+        );
+
+        p.apply_mesh_completions(None, vec![nonempty_mesh_done(end, pos_end, 3)], |key, _| {
+            submitted.push(key)
+        });
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(p.rendered, rendered);
+        assert!(!p.section_epoch.contains_key(&(end.to_owned(), pos_end)));
     }
 
     #[test]

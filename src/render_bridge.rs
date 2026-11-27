@@ -565,6 +565,15 @@ fn vanilla_clip_dist(frame: &RenderFrameParams) -> f32 {
 
 /// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
 static PENDING_SECTIONS: Mutex<Vec<(SectionKey, BuiltSection)>> = Mutex::new(Vec::new());
+
+/// One shared GPU geometry arena ([`crate::gpu_arena::VOXY_GEOMETRY_BYTES`], 128 MiB by default)
+/// survives dimension and world changes. Like Voxy's `MixinLevelRenderer.voxy$setWorld`, only
+/// the active world owns arena section slots (flushed to the GPU on the next enabled upload tick).
+/// `RenderResourceReuse` recycles the geometry buffer via `getOrCreateGeometryBuffer` /
+/// `giveBackGeometryBuffer` rather than reallocating VRAM.
+/// Integrated unloads clear the departing dimension's GPU slots and upload residency but keep
+/// its CPU octree for fast re-upload. [`crate::pipeline::client_tick`] admits completions only
+/// for the active live dimension.
 static ARENA: Mutex<Option<ArenaState>> = Mutex::new(None);
 
 /// Identity of an uploaded section: `(dimension, lod level, section position)`.
