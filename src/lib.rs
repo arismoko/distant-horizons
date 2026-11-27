@@ -22,7 +22,7 @@ pub mod gen_worker;
 pub mod gpu_arena;
 pub mod lod;
 pub mod mesh;
-pub mod network;
+pub(crate) mod network;
 pub mod octree;
 pub mod octree_ingest;
 pub(crate) mod pipeline;
