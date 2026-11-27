@@ -41,7 +41,9 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
 - **Public API.** `src/api.rs` offers `LodWorldGenerator` overrides, `RemoteLodProvider` clients,
   column and section submission, `FullDataSourceV2` decoding and cache queries.
 - **Client UI.** Mod settings (`Options > Mods`), `/ds` and `/distantsunrises` client commands,
-  controls keybinds, and F3 debug entries.
+  controls keybinds, and F3 debug entries. Distant Generation Stage offers Surface, Features
+  (the default), and Full + Lighting. An old Distant Generation Mode value is not reused;
+  reselect Surface or Full + Lighting if you prefer either to Features.
 
 ## Differences from the original
 

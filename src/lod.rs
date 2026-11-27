@@ -1,6 +1,6 @@
 //! Distant Sunrises multi-detail-level LOD section store and quadtree selector.
 
-use crate::config::DhConfig;
+use crate::config::{DEFAULT_MAX_EXTRA_SPANS, DhConfig};
 use std::collections::{HashMap, HashSet};
 
 /// Width/depth in cells of one LOD section (`64 x 64`, matching DH `FullDataSourceV2.WIDTH`).
@@ -728,18 +728,9 @@ impl DimensionLodStore {
             .or_insert_with(|| LodSection::new(pos))
     }
 
-    /// Propagate dirty detail `d` updates up to parent detail `d + 1`..=`MAX_DETAIL`.
-    pub fn propagate_up(&mut self, start_pos: SectionPos) -> Vec<SectionPos> {
-        self.propagate_up_with_quality(start_pos, DhConfig::default().max_extra_spans())
-    }
-
     /// Propagate dirty detail `d` updates up to parent detail `d + 1`..=`MAX_DETAIL`, preserving
-    /// up to `max_extra_spans` stacked vertical spans per column.
-    pub fn propagate_up_with_quality(
-        &mut self,
-        start_pos: SectionPos,
-        max_extra_spans: usize,
-    ) -> Vec<SectionPos> {
+    /// up to [`DEFAULT_MAX_EXTRA_SPANS`] stacked vertical spans per column.
+    pub fn propagate_up(&mut self, start_pos: SectionPos) -> Vec<SectionPos> {
         let mut updated = Vec::new();
         let mut cur_pos = start_pos;
         while let Some(parent_pos) = cur_pos.parent() {
@@ -764,8 +755,11 @@ impl DimensionLodStore {
             let mut changed = false;
             for pz in 0..(SECTION_SIZE / 2) {
                 for px in 0..(SECTION_SIZE / 2) {
-                    let (down, down_spans) =
-                        child_tmp.downsample_2x2_with_spans(px * 2, pz * 2, max_extra_spans);
+                    let (down, down_spans) = child_tmp.downsample_2x2_with_spans(
+                        px * 2,
+                        pz * 2,
+                        DEFAULT_MAX_EXTRA_SPANS,
+                    );
                     if !down.is_empty()
                         && parent.set_cell_with_spans(qx + px, qz + pz, down, down_spans)
                     {
