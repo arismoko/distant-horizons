@@ -1,6 +1,6 @@
 id = "distantsunrises"
 name = "Distant Sunrises"
-version = "3.3.6"
+version = "3.3.8"
 description = "Generates and renders simplified level-of-detail terrain beyond the normal view distance."
 authors = [
     "James Seibel",

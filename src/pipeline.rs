@@ -339,6 +339,29 @@ fn has_non_empty_descendant(store: &OctreeIngestStore, pos: OctreeSectionPos) ->
 }
 
 impl Pipeline {
+    /// Queues every stored section of every dimension; returns how many.
+    fn queue_all(&mut self) -> usize {
+        let dims: Vec<String> = self.stores.keys().cloned().collect();
+        let mut queued = 0;
+        for dim in dims {
+            let positions = self.stores[&dim].section_positions();
+            queued += positions.len();
+            self.queue(&dim, positions);
+        }
+        queued
+    }
+
+    /// The GPU arena is gone, so nothing counts as uploaded: drop residency and pre-reset worker
+    /// epochs (their results are discarded), then mesh every stored section again.
+    fn reset_arena_state(&mut self) -> usize {
+        self.rendered.clear();
+        self.section_epoch.clear();
+        self.dirty.clear();
+        self.queued.clear();
+        self.models_dirty = true;
+        self.queue_all()
+    }
+
     fn queue(&mut self, dim: &str, positions: impl IntoIterator<Item = OctreeSectionPos>) {
         let rendered = self.rendered.get(dim);
         let set = self.queued.entry(dim.to_owned()).or_default();
@@ -497,14 +520,18 @@ pub fn invalidate_models() -> usize {
     p.models.clear();
     p.baked = 0;
     p.models_dirty = true;
-    let dims: Vec<String> = p.stores.keys().cloned().collect();
-    let mut queued = 0;
-    for dim in dims {
-        let positions = p.stores[&dim].section_positions();
-        queued += positions.len();
-        p.queue(&dim, positions);
-    }
-    queued
+    p.queue_all()
+}
+
+/// The GPU arena was lost and its sections are gone: forget what was uploaded and mesh every
+/// stored section again. Returns how many sections were queued.
+pub(crate) fn reset_arena_state() -> usize {
+    PIPELINE.lock().unwrap().reset_arena_state()
+}
+
+/// A new arena has empty model, tint and atlas tables: send them again without re-baking.
+pub(crate) fn mark_models_dirty() {
+    PIPELINE.lock().unwrap().models_dirty = true;
 }
 
 const fn face_of(direction: Direction) -> Face {
@@ -1127,5 +1154,41 @@ mod tests {
             !is_render_leaf(&store, parent_pos),
             "parent is no longer rendered once a finer child exists"
         );
+    }
+
+    #[test]
+    fn arena_reset_clears_rendered_and_epochs_before_requeuing() {
+        let dim = "minecraft:overworld";
+        let parent_pos = OctreeSectionPos::new(1, 0, 2, 0);
+        let child_pos = parent_pos.children().unwrap()[0];
+        let mut store = OctreeIngestStore::new();
+        for pos in [child_pos, parent_pos] {
+            let mut section = OctreeSection::new(pos);
+            section.set(0, 0, 0, Voxel::new(1, 0, 15, 0));
+            store.adopt_section(section);
+        }
+        let mut p = Pipeline::default();
+        p.stores.insert(dim.to_owned(), store);
+        p.rendered
+            .entry(dim.to_owned())
+            .or_default()
+            .insert(child_pos);
+        p.section_epoch.insert((dim.to_owned(), parent_pos), 7);
+        p.dirty
+            .entry(dim.to_owned())
+            .or_default()
+            .push_back(child_pos);
+
+        assert_eq!(p.reset_arena_state(), 2);
+
+        assert!(p.rendered.is_empty());
+        assert!(p.section_epoch.is_empty());
+        assert!(p.models_dirty);
+        let queued = &p.queued[dim];
+        assert!(queued.contains(&child_pos) && queued.contains(&parent_pos));
+        assert_eq!(p.dirty[dim].len(), 2);
+        let live = p.rendered.entry(dim.to_owned()).or_default();
+        assert_eq!(covered_rendered_mask(live, parent_pos), 0);
+        assert!(live.insert(child_pos));
     }
 }
