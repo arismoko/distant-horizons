@@ -1449,18 +1449,20 @@ struct OctreeSaveJob {
 
 #[derive(Default)]
 struct IoQueueState {
+    session: u64,
     /// Coalesced pending saves (newest revision per `(world_dir, dimension, pos)` wins).
     pending_saves: HashMap<SaveKey, LodSection>,
     save_order: VecDeque<SaveKey>,
-    pending_loads: VecDeque<(PathBuf, String, SectionPos)>,
+    pending_loads: VecDeque<(u64, PathBuf, String, SectionPos)>,
     /// Coalesced pending octree saves (newest write per `(world_dir, dimension, pos)` wins).
     pending_octree_saves: HashMap<OctreeSaveKey, OctreeSaveJob>,
     octree_save_order: VecDeque<OctreeSaveKey>,
-    pending_octree_loads: VecDeque<OctreeSaveKey>,
-    octree_responses: Vec<OctreeLoaded>,
+    pending_octree_loads: VecDeque<(u64, OctreeSaveKey)>,
+    octree_responses: Vec<(u64, OctreeLoaded)>,
     in_flight: usize,
     shutdown: bool,
-    responses: Vec<IoResponse>,
+    /// Save acknowledgements have no load session.
+    responses: Vec<(Option<u64>, IoResponse)>,
 }
 
 impl IoQueueState {
@@ -1528,7 +1530,9 @@ impl LodIoWorker {
         if st.shutdown {
             return;
         }
-        st.pending_loads.push_back((world_dir, dimension, pos));
+        let session = st.session;
+        st.pending_loads
+            .push_back((session, world_dir, dimension, pos));
         self.shared.wake_worker.notify_one();
     }
 
@@ -1590,14 +1594,33 @@ impl LodIoWorker {
         if st.shutdown {
             return;
         }
+        let session = st.session;
         st.pending_octree_loads
-            .push_back((world_dir, dimension, pos));
+            .push_back((session, (world_dir, dimension, pos)));
         self.shared.wake_worker.notify_one();
+    }
+
+    /// Discard queued loads and buffered load replies without interrupting saves.
+    /// An in-flight load may still finish, but its reply is skipped at drain.
+    pub fn cancel_loads_and_advance_session(&self) {
+        let mut st = self.shared.state.lock().unwrap();
+        st.session = st.session.wrapping_add(1);
+        st.pending_octree_loads.clear();
+        st.pending_loads.clear();
+        st.octree_responses.clear();
+        st.responses.retain(|(session, _)| session.is_none());
+        if st.idle() {
+            self.shared.wake_flusher.notify_all();
+        }
     }
 
     pub fn drain_octree_responses(&self) -> Vec<OctreeLoaded> {
         let mut st = self.shared.state.lock().unwrap();
+        let session = st.session;
         std::mem::take(&mut st.octree_responses)
+            .into_iter()
+            .filter_map(|(entry_session, response)| (entry_session == session).then_some(response))
+            .collect()
     }
 
     /// Block until all currently queued saves and loads have finished and synced to disk.
@@ -1613,7 +1636,15 @@ impl LodIoWorker {
 
     pub fn drain_responses(&self) -> Vec<IoResponse> {
         let mut st = self.shared.state.lock().unwrap();
+        let session = st.session;
         std::mem::take(&mut st.responses)
+            .into_iter()
+            .filter_map(|(entry_session, response)| {
+                entry_session
+                    .is_none_or(|s| s == session)
+                    .then_some(response)
+            })
+            .collect()
     }
 }
 
@@ -1635,9 +1666,9 @@ fn run_io_worker(shared: Arc<IoShared>) {
     loop {
         enum Task {
             Save(PathBuf, String, LodSection),
-            Load(PathBuf, String, SectionPos),
+            Load(u64, PathBuf, String, SectionPos),
             OctreeSave(OctreeSaveKey, OctreeSaveJob),
-            OctreeLoad(OctreeSaveKey),
+            OctreeLoad(u64, OctreeSaveKey),
             Exit,
         }
 
@@ -1650,9 +1681,9 @@ fn run_io_worker(shared: Arc<IoShared>) {
                     st.in_flight += 1;
                     break Task::Save(key.0, key.1, section);
                 }
-                if let Some((world_dir, dim, pos)) = st.pending_loads.pop_front() {
+                if let Some((session, world_dir, dim, pos)) = st.pending_loads.pop_front() {
                     st.in_flight += 1;
-                    break Task::Load(world_dir, dim, pos);
+                    break Task::Load(session, world_dir, dim, pos);
                 }
                 if let Some(key) = st.octree_save_order.pop_front()
                     && let Some(job) = st.pending_octree_saves.remove(&key)
@@ -1660,9 +1691,9 @@ fn run_io_worker(shared: Arc<IoShared>) {
                     st.in_flight += 1;
                     break Task::OctreeSave(key, job);
                 }
-                if let Some(key) = st.pending_octree_loads.pop_front() {
+                if let Some((session, key)) = st.pending_octree_loads.pop_front() {
                     st.in_flight += 1;
-                    break Task::OctreeLoad(key);
+                    break Task::OctreeLoad(session, key);
                 }
                 if st.shutdown {
                     break Task::Exit;
@@ -1690,16 +1721,19 @@ fn run_io_worker(shared: Arc<IoShared>) {
                     shared.wake_flusher.notify_all();
                 }
             }
-            Task::OctreeLoad((world_dir, dimension, pos)) => {
+            Task::OctreeLoad(session, (world_dir, dimension, pos)) => {
                 let loaded = cache.load_octree_section(&world_dir, &dimension, pos);
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
                 if let Some((section, mapping)) = loaded {
-                    st.octree_responses.push(OctreeLoaded {
-                        dimension,
-                        section,
-                        mapping,
-                    });
+                    st.octree_responses.push((
+                        session,
+                        OctreeLoaded {
+                            dimension,
+                            section,
+                            mapping,
+                        },
+                    ));
                 }
                 if st.idle() {
                     shared.wake_flusher.notify_all();
@@ -1716,18 +1750,19 @@ fn run_io_worker(shared: Arc<IoShared>) {
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
                 if res.is_ok() {
-                    st.responses.push(IoResponse::Saved);
+                    st.responses.push((None, IoResponse::Saved));
                 }
                 if st.idle() {
                     shared.wake_flusher.notify_all();
                 }
             }
-            Task::Load(world_dir, dimension, pos) => {
+            Task::Load(session, world_dir, dimension, pos) => {
                 let loaded = cache.load_section(&world_dir, &dimension, pos);
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
                 if let Some(section) = loaded {
-                    st.responses.push(IoResponse::Loaded { dimension, section });
+                    st.responses
+                        .push((Some(session), IoResponse::Loaded { dimension, section }));
                 }
                 if st.idle() {
                     shared.wake_flusher.notify_all();
@@ -1982,6 +2017,172 @@ mod tests {
         mapping.biomes.insert(3, "minecraft:plains".into());
         mapping.biomes.insert(4, "minecraft:forest".into());
         (sec, mapping)
+    }
+
+    #[test]
+    fn session_bump_cancels_queued_loads_while_flushing_old_saves() {
+        let world_a = fresh_tmp_dir("cancel-queued-loads");
+        let dim = "minecraft:overworld";
+        let octree_pos = OctreeSectionPos::new(0, 1, 0, 2);
+        let column_pos = SectionPos::new(0, 1, 2);
+        let (mut octree, mapping) = populated_octree(octree_pos);
+        let mut seed = RegionCache::default();
+        seed.save_octree_section(&world_a, dim, &octree, &mapping, DEFAULT_OCTREE_COMPRESSION)
+            .unwrap();
+        seed.save_section(&world_a, dim, &sample_section(column_pos, 64))
+            .unwrap();
+        drop(seed);
+
+        let worker = LodIoWorker {
+            shared: Arc::new(IoShared {
+                state: Mutex::new(IoQueueState::default()),
+                wake_worker: Condvar::new(),
+                wake_flusher: Condvar::new(),
+            }),
+            handle: Mutex::new(None),
+        };
+        octree.set(4, 4, 4, Voxel::new(2, 3, 9, 9));
+        let column = sample_section(column_pos, 80);
+        worker.save_octree_section(world_a.clone(), dim.into(), octree.clone(), mapping);
+        worker.request_save(world_a.clone(), dim.into(), column.clone());
+        worker.load_octree_section(world_a.clone(), dim.into(), octree_pos);
+        worker.request_load(world_a.clone(), dim.into(), column_pos);
+        {
+            let st = worker.shared.state.lock().unwrap();
+            assert_eq!(st.pending_octree_loads.len(), 1);
+            assert_eq!(st.pending_loads.len(), 1);
+        }
+        worker.cancel_loads_and_advance_session();
+        {
+            let st = worker.shared.state.lock().unwrap();
+            assert!(st.pending_octree_loads.is_empty());
+            assert!(st.pending_loads.is_empty());
+        }
+
+        let shared = Arc::clone(&worker.shared);
+        *worker.handle.lock().unwrap() = Some(thread::spawn(move || run_io_worker(shared)));
+        worker.flush();
+        assert!(worker.drain_octree_responses().is_empty());
+        assert!(matches!(
+            worker.drain_responses().as_slice(),
+            [IoResponse::Saved]
+        ));
+        drop(worker);
+
+        let mut reader = RegionCache::default();
+        let (saved_octree, _) = reader
+            .load_octree_section(&world_a, dim, octree_pos)
+            .unwrap();
+        let saved_column = reader.load_section(&world_a, dim, column_pos).unwrap();
+        assert_eq!(saved_octree.to_dense(), octree.to_dense());
+        assert_eq!(saved_column.columns, column.columns);
+        drop(reader);
+        fs::remove_dir_all(world_a).unwrap();
+    }
+
+    #[test]
+    fn in_flight_load_reply_from_prior_session_is_dropped_at_drain() {
+        let dir = fresh_tmp_dir("filter-stale-loads");
+        let world_a = dir.join("a");
+        let world_b = dir.join("b");
+        let dim = "minecraft:overworld";
+        let octree_pos = OctreeSectionPos::new(0, 1, 0, 2);
+        let column_pos = SectionPos::new(0, 1, 2);
+        let (octree_a, mapping) = populated_octree(octree_pos);
+        let mut octree_b = octree_a.clone();
+        octree_b.set(4, 4, 4, Voxel::new(2, 3, 9, 9));
+        let column_a = sample_section(column_pos, 64);
+        let column_b = sample_section(column_pos, 80);
+
+        let worker = LodIoWorker::spawn();
+        worker.save_octree_section(
+            world_a.clone(),
+            dim.into(),
+            octree_a.clone(),
+            mapping.clone(),
+        );
+        worker.save_octree_section(
+            world_b.clone(),
+            dim.into(),
+            octree_b.clone(),
+            mapping.clone(),
+        );
+        worker.request_save(world_a.clone(), dim.into(), column_a.clone());
+        worker.request_save(world_b.clone(), dim.into(), column_b.clone());
+        worker.flush();
+        worker.load_octree_section(world_a.clone(), dim.into(), octree_pos);
+        worker.request_load(world_a, dim.into(), column_pos);
+        worker.flush();
+
+        let n = {
+            let st = worker.shared.state.lock().unwrap();
+            let n = st.session;
+            assert!(matches!(st.octree_responses.as_slice(), [(session, _)] if *session == n));
+            assert!(matches!(
+                st.responses.as_slice(),
+                [(None, IoResponse::Saved), (None, IoResponse::Saved), (Some(session), IoResponse::Loaded { .. })]
+                    if *session == n
+            ));
+            n
+        };
+        worker.cancel_loads_and_advance_session();
+        {
+            let mut st = worker.shared.state.lock().unwrap();
+            let n1 = st.session;
+            assert_eq!(n1, n.wrapping_add(1));
+            assert!(st.octree_responses.is_empty());
+            assert!(matches!(
+                st.responses.as_slice(),
+                [(None, IoResponse::Saved), (None, IoResponse::Saved)]
+            ));
+
+            // Model replies posted by a load that finished after cancellation.
+            st.octree_responses.push((
+                n,
+                OctreeLoaded {
+                    dimension: dim.into(),
+                    section: octree_a.clone(),
+                    mapping: mapping.clone(),
+                },
+            ));
+            st.responses.push((
+                Some(n),
+                IoResponse::Loaded {
+                    dimension: dim.into(),
+                    section: column_a.clone(),
+                },
+            ));
+            st.responses.push((None, IoResponse::Saved));
+        }
+
+        worker.load_octree_section(world_b.clone(), dim.into(), octree_pos);
+        worker.request_load(world_b, dim.into(), column_pos);
+        worker.flush();
+
+        let octrees = worker.drain_octree_responses();
+        let [loaded] = octrees.as_slice() else {
+            panic!("expected exactly one octree reply");
+        };
+        assert_eq!(loaded.dimension, dim);
+        assert_eq!(loaded.section.to_dense(), octree_b.to_dense());
+        assert_ne!(loaded.section.to_dense(), octree_a.to_dense());
+        assert_eq!(loaded.mapping, mapping);
+
+        let replies = worker.drain_responses();
+        let [
+            IoResponse::Saved,
+            IoResponse::Saved,
+            IoResponse::Saved,
+            IoResponse::Loaded { dimension, section },
+        ] = replies.as_slice()
+        else {
+            panic!("expected three save acknowledgements and one column reply");
+        };
+        assert_eq!(dimension, dim);
+        assert_eq!(section.columns, column_b.columns);
+        assert_ne!(section.columns, column_a.columns);
+        drop(worker);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

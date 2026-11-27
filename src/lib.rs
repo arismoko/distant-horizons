@@ -51,7 +51,7 @@ use mod_api::{
     DebugGroup, EntityRef, Heightmap, Hooks, Host, HostSide, LevelDimension, LevelHost,
     LevelLoadEvent, LevelTickPostEvent, LevelUnloadEvent, RegisterClientCommandsEvent,
     RegisterDebugEntriesEvent, Registrar, RegistrationContext, RenderFogEvent, ServerHost,
-    ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
+    ServerStartedEvent, ServerStoppedEvent, ServerStoppingEvent, SettingChangedEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -376,8 +376,17 @@ impl Hooks for DistantHorizonsMod {
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         let world_dir = host.world_dir();
-        runtime().gen_pool.shutdown_and_join();
+        let rt = runtime();
+        rt.gen_pool.shutdown_and_join();
+        rt.io.cancel_loads_and_advance_session();
         flush_dirty_sections(world_dir);
+    }
+
+    fn server_stopped(&self, _host: &mut dyn ServerHost, _event: &mut ServerStoppedEvent) {
+        // Sunrise's server_lifecycle/mod.rs:21-23, 38-47, 67-95 skips server_stopping on
+        // non-orderly exits (failed init, errored or panicked tick), but always fires
+        // server_stopped at the close boundary before returning to title.
+        runtime().io.cancel_loads_and_advance_session();
     }
 
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
