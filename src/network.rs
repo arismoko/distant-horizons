@@ -1605,8 +1605,16 @@ pub mod octree_sync {
             kind: ExceptionKind,
             message: String,
         },
-        /// A full response without a usable section.
+        /// A full response whose transfer buffer is absent (dropped or expired split bytes).
+        /// Retryable.
         Lost {
+            level: String,
+            pos: OctreeSectionPos,
+        },
+        /// A full response whose assembled buffer failed to decode or rebuild. The server sent
+        /// the same unreadable bytes it would send again, so the client stops asking for `pos`
+        /// for the rest of the play session.
+        Unreadable {
             level: String,
             pos: OctreeSectionPos,
         },
@@ -1723,8 +1731,8 @@ pub mod octree_sync {
                                 Err(err) => {
                                     // The future is already retired. Queue completion even when
                                     // returning the diagnostic to the payload handler so the
-                                    // pipeline can remove its marker.
-                                    events.push(ClientEvent::Lost { level, pos });
+                                    // pipeline can suppress further requests for this key.
+                                    events.push(ClientEvent::Unreadable { level, pos });
                                     return Err(err);
                                 }
                             },
@@ -2013,8 +2021,8 @@ pub mod octree_sync {
 
         #[test]
         fn full_response_without_transfer_queues_lost_and_retires_the_future() {
-            // Covers the real missing-transfer branch only; the decode-error branch is not
-            // exercised because no corrupted packet is crafted.
+            // The absent-buffer branch only; a buffer that fails to decode is Unreadable and
+            // covered by `corrupt_full_response_queues_unreadable_and_retires_the_future`.
             let now = Instant::now();
             let pos = OctreeSectionPos::new(0, 2, 1, -3);
             let mut intake = ClientIntake::default();
@@ -2039,6 +2047,52 @@ pub mod octree_sync {
             assert!(matches!(
                 intake.events.as_slice(),
                 [ClientEvent::Lost { level, pos: lost }] if level == LEVEL && *lost == pos
+            ));
+
+            intake.events.clear();
+            intake.receive(&response, now, || true).unwrap();
+            assert!(intake.events.is_empty(), "a retired future completes once");
+        }
+
+        #[test]
+        fn corrupt_full_response_queues_unreadable_and_retires_the_future() {
+            let now = Instant::now();
+            let pos = OctreeSectionPos::new(0, 2, 1, -3);
+            let mut dto = OctreeSectionDto::from_section(
+                &varied_section(pos, 1),
+                &[],
+                DhV2CompressionMode::Uncompressed,
+                0,
+            )
+            .unwrap();
+            dto.checksum ^= 1;
+            let (payload, buffer) = OctreePayload::new(&dto, Vec::new()).unwrap();
+            let split = Message::Split(SplitMessage {
+                buffer_id: payload.buffer_id,
+                buffer,
+                is_first: true,
+            })
+            .encode()
+            .unwrap();
+            let response = Message::Response(OctreeSectionResponse {
+                future_id: 0,
+                payload: Some(payload),
+            })
+            .encode()
+            .unwrap();
+            let mut intake = ClientIntake::default();
+            assert!(intake.configure(|_| Ok(PayloadAccepted::Queued)));
+            assert!(intake.send_request(LEVEL, pos, None, |_| Ok(PayloadAccepted::Queued)));
+
+            intake.receive(&split, now, || true).unwrap();
+            assert_eq!(
+                intake.receive(&response, now, || true),
+                Err(SyncError::ChecksumMismatch)
+            );
+            assert!(intake.session.pending.is_empty());
+            assert!(matches!(
+                intake.events.as_slice(),
+                [ClientEvent::Unreadable { level, pos: bad }] if level == LEVEL && *bad == pos
             ));
 
             intake.events.clear();
@@ -2349,6 +2403,7 @@ pub mod octree_sync {
                 request_remote_sections(
                     Some(&store),
                     &mut requested,
+                    None,
                     [0.0; 3],
                     0,
                     1,
@@ -2372,6 +2427,7 @@ pub mod octree_sync {
                 request_remote_sections(
                     Some(&store),
                     &mut requested,
+                    None,
                     [0.0; 3],
                     0,
                     1,
@@ -2454,7 +2510,7 @@ pub mod octree_sync {
             intake
                 .session
                 .retain_pending_requests(LEVEL, &mut requested);
-            request_remote_sections(None, &mut requested, [0.0; 3], 0, 1, demand, |key| {
+            request_remote_sections(None, &mut requested, None, [0.0; 3], 0, 1, demand, |key| {
                 assert_ne!(
                     key, pos,
                     "clear must not send a second future for the pending key"
@@ -2491,6 +2547,7 @@ pub mod octree_sync {
             request_remote_sections(
                 Some(&store),
                 &mut queued_marks,
+                None,
                 [0.0; 3],
                 0,
                 1,
@@ -2509,6 +2566,7 @@ pub mod octree_sync {
             request_remote_sections(
                 Some(&store),
                 &mut requested,
+                None,
                 [0.0; 3],
                 0,
                 1,
