@@ -215,28 +215,40 @@ impl DrawIndexedIndirect {
 // CPU allocators
 // ---------------------------------------------------------------------------------------------
 
-/// Address-ordered free list with coalescing, in element units. `free` returns the allocation's
-/// size, as Voxy's `AllocationArena.free` does.
+/// Best-fit free list in element units, following Voxy's `AllocationArena.alloc` size ordering.
+/// Address ordering coalesces adjacent runs without moving live allocations.
 #[derive(Debug)]
 pub struct FreeList {
     capacity: u64,
     free: BTreeMap<u64, u64>,
+    by_size: BTreeSet<(u64, u64)>,
     allocated: HashMap<u64, u64>,
     used: u64,
 }
 
 impl FreeList {
     pub fn new(capacity: u64) -> Self {
-        let mut free = BTreeMap::new();
-        if capacity > 0 {
-            free.insert(0, capacity);
-        }
-        Self {
+        let mut list = Self {
             capacity,
-            free,
+            free: BTreeMap::new(),
+            by_size: BTreeSet::new(),
             allocated: HashMap::new(),
             used: 0,
+        };
+        if capacity > 0 {
+            list.insert_free(0, capacity);
         }
+        list
+    }
+
+    fn insert_free(&mut self, start: u64, len: u64) {
+        self.free.insert(start, len);
+        self.by_size.insert((len, start));
+    }
+
+    fn remove_free(&mut self, start: u64, len: u64) {
+        self.free.remove(&start);
+        self.by_size.remove(&(len, start));
     }
 
     pub fn capacity(&self) -> u64 {
@@ -247,15 +259,15 @@ impl FreeList {
         self.used
     }
 
-    /// First-fit by address. `None` when no free run is large enough.
+    /// Smallest fitting run, with ties by address. `None` if no run is large enough.
     pub fn alloc(&mut self, len: u64) -> Option<u64> {
         if len == 0 {
             return None;
         }
-        let (&start, &run) = self.free.iter().find(|&(_, &run)| run >= len)?;
-        self.free.remove(&start);
+        let (run, start) = self.by_size.range((len, 0)..).next().copied()?;
+        self.remove_free(start, run);
         if run > len {
-            self.free.insert(start + len, run - len);
+            self.insert_free(start + len, run - len);
         }
         self.allocated.insert(start, len);
         self.used += len;
@@ -271,15 +283,15 @@ impl FreeList {
         if let Some((&prev, &prev_len)) = self.free.range(..start).next_back()
             && prev + prev_len == start
         {
-            self.free.remove(&prev);
+            self.remove_free(prev, prev_len);
             new_start = prev;
             new_len += prev_len;
         }
         if let Some(&next_len) = self.free.get(&(start + len)) {
-            self.free.remove(&(start + len));
+            self.remove_free(start + len, next_len);
             new_len += next_len;
         }
-        self.free.insert(new_start, new_len);
+        self.insert_free(new_start, new_len);
         Some(len)
     }
 }
@@ -337,6 +349,8 @@ pub enum ArenaError {
     GeometryFull,
     /// Every section id is in use.
     SectionsFull,
+    /// The rebuilt tree exceeds the GPU node table.
+    NodesFull,
     /// Nothing to upload (Voxy throws on an empty `BuiltSection`).
     EmptySection,
     UnknownSection(u32),
@@ -397,11 +411,11 @@ impl GpuNode {
     }
 }
 
+type NodeTree = (Vec<GpuNode>, Vec<u32>);
+
 /// Builds a compact top-down octree node table (`detail = MAX_OCTREE_DETAIL` roots down to
 /// `detail = 0` leaves) with contiguous 8-child blocks for `voxy_traversal.csh`.
-pub fn build_node_tree(
-    live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
-) -> (Vec<GpuNode>, Vec<u32>) {
+pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) -> NodeTree {
     use crate::octree::{MAX_OCTREE_DETAIL, child_index};
 
     let mut nodes: Vec<GpuNode> = Vec::new();
@@ -490,6 +504,23 @@ pub fn build_node_tree(
     }
 
     (nodes, roots)
+}
+
+fn rebuild_node_tree_if_dirty(
+    nodes_dirty: &mut bool,
+    live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    max_nodes: u64,
+) -> Result<Option<NodeTree>, ArenaError> {
+    if !*nodes_dirty {
+        return Ok(None);
+    }
+    let (nodes, roots) = build_node_tree(live_meta);
+    if (nodes.len() as u64) > max_nodes {
+        // This tree will not fit until section residency changes.
+        *nodes_dirty = false;
+        return Err(ArenaError::NodesFull);
+    }
+    Ok(Some((nodes, roots)))
 }
 
 /// Whole-buffer [`StorageBufferSlice`]s of the arena's bound buffers.
@@ -796,16 +827,9 @@ impl GpuArena {
                 .write_range(&*host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
         }
         self.dirty.clear();
-        if self.nodes_dirty {
-            let (node_list, root_list) = build_node_tree(&self.live_meta);
-            if (node_list.len() as u64) > GPU_MAX_NODES {
-                eprintln!(
-                    "distantsunrises: GPU node tree ({} nodes) exceeds GPU_MAX_NODES ({GPU_MAX_NODES}); skipping node/root upload",
-                    node_list.len()
-                );
-                self.nodes_dirty = false;
-                return Ok(());
-            }
+        if let Some((node_list, root_list)) =
+            rebuild_node_tree_if_dirty(&mut self.nodes_dirty, &self.live_meta, GPU_MAX_NODES)?
+        {
             if !node_list.is_empty() {
                 let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
                 for n in &node_list {
@@ -881,7 +905,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn free_list_first_fit_and_coalesce() {
+    fn free_list_best_fit_and_coalesce() {
         let mut f = FreeList::new(100);
         let a = f.alloc(10).unwrap();
         let b = f.alloc(20).unwrap();
@@ -889,7 +913,7 @@ mod tests {
         assert_eq!((a, b, c), (0, 10, 30));
         assert_eq!(f.used(), 60);
         assert_eq!(f.free(b), Some(20));
-        // Hole of 20 at 10 is reused first-fit.
+        // Hole of 20 at 10 is the smallest run that can fit 15.
         assert_eq!(f.alloc(15), Some(10));
         assert_eq!(f.free(10), Some(15));
         assert_eq!(f.free(a), Some(10));
@@ -899,6 +923,25 @@ mod tests {
         assert_eq!(f.free(0), Some(30));
         assert_eq!(f.used(), 0);
         assert_eq!(f.alloc(100), Some(0));
+    }
+
+    #[test]
+    fn free_list_best_fit_avoids_job5_fragmentation() {
+        let mut f = FreeList::new(93);
+        let large = f.alloc(60).unwrap();
+        let small = std::array::from_fn::<_, 3, _>(|_| {
+            f.alloc(1).unwrap(); // Live guard separating the free runs.
+            f.alloc(10).unwrap()
+        });
+        assert_eq!(f.free(large), Some(60));
+        for start in small {
+            assert_eq!(f.free(start), Some(10));
+        }
+        let placements = std::array::from_fn::<_, 3, _>(|_| f.alloc(10).unwrap());
+        // First-fit would take 0, 10, 20, leaving only 30 contiguous units at the low end.
+        assert_eq!(f.alloc(60), Some(large));
+        assert_eq!(placements, small);
+        assert_eq!(f.used(), f.capacity());
     }
 
     #[test]
@@ -1040,6 +1083,31 @@ mod tests {
         }
         assert_eq!(cur.section_id, 10);
         assert_eq!(unpack_section_pos([cur.pos0, cur.pos1]), (0, [-3, 2, 5]));
+    }
+
+    #[test]
+    fn nodes_full_clears_dirty_until_residency_changes() {
+        let live = HashMap::from([(
+            1,
+            (crate::octree::MAX_OCTREE_DETAIL, [0; 3], SectionAabb::FULL),
+        )]);
+        let mut nodes_dirty = true;
+        assert!(matches!(
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 0),
+            Err(ArenaError::NodesFull)
+        ));
+        assert!(!nodes_dirty);
+        assert!(matches!(
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 0),
+            Ok(None)
+        ));
+
+        nodes_dirty = true;
+        assert!(matches!(
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 1),
+            Ok(Some(_))
+        ));
+        assert!(nodes_dirty);
     }
 
     #[test]
