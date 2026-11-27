@@ -649,7 +649,7 @@ fn sample_loaded_chunks(
     ingest_chunk_snapshots(host, dim, &snapshots, dirty_sections);
 }
 
-/// Converts chunk snapshots (live G1 or saved G3) into LOD columns and spans.
+/// Converts chunk snapshots (live G1 or saved G3) into LOD columns with one solid span and optional fluid.
 fn ingest_chunk_snapshots(
     host: &dyn ServerHost,
     dim: &str,
@@ -660,7 +660,6 @@ fn ingest_chunk_snapshots(
 
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
-    let max_spans = st.config.vertical_quality.clamp(1, 8) as usize;
     let store = st.dimensions.entry(dim.to_owned()).or_default();
 
     for ([cx, cz], snap_opt) in snapshots {
@@ -686,12 +685,10 @@ fn ingest_chunk_snapshots(
                 let y_max = base_y + (LOADED_SCAN_ABOVE as i32);
 
                 let mut fluid_top: Option<i32> = None;
-                // Contiguous vertical solid spans `(top_y, lowest_solid_y, top_block_id)` for
-                // tree canopies, overhangs, and ground underneath (DH `EDhApiVerticalQuality`).
-                let mut solid_spans: Vec<(i32, i32, &str)> = Vec::with_capacity(max_spans);
+                let mut primary_span: Option<(i32, i32, &str)> = None;
                 let mut in_solid_span = false;
 
-                // Scan top-down through the sampled band for surface + vertical spans.
+                // Keep scanning after the first solid span to find the highest fluid block.
                 for y in (y_min..=y_max).rev() {
                     let block_id = match snap.block_state(lx, y, lz) {
                         Some(state) => *block_id_cache
@@ -710,25 +707,18 @@ fn ingest_chunk_snapshots(
                         in_solid_span = false;
                         continue;
                     }
-                    if in_solid_span {
-                        if let Some(last) = solid_spans.last_mut() {
-                            last.1 = y;
+                    match &mut primary_span {
+                        Some(span) if in_solid_span => span.1 = y,
+                        Some(_) => {}
+                        None => {
+                            primary_span = Some((y, y, block_id));
+                            in_solid_span = true;
                         }
-                    } else if solid_spans.len() < max_spans {
-                        solid_spans.push((y, y, block_id));
-                        in_solid_span = true;
                     }
                 }
 
-                let (top_y, primary_bot_y, block_id) = match solid_spans.first().copied() {
-                    Some((ty, by, id)) => {
-                        let bot = if solid_spans.len() > 1 {
-                            by - 1
-                        } else {
-                            (by - 1).min(ty - 8)
-                        };
-                        (ty, bot, id)
-                    }
+                let (top_y, primary_bot_y, block_id) = match primary_span {
+                    Some((ty, by, id)) => (ty, (by - 1).min(ty - 8), id),
                     None => match fluid_top {
                         Some(fy) => (fy - 4, fy - 12, "minecraft:sand"),
                         None => continue,
@@ -771,33 +761,10 @@ fn ingest_chunk_snapshots(
                 .with_fluid_light(fluid_sky, fluid_blk)
                 .with_material(classify_dh_material(block_id));
 
-                let mut extra_spans = Vec::new();
-                for &(s_top, s_bot, s_block) in solid_spans.iter().skip(1) {
-                    let s_biome = snap
-                        .biome(lx, s_top, lz)
-                        .map(|k| k.identifier().as_str())
-                        .unwrap_or(biome_id);
-                    let s_rgb = block_color(s_block, s_biome, 0);
-                    let (s_sky, s_blk) = if snap.has_light() {
-                        snap.light(lx, s_top + 1, lz).unwrap_or((12, 0))
-                    } else {
-                        (12, 0)
-                    };
-                    extra_spans.push(
-                        crate::lod::ExtraSpan::new(s_top, s_bot - 1, s_rgb, s_sky, s_blk, false)
-                            .with_material(classify_dh_material(s_block)),
-                    );
-                }
-
                 let sec_pos = SectionPos::from_block(0, bx, bz);
                 let (cell_x, cell_z) = sec_pos.local_cell(bx, bz);
                 let sec = store.get_or_create_mut(sec_pos);
-                let changed = if extra_spans.is_empty() {
-                    sec.set_cell(cell_x, cell_z, lod_col)
-                } else {
-                    sec.set_cell_with_spans(cell_x, cell_z, lod_col, extra_spans)
-                };
-                if changed {
+                if sec.set_cell(cell_x, cell_z, lod_col) {
                     dirty_sections.insert(sec_pos);
                 }
             }
@@ -1003,11 +970,7 @@ fn sample_distant_sections(
         };
 
         let saved_reader = host.level(dim).and_then(|l| l.saved_chunk_reader(host));
-        let feature_stage = match cfg.distant_generation_mode {
-            2 => Some(mod_api::GenerationStage::Features),
-            3 => Some(mod_api::GenerationStage::Light),
-            _ => None,
-        };
+        let feature_stage = cfg.distant_generation_stage.feature_stage();
         if rt.gen_pool.enqueue(
             dim.to_owned(),
             pos,

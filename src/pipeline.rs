@@ -390,8 +390,6 @@ fn ingest_unpropagated(
     snapshot: &ChunkSnapshot,
     source: SnapshotSource,
 ) -> bool {
-    let cave_cull = (source == SnapshotSource::Distant && dim != "minecraft:the_nether")
-        .then(|| (60, p.mapper.block_named(host, "minecraft:stone")));
     let store = p.stores.entry(dim.to_owned()).or_default();
     let mapper = std::cell::RefCell::new(&mut p.mapper);
     match source {
@@ -414,7 +412,7 @@ fn ingest_unpropagated(
             chunk,
             snapshot,
             crate::octree_ingest::IngestSource::Distant,
-            cave_cull,
+            dim != "minecraft:the_nether", // Cull underground only for non-Nether distant chunks.
             &mut |state| mapper.borrow_mut().block(host, state),
             &mut |biome| mapper.borrow_mut().biome(biome),
         ),
