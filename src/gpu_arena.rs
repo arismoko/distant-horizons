@@ -337,6 +337,8 @@ pub enum ArenaError {
     GeometryFull,
     /// Every section id is in use.
     SectionsFull,
+    /// The rebuilt tree exceeds the GPU node table.
+    NodesFull,
     /// Nothing to upload (Voxy throws on an empty `BuiltSection`).
     EmptySection,
     UnknownSection(u32),
@@ -397,11 +399,11 @@ impl GpuNode {
     }
 }
 
+type NodeTree = (Vec<GpuNode>, Vec<u32>);
+
 /// Builds a compact top-down octree node table (`detail = MAX_OCTREE_DETAIL` roots down to
 /// `detail = 0` leaves) with contiguous 8-child blocks for `voxy_traversal.csh`.
-pub fn build_node_tree(
-    live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
-) -> (Vec<GpuNode>, Vec<u32>) {
+pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) -> NodeTree {
     use crate::octree::{MAX_OCTREE_DETAIL, child_index};
 
     let mut nodes: Vec<GpuNode> = Vec::new();
@@ -490,6 +492,23 @@ pub fn build_node_tree(
     }
 
     (nodes, roots)
+}
+
+fn rebuild_node_tree_if_dirty(
+    nodes_dirty: &mut bool,
+    live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    max_nodes: u64,
+) -> Result<Option<NodeTree>, ArenaError> {
+    if !*nodes_dirty {
+        return Ok(None);
+    }
+    let (nodes, roots) = build_node_tree(live_meta);
+    if (nodes.len() as u64) > max_nodes {
+        // This tree will not fit until section residency changes.
+        *nodes_dirty = false;
+        return Err(ArenaError::NodesFull);
+    }
+    Ok(Some((nodes, roots)))
 }
 
 /// Whole-buffer [`StorageBufferSlice`]s of the arena's bound buffers.
@@ -796,16 +815,9 @@ impl GpuArena {
                 .write_range(&*host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
         }
         self.dirty.clear();
-        if self.nodes_dirty {
-            let (node_list, root_list) = build_node_tree(&self.live_meta);
-            if (node_list.len() as u64) > GPU_MAX_NODES {
-                eprintln!(
-                    "distantsunrises: GPU node tree ({} nodes) exceeds GPU_MAX_NODES ({GPU_MAX_NODES}); skipping node/root upload",
-                    node_list.len()
-                );
-                self.nodes_dirty = false;
-                return Ok(());
-            }
+        if let Some((node_list, root_list)) =
+            rebuild_node_tree_if_dirty(&mut self.nodes_dirty, &self.live_meta, GPU_MAX_NODES)?
+        {
             if !node_list.is_empty() {
                 let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
                 for n in &node_list {
@@ -1040,6 +1052,31 @@ mod tests {
         }
         assert_eq!(cur.section_id, 10);
         assert_eq!(unpack_section_pos([cur.pos0, cur.pos1]), (0, [-3, 2, 5]));
+    }
+
+    #[test]
+    fn nodes_full_clears_dirty_until_residency_changes() {
+        let live = HashMap::from([(
+            1,
+            (crate::octree::MAX_OCTREE_DETAIL, [0; 3], SectionAabb::FULL),
+        )]);
+        let mut nodes_dirty = true;
+        assert!(matches!(
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 0),
+            Err(ArenaError::NodesFull)
+        ));
+        assert!(!nodes_dirty);
+        assert!(matches!(
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 0),
+            Ok(None)
+        ));
+
+        nodes_dirty = true;
+        assert!(matches!(
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 1),
+            Ok(Some(_))
+        ));
+        assert!(nodes_dirty);
     }
 
     #[test]

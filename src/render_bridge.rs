@@ -28,7 +28,7 @@ use std::time::Instant;
 //      pack-linked pipelines (`voxy_pack_*.vsh`) instead of `voxy_quads`.
 // ---------------------------------------------------------------------------------------------
 
-use crate::gpu_arena::{ArenaConfig, BuiltSection, GpuArena};
+use crate::gpu_arena::{ArenaConfig, ArenaError, BuiltSection, GpuArena};
 
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
 pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
@@ -624,7 +624,7 @@ fn create_quad_mesh(
 /// uploads pending sections and flushes metadata. Call from `client_tick_pre`. Errors are logged
 /// through [`report`]; the frame goes on without them.
 pub fn upload_pending(host: &mut dyn mod_api::ClientHost, config: ArenaConfig) {
-    report("arena upload", try_upload_pending(host, config));
+    report_arena("arena upload", try_upload_pending(host, config));
 }
 
 fn try_upload_pending(
@@ -643,8 +643,8 @@ fn try_upload_pending(
     let state = guard.as_mut().unwrap();
     let pending_tables = PENDING_TABLES.lock().unwrap().take();
     if let Some((models, tints, atlas)) = pending_tables {
-        let wrote_models = report("write models", state.arena.write_models(host, 0, &models));
-        let wrote_tints = report(
+        let wrote_models = report_arena("write models", state.arena.write_models(host, 0, &models));
+        let wrote_tints = report_arena(
             "write biome tints",
             state.arena.write_biome_tints(host, 0, &tints),
         );
@@ -676,14 +676,14 @@ fn try_upload_pending(
         let old = state.ids.get(&key).copied();
         if section.is_empty() {
             if let Some(old) = old
-                && report("remove section", state.arena.remove(old)).is_some()
+                && report_arena("remove section", state.arena.remove(old)).is_some()
             {
                 state.ids.remove(&key);
             }
             continue;
         }
         // `upload_replace` keeps the old section live when the new one cannot be stored.
-        if let Some(new) = report(
+        if let Some(new) = report_arena(
             "upload section",
             state.arena.upload_replace(host, old, &section),
         ) {
@@ -695,6 +695,7 @@ fn try_upload_pending(
 
 /// Drops every section of `dimension` (world / dimension change); the buffers stay.
 pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaError> {
+    flush_report_summaries();
     let mut guard = ARENA.lock().unwrap();
     let Some(state) = guard.as_mut() else {
         return Ok(());
@@ -1437,35 +1438,97 @@ pub fn sun_brightness_from_day_time(day_time: i64, dimension: &str) -> f32 {
     sun_brightness_from_day_time_and_weather(day_time, dimension, 0.0, 0.0)
 }
 
-/// Messages logged per `report` call site before it goes quiet.
-const REPORT_LIMIT_PER_SITE: u32 = 20;
+const REPORT_INITIAL_BURST: u64 = 5;
+type ReportCause = (&'static str, &'static str);
 
-/// Counts one more message for `what` and says whether it is still under the per-site limit.
-fn take_report_slot(counts: &mut HashMap<&'static str, u32>, what: &'static str) -> bool {
-    let logged = counts.entry(what).or_insert(0);
-    if *logged < REPORT_LIMIT_PER_SITE {
-        *logged += 1;
-        true
-    } else {
-        false
-    }
+#[derive(Default)]
+struct ReportCount {
+    total: u64,
+    reported: u64,
 }
 
-/// Logs the first few errors of each render call site the frame cannot recover from, then keeps
-/// that site quiet; one noisy site never silences unrelated errors.
-fn report<T, E: std::fmt::Debug>(what: &'static str, result: Result<T, E>) -> Option<T> {
-    static LOGGED: LazyLock<Mutex<HashMap<&'static str, u32>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    match result {
-        Ok(v) => Some(v),
-        Err(e) => {
-            let log = take_report_slot(&mut LOGGED.lock().unwrap_or_else(|p| p.into_inner()), what);
-            if log {
-                eprintln!("distantsunrises: {what} failed: {e:?}");
-            }
+#[derive(Default)]
+struct Reports(HashMap<ReportCause, ReportCount>);
+
+impl Reports {
+    fn record(&mut self, cause: ReportCause) -> Option<(u64, u64)> {
+        let count = self.0.entry(cause).or_default();
+        count.total += 1;
+        let total = count.total;
+        if total <= REPORT_INITIAL_BURST || is_summary_milestone(total) {
+            let suppressed = total - count.reported - 1;
+            count.reported = total;
+            Some((total, suppressed))
+        } else {
             None
         }
     }
+
+    fn flush(&mut self, mut emit: impl FnMut(ReportCause, u64, u64)) {
+        for (&cause, count) in &mut self.0 {
+            if count.total > count.reported {
+                emit(cause, count.total, count.total - count.reported);
+                count.reported = count.total;
+            }
+        }
+    }
+}
+
+fn is_summary_milestone(mut total: u64) -> bool {
+    if total < 10 {
+        return false;
+    }
+    while total.is_multiple_of(10) {
+        total /= 10;
+    }
+    matches!(total, 1 | 2 | 5)
+}
+
+static REPORTS: LazyLock<Mutex<Reports>> = LazyLock::new(|| Mutex::new(Reports::default()));
+
+pub(crate) fn report_warning(
+    what: &'static str,
+    cause: &'static str,
+    detail: std::fmt::Arguments<'_>,
+) {
+    if let Some((total, suppressed)) = REPORTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record((what, cause))
+    {
+        log::warn!(
+            "distantsunrises: {what} ({cause}): {detail}; total={total}, suppressed={suppressed}"
+        );
+    }
+}
+
+/// Reports errors suppressed since the last warning, retaining cumulative totals.
+pub fn flush_report_summaries() {
+    REPORTS.lock().unwrap_or_else(|p| p.into_inner()).flush(|(what, cause), total, suppressed| {
+        log::warn!("distantsunrises: {what} ({cause}): final summary; total={total}, suppressed={suppressed}");
+    });
+}
+
+fn report<T, E: std::fmt::Debug>(what: &'static str, result: Result<T, E>) -> Option<T> {
+    result
+        .inspect_err(|e| report_warning(what, what, format_args!("{e:?}")))
+        .ok()
+}
+
+fn report_arena<T>(what: &'static str, result: Result<T, ArenaError>) -> Option<T> {
+    result
+        .inspect_err(|e| {
+            let cause = match e {
+                ArenaError::GeometryFull => "GeometryFull",
+                ArenaError::SectionsFull => "SectionsFull",
+                ArenaError::NodesFull => "NodesFull",
+                ArenaError::EmptySection => "EmptySection",
+                ArenaError::UnknownSection(_) => "UnknownSection",
+                ArenaError::Buffer(_) => "Buffer",
+            };
+            report_warning(what, cause, format_args!("{e:?}"));
+        })
+        .ok()
 }
 
 #[cfg(test)]
@@ -1473,15 +1536,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn report_limit_is_per_call_site() {
-        let mut counts = HashMap::new();
-        for _ in 0..REPORT_LIMIT_PER_SITE {
-            assert!(take_report_slot(&mut counts, "noisy"));
+    fn reporting_counts_each_site_and_cause_independently() {
+        let mut reports = Reports::default();
+        for total in 1..=REPORT_INITIAL_BURST {
+            assert_eq!(reports.record(("upload", "GeometryFull")), Some((total, 0)));
         }
-        assert!(!take_report_slot(&mut counts, "noisy"));
-        assert!(!take_report_slot(&mut counts, "noisy"));
-        // Another site still logs after "noisy" is silenced.
-        assert!(take_report_slot(&mut counts, "quiet"));
+        assert_eq!(reports.record(("upload", "GeometryFull")), None);
+        assert_eq!(reports.record(("upload", "SectionsFull")), Some((1, 0)));
+        assert_eq!(reports.record(("replace", "GeometryFull")), Some((1, 0)));
+    }
+
+    #[test]
+    fn milestones_follow_the_exact_one_two_five_cadence() {
+        let milestones: Vec<_> = (0..=1000).filter(|&n| is_summary_milestone(n)).collect();
+        assert_eq!(milestones, [10, 20, 50, 100, 200, 500, 1000]);
+    }
+
+    #[test]
+    fn flush_reports_the_final_count_once_between_milestones() {
+        let mut reports = Reports::default();
+        let cause = ("upload", "GeometryFull");
+        for total in 1..=63 {
+            let expected = match total {
+                1..=5 => Some((total, 0)),
+                10 => Some((10, 4)),
+                20 => Some((20, 9)),
+                50 => Some((50, 29)),
+                _ => None,
+            };
+            assert_eq!(reports.record(cause), expected);
+        }
+        let mut flushed = Vec::new();
+        for _ in 0..2 {
+            reports.flush(|key, total, suppressed| flushed.push((key, total, suppressed)));
+        }
+        assert_eq!(flushed, [(cause, 63, 13)]);
     }
 
     #[test]
