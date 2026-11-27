@@ -1237,6 +1237,10 @@ pub mod octree_sync {
             }
         }
 
+        fn reset(&mut self) {
+            self.players.clear();
+        }
+
         pub fn remove_player(&mut self, player: K) {
             self.players.remove(&player);
         }
@@ -1524,6 +1528,11 @@ pub mod octree_sync {
         server_registry().lock().unwrap().remove_player(player);
     }
 
+    /// Forget every player's sync state when the server stops.
+    pub(crate) fn server_reset() {
+        server_registry().lock().unwrap().reset();
+    }
+
     /// Declare the optional raw play channel during `Hooks::register`. Not `droppable`: a dropped
     /// middle chunk would corrupt a buffer.
     pub fn register_payloads(registrar: &mut dyn Registrar) {
@@ -1684,6 +1693,23 @@ pub mod octree_sync {
             fn player_block_xz(&self, _: u32) -> Option<(i32, i32)> {
                 Some((0, 0))
             }
+        }
+
+        #[test]
+        fn server_registry_reset_forgets_registered_player() {
+            let config = SessionConfig {
+                generation_request_rate_limit: 9,
+                ..SessionConfig::default()
+            };
+            let mut registry = ServerSyncRegistry::new(config);
+            let mut player = PlayerSyncState::new(config);
+            player.on_client_config(&config);
+            registry.players.insert(1, player);
+
+            registry.reset();
+
+            assert!(registry.player(1).is_none());
+            assert_eq!(registry.server_config.generation_request_rate_limit, 9);
         }
 
         #[test]

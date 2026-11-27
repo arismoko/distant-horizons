@@ -918,6 +918,42 @@ pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaErr
     result
 }
 
+fn clear_all_pending_and_ids(
+    pending: &mut Vec<(SectionKey, BuiltSection)>,
+    ids: &mut HashMap<SectionKey, u32>,
+    mut remove: impl FnMut(u32) -> Result<(), crate::gpu_arena::ArenaError>,
+) -> Result<(), crate::gpu_arena::ArenaError> {
+    pending.clear();
+    let mut result = Ok(());
+    for (_, id) in ids.drain() {
+        if let Err(e) = remove(id) {
+            result = Err(e);
+        }
+    }
+    result
+}
+
+/// Drops every uploaded and pending section across all dimensions (session logout or remote
+/// level unload); the reusable arena buffers and tables stay.
+pub fn clear_all_sections() -> Result<(), crate::gpu_arena::ArenaError> {
+    flush_report_summaries();
+    let mut guard = ARENA.lock().unwrap();
+    let mut pending = PENDING_SECTIONS.lock().unwrap();
+    let result = match guard.as_mut() {
+        Some(state) => {
+            clear_all_pending_and_ids(&mut pending, &mut state.ids, |id| state.arena.remove(id))
+        }
+        None => {
+            pending.clear();
+            Ok(())
+        }
+    };
+    drop(pending);
+    drop(guard);
+    clear_frame_stats();
+    result
+}
+
 static FRAME_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The frame's parameters, set by [`begin_frame`] in `prepare_render_buffers`.
@@ -1561,6 +1597,56 @@ impl Default for DhState {
     }
 }
 
+impl DhState {
+    pub fn clear_dimension_server_state(&mut self, dimension: &str) {
+        self.dimensions.remove(dimension);
+        self.pending_chunks.remove(dimension);
+        self.pending_chunk_set.remove(dimension);
+        self.server_player_round_robin.remove(dimension);
+        self.next_distant_sample.remove(dimension);
+        self.desired_cache.retain(|(dim, _), _| dim != dimension);
+    }
+
+    pub fn clear_server_world_state(&mut self) {
+        self.world_dir = None;
+        self.dimensions.clear();
+        self.desired_cache.clear();
+        self.pending_chunks.clear();
+        self.pending_chunk_set.clear();
+        self.server_player_round_robin.clear();
+        self.next_distant_sample.clear();
+    }
+
+    pub fn clear_client_session_state(&mut self) {
+        self.camera = None;
+        self.has_camera = false;
+        self.client_loaded_chunks.clear();
+        self.remote_requested.clear();
+    }
+
+    fn adopt_io_responses(&mut self, responses: Vec<IoResponse>) -> u64 {
+        let mut saved = 0;
+        for res in responses {
+            match res {
+                IoResponse::Saved => saved += 1,
+                IoResponse::Loaded { dimension, section } => {
+                    let Some(dim) = self.dimensions.get_mut(&dimension) else {
+                        continue;
+                    };
+                    let newer = dim
+                        .sections
+                        .get(&section.pos)
+                        .is_none_or(|existing| existing.populated < section.populated);
+                    if newer {
+                        dim.sections.insert(section.pos, section);
+                    }
+                }
+            }
+        }
+        saved
+    }
+}
+
 static RUNTIME: OnceLock<Arc<DhRuntime>> = OnceLock::new();
 
 pub fn runtime() -> &'static Arc<DhRuntime> {
@@ -1581,28 +1667,15 @@ pub fn runtime() -> &'static Arc<DhRuntime> {
 /// Drains background IO results into the section store and returns this frame's parameters.
 pub fn begin_render_frame(camera: [f64; 3]) -> RenderFrameParams {
     let rt = runtime();
-    let io_responses = rt.io.drain_responses();
-
     let mut st = rt.inner.lock().unwrap();
     st.camera_pos = camera;
     st.has_camera = true;
 
-    for res in io_responses {
-        match res {
-            IoResponse::Saved => {
-                rt.saved_sections.fetch_add(1, Ordering::Relaxed);
-            }
-            IoResponse::Loaded { dimension, section } => {
-                let dim = st.dimensions.entry(dimension).or_default();
-                let newer = dim
-                    .sections
-                    .get(&section.pos)
-                    .is_none_or(|existing| existing.populated < section.populated);
-                if newer {
-                    dim.sections.insert(section.pos, section);
-                }
-            }
-        }
+    // Drain under rt.inner, matching close's lock order, so a pre-bump reply cannot
+    // repopulate retired state. Adoption drops replies for unloaded dimensions.
+    let saved = st.adopt_io_responses(rt.io.drain_responses());
+    if saved > 0 {
+        rt.saved_sections.fetch_add(saved, Ordering::Relaxed);
     }
 
     RenderFrameParams {
@@ -1785,6 +1858,161 @@ mod tests {
     use mod_api::BufferError;
     use std::cell::Cell;
 
+    #[test]
+    fn dh_state_clears_dimension_world_and_client_session_state_preserving_api_hooks() {
+        use crate::api::{LodGenOutput, LodGenRequest, LodSectionPos};
+
+        struct Hooks;
+        impl LodWorldGenerator for Hooks {
+            fn generate(&self, _: &LodGenRequest, _: &mut dyn FnMut(LodGenOutput)) {}
+        }
+        impl RemoteLodProvider for Hooks {
+            fn request_section(&self, _: &str, _: LodSectionPos, _: i64) {}
+        }
+
+        let config = DhConfig {
+            enabled: false,
+            ..DhConfig::default()
+        };
+        let (unloaded, active) = ("test:unloaded", "test:active");
+        let camera = CameraMatrices {
+            position: [1.0, 2.0, 3.0],
+            yaw: 30.0,
+            pitch: 20.0,
+            fov_degrees: 70.0,
+            near: 0.1,
+            far: 100.0,
+            view: [0.0; 16],
+            projection: [0.0; 16],
+        };
+        let path = PathBuf::from("test-world");
+        let pos = SectionPos::new(0, 0, 0);
+        let chunks = HashSet::from([[2, 3]]);
+        let mut st = DhState {
+            config,
+            world_dir: Some(path.clone()),
+            active_dimension: active.into(),
+            camera: Some(camera),
+            camera_pos: camera.position,
+            has_camera: true,
+            fog_color: [0.1, 0.2, 0.3, 1.0],
+            vanilla_far_blocks: 512.0,
+            sun_brightness: 0.5,
+            rain_level: 0.25,
+            thunder_level: 0.75,
+            vanilla_render_distance_chunks: 32,
+            client_loaded_chunks: chunks.clone(),
+            ..DhState::default()
+        };
+        let generator: Arc<dyn LodWorldGenerator> = Arc::new(Hooks);
+        let provider: Arc<dyn RemoteLodProvider> = Arc::new(Hooks);
+        for dim in [unloaded, active].map(str::to_owned) {
+            st.dimensions.entry(dim.clone()).or_default();
+            st.pending_chunks
+                .insert(dim.clone(), chunks.iter().copied().collect());
+            st.pending_chunk_set.insert(dim.clone(), chunks.clone());
+            st.server_player_round_robin.insert(dim.clone(), 3);
+            st.next_distant_sample.insert(dim.clone(), Instant::now());
+            st.desired_cache.insert(
+                (dim.clone(), 0),
+                DesiredCache {
+                    center: [2, 3],
+                    config,
+                    list: vec![pos],
+                    disk_cursor: 1,
+                    sample_cursor: 0,
+                },
+            );
+            st.world_generators.insert(dim.clone(), generator.clone());
+            st.remote_providers.insert(dim.clone(), provider.clone());
+            st.disabled_builtin_gen.insert(dim.clone());
+            st.disabled_builtin_net.insert(dim.clone());
+            st.remote_requested.insert(dim, HashSet::from([pos]));
+        }
+
+        fn keys<V>(map: &HashMap<String, V>) -> Vec<&str> {
+            map.keys().map(String::as_str).collect()
+        }
+
+        st.clear_dimension_server_state(unloaded);
+        for expected in [Some(active), None] {
+            assert_eq!(st.world_dir.as_deref(), expected.map(|_| path.as_path()));
+            for actual in [
+                keys(&st.dimensions),
+                keys(&st.pending_chunks),
+                keys(&st.pending_chunk_set),
+                keys(&st.server_player_round_robin),
+                keys(&st.next_distant_sample),
+                st.desired_cache
+                    .keys()
+                    .map(|(dim, _)| dim.as_str())
+                    .collect(),
+            ] {
+                assert!(actual.into_iter().eq(expected));
+            }
+            assert_eq!(st.camera, Some(camera));
+            assert!(st.has_camera);
+            assert_eq!(st.client_loaded_chunks, chunks);
+            for dim in [active, unloaded] {
+                assert_eq!(st.remote_requested[dim], HashSet::from([pos]));
+            }
+            if expected.is_some() {
+                st.clear_server_world_state();
+            }
+        }
+        st.clear_client_session_state();
+        assert!(!st.has_camera);
+        assert!(st.camera.is_none());
+        assert!(st.client_loaded_chunks.is_empty());
+        assert!(st.remote_requested.is_empty());
+        assert_eq!(st.config, config);
+        assert_eq!(st.active_dimension, active);
+        assert_eq!(st.camera_pos, camera.position);
+        assert_eq!(st.fog_color, [0.1, 0.2, 0.3, 1.0]);
+        assert_eq!(st.vanilla_far_blocks, 512.0);
+        assert_eq!(st.sun_brightness, 0.5);
+        assert_eq!((st.rain_level, st.thunder_level), (0.25, 0.75));
+        assert_eq!(st.vanilla_render_distance_chunks, 32);
+        for dim in [unloaded, active] {
+            assert!(Arc::ptr_eq(&st.world_generators[dim], &generator));
+            assert!(Arc::ptr_eq(&st.remote_providers[dim], &provider));
+            assert!(st.disabled_builtin_gen.contains(dim));
+            assert!(st.disabled_builtin_net.contains(dim));
+        }
+    }
+
+    #[test]
+    fn adopt_io_responses_drops_loaded_section_for_unloaded_dimension() {
+        use crate::lod::LodSection;
+
+        let (reopened, active) = ("custom:reopened", "minecraft:overworld");
+        let pos = SectionPos::new(0, 0, 0);
+        let dir = crate::storage::fresh_tmp_dir("reopen-column-store");
+        let io = LodIoWorker::spawn();
+        let mut st = DhState::default();
+        for dim in [reopened, active] {
+            st.dimensions.entry(dim.into()).or_default();
+            io.request_save(dir.clone(), dim.into(), LodSection::new(pos));
+            io.request_load(dir.clone(), dim.into(), pos);
+        }
+        io.flush();
+        st.clear_dimension_server_state(reopened);
+        st.adopt_io_responses(vec![IoResponse::Loaded {
+            dimension: reopened.into(),
+            section: LodSection::new(pos),
+        }]);
+        assert!(!st.dimensions.contains_key(reopened));
+
+        io.discard_dimension_load_replies(reopened);
+        st.dimensions.entry(reopened.into()).or_default();
+        let saved = st.adopt_io_responses(io.drain_responses());
+        drop(io);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(saved, 2);
+        assert!(st.dimensions[reopened].sections.is_empty());
+        assert!(st.dimensions[active].sections.contains_key(&pos));
+    }
+
     fn tables() -> Tables {
         (vec![1, 2], vec![3], vec![4, 5, 6])
     }
@@ -1933,6 +2161,33 @@ mod tests {
         let mut slot = Some(newer.clone());
         restore_tables_if_empty(&mut slot, tables());
         assert_eq!(slot, Some(newer));
+    }
+
+    #[test]
+    fn clear_all_pending_and_ids_retires_every_dimension() {
+        let overworld = key("minecraft:overworld");
+        let nether = key("minecraft:the_nether");
+        let mut pending = vec![(overworld.clone(), mesh()), (nether.clone(), mesh())];
+        let mut ids = HashMap::from([(overworld, 1), (nether, 2)]);
+        let mut attempted = Vec::new();
+
+        let result = clear_all_pending_and_ids(&mut pending, &mut ids, |id| {
+            attempted.push(id);
+            // Fail the first removal regardless of the map's iteration order.
+            if attempted.len() == 1 {
+                Err(ArenaError::UnknownSection(id))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(pending.is_empty());
+        assert!(ids.is_empty());
+        assert!(
+            matches!(result, Err(ArenaError::UnknownSection(id)) if Some(&id) == attempted.first())
+        );
+        attempted.sort_unstable();
+        assert_eq!(attempted, [1, 2]);
     }
 
     #[test]

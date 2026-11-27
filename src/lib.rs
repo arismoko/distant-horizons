@@ -145,7 +145,18 @@ impl Hooks for DistantHorizonsMod {
         host: &mut dyn ClientHost,
         _event: &mut mod_api::ClientPlayerLoggingOutEvent,
     ) {
+        let _ = render_bridge::clear_all_sections();
         render_bridge::drop_quad_mesh(host);
+        network::octree_sync::client_reset();
+        let is_remote = is_remote_client(host);
+        if is_remote {
+            pipeline::clear_all();
+        }
+        let mut st = runtime().inner.lock().unwrap();
+        if is_remote {
+            st.dimensions.clear();
+        }
+        st.clear_client_session_state();
     }
 
     fn register_client_commands(
@@ -194,14 +205,29 @@ impl Hooks for DistantHorizonsMod {
 
     fn client_level_unload(
         &self,
-        _host: &mut dyn ClientHost,
+        host: &mut dyn ClientHost,
         event: &mut ClientLevelUnloadEvent<'_>,
     ) {
-        let _ = render_bridge::clear_dimension(event.dimension);
+        let is_remote = is_remote_client(host);
+        if is_remote {
+            let _ = render_bridge::clear_all_sections();
+        } else {
+            let _ = render_bridge::clear_dimension(event.dimension);
+        }
         network::octree_sync::client_reset();
+        if is_remote {
+            pipeline::clear_all();
+        }
         let mut st = runtime().inner.lock().unwrap();
-        st.remote_requested.remove(event.dimension);
-        st.client_loaded_chunks.clear();
+        if is_remote {
+            st.dimensions.clear();
+            st.clear_client_session_state();
+        } else {
+            st.camera = None;
+            st.has_camera = false;
+            st.remote_requested.remove(event.dimension);
+            st.client_loaded_chunks.clear();
+        }
     }
 
     fn client_chunk_load(&self, host: &mut dyn ClientHost, event: &mut ClientChunkLoadEvent<'_>) {
@@ -258,7 +284,8 @@ impl Hooks for DistantHorizonsMod {
             kb.poll(host);
         }
 
-        let cam = host.camera();
+        // Don't publish a camera from menu ticks when play is obstructed.
+        let cam = host.playing().then(|| host.camera()).flatten();
         let clock = host.clock();
         let gfx_opts = host.graphics_options();
         let active_dim_now = rt.inner.lock().unwrap().active_dimension.clone();
@@ -383,10 +410,12 @@ impl Hooks for DistantHorizonsMod {
     }
 
     fn server_stopped(&self, _host: &mut dyn ServerHost, _event: &mut ServerStoppedEvent) {
-        // Sunrise's server_lifecycle/mod.rs:21-23, 38-47, 67-95 skips server_stopping on
-        // non-orderly exits (failed init, errored or panicked tick), but always fires
-        // server_stopped at the close boundary before returning to title.
-        runtime().io.cancel_loads_and_advance_session();
+        // In Dev 2, server_lifecycle/mod.rs:21-23, 38-47, 67-95 skips server_stopping on
+        // failed init or an errored or panicked tick. A whole-world save failure can skip the
+        // per-level close loop (server_lifecycle/mod.rs:239-289), and a per-level save.flush()
+        // failure skips level_unload (world/levels.rs:2100-2134). server_stopped always fires
+        // after server teardown.
+        clear_closed_world_state();
     }
 
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
@@ -401,9 +430,15 @@ impl Hooks for DistantHorizonsMod {
 
     fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
         let world_dir = host.world_dir();
-        runtime().gen_pool.reset_dimension(event.dimension);
-        pipeline::clear_dimension(event.dimension);
+        let rt = runtime();
+        rt.gen_pool.reset_dimension(event.dimension);
         flush_dirty_sections(world_dir);
+        pipeline::clear_dimension(event.dimension);
+        {
+            let mut st = rt.inner.lock().unwrap();
+            rt.io.discard_dimension_load_replies(event.dimension);
+            st.clear_dimension_server_state(event.dimension);
+        }
     }
 
     fn chunk_load(&self, host: &mut dyn ServerHost, event: &mut ChunkLoadEvent<'_>) {
@@ -436,14 +471,17 @@ impl Hooks for DistantHorizonsMod {
     }
 }
 
+fn is_remote_client(host: &dyn ClientHost) -> bool {
+    host.client_session()
+        .client_server()
+        .is_some_and(|s| !s.integrated_local)
+}
+
 /// Client side of `octree_sync` on a remote server: send our config once, then ask for the
 /// sections around the camera and adopt what comes back.
 fn poll_remote_octree(host: &mut dyn ClientHost) {
-    let is_remote = host
-        .client_session()
-        .client_server()
-        .is_some_and(|s| !s.integrated_local);
-    if !is_remote || !host.has_channel(&network::octree_sync::octree_sync_channel_id()) {
+    if !is_remote_client(host) || !host.has_channel(&network::octree_sync::octree_sync_channel_id())
+    {
         return;
     }
     let (enabled, dim, camera) = {
@@ -1136,11 +1174,23 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
     }
 }
 
+/// Retires all world-owned server caches and workers at the world close boundary.
+fn clear_closed_world_state() {
+    let rt = runtime();
+    rt.gen_pool.shutdown_and_join();
+    {
+        let mut st = rt.inner.lock().unwrap();
+        rt.io.cancel_loads_and_advance_session();
+        st.clear_server_world_state();
+    }
+    pipeline::clear_all();
+    network::octree_sync::server_reset();
+}
+
 fn flush_dirty_sections(world_dir: Option<std::path::PathBuf>) {
     let rt = runtime();
-    let Some(dir) = world_dir.or_else(|| rt.inner.lock().unwrap().world_dir.clone()) else {
-        return;
-    };
-    while pipeline::flush_saves(&rt.io, &dir, usize::MAX) > 0 {}
+    if let Some(dir) = world_dir.or_else(|| rt.inner.lock().unwrap().world_dir.clone()) {
+        while pipeline::flush_saves(&rt.io, &dir, usize::MAX) > 0 {}
+    }
     rt.io.flush();
 }

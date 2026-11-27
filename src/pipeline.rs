@@ -16,7 +16,7 @@ use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
 use crate::octree_ingest::DistantColumn;
 use crate::octree_ingest::{OctreeIngestStore, ingest_chunk_snapshot, ingest_saved_chunk};
 use crate::render_bridge::submit_built_section;
-use crate::storage::{DEFAULT_OCTREE_COMPRESSION, LodIoWorker, OctreeMapping};
+use crate::storage::{DEFAULT_OCTREE_COMPRESSION, LodIoWorker, OctreeLoaded, OctreeMapping};
 use mod_api::{
     BlockKey, BlockState, ChunkSnapshot, ClientHost, Direction, Host, HostBlockStates, PlayerRef,
     ServerHost, TerrainColumn,
@@ -255,6 +255,11 @@ impl MeshWorker {
         self.done.lock().unwrap().retain(|(d, _, _, _)| d != dim);
     }
 
+    fn clear_all(&self) {
+        self.queue.0.lock().unwrap().clear();
+        self.done.lock().unwrap().clear();
+    }
+
     fn drain_done(&self) -> Vec<MeshDone> {
         std::mem::take(&mut *self.done.lock().unwrap())
     }
@@ -339,6 +344,67 @@ fn has_non_empty_descendant(store: &OctreeIngestStore, pos: OctreeSectionPos) ->
 }
 
 impl Pipeline {
+    fn clear_dimension(&mut self, dim: &str) {
+        self.stores.remove(dim);
+        self.dirty.remove(dim);
+        self.queued.remove(dim);
+        self.section_epoch.retain(|(d, _), _| d != dim);
+        self.rendered.remove(dim);
+        self.unsaved.remove(dim);
+        self.requested.remove(dim);
+    }
+
+    fn clear_all(&mut self) {
+        self.stores.clear();
+        self.dirty.clear();
+        self.queued.clear();
+        self.section_epoch.clear();
+        self.rendered.clear();
+        self.unsaved.clear();
+        self.requested.clear();
+        // Keep next_epoch so a mesh still in flight cannot match a reopened world's section.
+    }
+
+    fn flush_saves(&mut self, io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
+        let mut queued = 0;
+        for (dim, set) in self.unsaved.iter_mut() {
+            let Some(store) = self.stores.get(dim) else {
+                set.clear();
+                continue;
+            };
+            while queued < limit {
+                let Some(&pos) = set.iter().next() else { break };
+                set.remove(&pos);
+                let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let (_, mapping) = self.mapper.mapping_of(section);
+                io.save_octree_section(world_dir.to_owned(), dim.clone(), section.clone(), mapping);
+                queued += 1;
+            }
+        }
+        queued
+    }
+
+    fn adopt_loaded_entries(
+        &mut self,
+        loaded: Vec<OctreeLoaded>,
+        is_loaded: impl Fn(&str) -> bool,
+        mut remap: impl FnMut(&mut Mapper, &OctreeSection, &OctreeMapping) -> OctreeSection,
+    ) {
+        for l in loaded {
+            if !is_loaded(&l.dimension) {
+                continue;
+            }
+            let section = remap(&mut self.mapper, &l.section, &l.mapping);
+            let pos = section.pos;
+            let store = self.stores.entry(l.dimension.clone()).or_default();
+            if store.adopt_section(section) {
+                self.queue(&l.dimension, [pos]);
+            }
+        }
+    }
+
     /// Queues every stored section of every dimension; returns how many.
     fn queue_all(&mut self) -> usize {
         let dims: Vec<String> = self.stores.keys().cloned().collect();
@@ -502,15 +568,19 @@ pub fn ingest_chunks_batch(
 
 /// Drops every section of `dim` (level unload).
 pub fn clear_dimension(dim: &str) {
-    MESH_WORKER.clear_dim(dim);
     let mut p = PIPELINE.lock().unwrap();
-    p.stores.remove(dim);
-    p.dirty.remove(dim);
-    p.queued.remove(dim);
-    p.section_epoch.retain(|(d, _), _| d != dim);
-    p.rendered.remove(dim);
-    p.unsaved.remove(dim);
-    p.requested.remove(dim);
+    p.clear_dimension(dim);
+    MESH_WORKER.clear_dim(dim);
+}
+
+/// Drops the closed world's sections, player positions and queued mesh work.
+pub fn clear_all() {
+    {
+        let mut p = PIPELINE.lock().unwrap();
+        p.clear_all();
+        MESH_WORKER.clear_all();
+    }
+    PLAYER_XZ.lock().unwrap().clear();
 }
 
 /// A resource reload, shader-pack change or `/ds remesh` invalidates every baked model: bake them
@@ -920,26 +990,7 @@ pub fn ingest_distant(
 /// Hand up to `limit` changed sections of every dimension to the I/O worker (it coalesces newer
 /// saves of one section). Returns how many were queued.
 pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
-    let mut queued = 0;
-    for (dim, set) in p.unsaved.iter_mut() {
-        let Some(store) = p.stores.get(dim) else {
-            set.clear();
-            continue;
-        };
-        while queued < limit {
-            let Some(&pos) = set.iter().next() else { break };
-            set.remove(&pos);
-            let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
-                continue;
-            };
-            let (_, mapping) = p.mapper.mapping_of(section);
-            io.save_octree_section(world_dir.to_owned(), dim.clone(), section.clone(), mapping);
-            queued += 1;
-        }
-    }
-    queued
+    PIPELINE.lock().unwrap().flush_saves(io, world_dir, limit)
 }
 
 /// Ask disk (single player and server) for stored sections around `center` that the store does not
@@ -983,26 +1034,16 @@ pub fn request_stored_sections(
 }
 
 /// Adopt sections the I/O worker finished loading, translating their ids to this session's.
-pub fn adopt_loaded(host: &dyn Host, io: &LodIoWorker) {
+pub fn adopt_loaded(host: &dyn ServerHost, io: &LodIoWorker) {
     let loaded = io.drain_octree_responses();
     if loaded.is_empty() {
         return;
     }
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
-    for l in loaded {
-        let section = p
-            .mapper
-            .remap(host, &l.section, &l.mapping.blocks, &l.mapping.biomes);
-        let pos = section.pos;
-        if p.stores
-            .entry(l.dimension.clone())
-            .or_default()
-            .adopt_section(section)
-        {
-            p.queue(&l.dimension, [pos]);
-        }
-    }
+    PIPELINE.lock().unwrap().adopt_loaded_entries(
+        loaded,
+        |dim| host.level(dim).is_some(),
+        |mapper, section, mapping| mapper.remap(host, section, &mapping.blocks, &mapping.biomes),
+    );
 }
 
 /// Client side of `octree_sync`: adopt what the server sent and ask for sections around `center`
@@ -1129,6 +1170,92 @@ pub fn install_sync_source() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_saves_before_clear_dimension_persists_dirty_octree_section() {
+        use crate::storage::{RegionCache, fresh_tmp_dir};
+
+        let dir = fresh_tmp_dir("unload-flush");
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        let pos = OctreeSectionPos::new(0, 1, 2, 3);
+        let voxel = Voxel::new(1, 0, 15, 0);
+        let mut section = OctreeSection::new(pos);
+        section.set(0, 0, 0, voxel);
+        let (saved, discarded) = ("test:saved", "test:discarded");
+        for dim in [saved, discarded] {
+            let store = p.stores.entry(dim.into()).or_default();
+            store.adopt_section(section.clone());
+            p.unsaved.insert(dim.into(), HashSet::from([pos]));
+        }
+        p.clear_dimension(discarded);
+        let queued = p.flush_saves(&io, &dir, usize::MAX);
+        p.clear_dimension(saved);
+        io.flush();
+        drop(io);
+        let [kept, lost] = [saved, discarded]
+            .map(|dim| RegionCache::default().load_octree_section(&dir, dim, pos));
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(queued, 1);
+        assert_eq!(kept.unwrap().0.get(0, 0, 0), voxel);
+        assert!(lost.is_none());
+    }
+
+    #[test]
+    fn clear_all_retires_all_world_maps_and_keeps_process_state() {
+        let mut p = Pipeline {
+            next_epoch: 7,
+            baked: 2,
+            models_dirty: true,
+            ..Default::default()
+        };
+        let pos = OctreeSectionPos::new(0, 1, 2, 3);
+        for dim in ["test:a", "test:b"] {
+            p.stores.insert(dim.into(), OctreeIngestStore::default());
+            p.queue(dim, [pos]);
+            p.section_epoch.insert((dim.into(), pos), 7);
+            p.rendered.insert(dim.into(), HashSet::from([pos]));
+            p.unsaved.insert(dim.into(), HashSet::from([pos]));
+            p.requested.insert(dim.into(), HashSet::from([pos]));
+        }
+        p.clear_all();
+        assert!(p.stores.is_empty());
+        assert!(p.dirty.is_empty());
+        assert!(p.queued.is_empty());
+        assert!(p.section_epoch.is_empty());
+        assert!(p.rendered.is_empty());
+        assert!(p.unsaved.is_empty());
+        assert!(p.requested.is_empty());
+        assert_eq!((p.next_epoch, p.baked, p.models_dirty), (7, 2, true));
+    }
+
+    #[test]
+    fn adopt_loaded_entries_drops_unloaded_dimension_without_recreating_store() {
+        let (unloaded, loaded) = ("test:unloaded", "test:loaded");
+        let pos = OctreeSectionPos::new(0, 1, 2, 3);
+        let entries = [unloaded, loaded].map(|dim| OctreeLoaded {
+            dimension: dim.into(),
+            section: OctreeSection::new(pos),
+            mapping: OctreeMapping::default(),
+        });
+        let mut p = Pipeline::default();
+        let mut remaps = 0;
+        p.adopt_loaded_entries(
+            entries.into(),
+            |dim| dim == loaded,
+            |_, section, _| {
+                remaps += 1;
+                section.clone()
+            },
+        );
+        assert_eq!(remaps, 1);
+        assert!(!p.stores.contains_key(unloaded));
+        assert!(!p.dirty.contains_key(unloaded));
+        assert!(!p.queued.contains_key(unloaded));
+        assert!(p.stores[loaded].section(pos).is_some());
+        assert_eq!(p.dirty[loaded], VecDeque::from([pos]));
+        assert_eq!(p.queued[loaded], HashSet::from([pos]));
+    }
 
     #[test]
     fn leaf_selection_never_renders_parent_alongside_non_empty_child() {

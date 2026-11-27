@@ -1614,6 +1614,17 @@ impl LodIoWorker {
         }
     }
 
+    /// Drops buffered load replies for `dimension` after an idle flush, preserving other
+    /// dimensions' replies and all saves and save acknowledgements.
+    pub(crate) fn discard_dimension_load_replies(&self, dimension: &str) {
+        let mut st = self.shared.state.lock().unwrap();
+        st.octree_responses
+            .retain(|(_, r)| r.dimension != dimension);
+        st.responses.retain(
+            |(_, r)| !matches!(r, IoResponse::Loaded { dimension: dim, .. } if dim == dimension),
+        );
+    }
+
     pub fn drain_octree_responses(&self) -> Vec<OctreeLoaded> {
         let mut st = self.shared.state.lock().unwrap();
         let session = st.session;
@@ -1773,6 +1784,19 @@ fn run_io_worker(shared: Arc<IoShared>) {
 }
 
 #[cfg(test)]
+pub(crate) fn fresh_tmp_dir(label: &str) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "dh-storage-test-{}-{}-{seq}",
+        label,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::lod::SOURCE_LOADED_CHUNK;
@@ -1805,18 +1829,6 @@ mod tests {
             }
         }
         section
-    }
-
-    fn fresh_tmp_dir(label: &str) -> PathBuf {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dh-storage-test-{}-{}-{seq}",
-            label,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     #[test]
@@ -2017,6 +2029,37 @@ mod tests {
         mapping.biomes.insert(3, "minecraft:plains".into());
         mapping.biomes.insert(4, "minecraft:forest".into());
         (sec, mapping)
+    }
+
+    #[test]
+    fn discard_dimension_load_replies_drops_only_target_dim_after_flush() {
+        let dir = fresh_tmp_dir("discard-dimension-replies");
+        let (reopened, active) = ("custom:reopened", "minecraft:overworld");
+        let octree_pos = OctreeSectionPos::new(0, 1, 0, 2);
+        let column_pos = SectionPos::new(0, 1, 2);
+        let (octree, mapping) = populated_octree(octree_pos);
+        let worker = LodIoWorker::spawn();
+        for dim in [reopened, active] {
+            worker.save_octree_section(dir.clone(), dim.into(), octree.clone(), mapping.clone());
+            worker.request_save(dir.clone(), dim.into(), sample_section(column_pos, 64));
+        }
+        for dim in [reopened, active] {
+            worker.load_octree_section(dir.clone(), dim.into(), octree_pos);
+            worker.request_load(dir.clone(), dim.into(), column_pos);
+        }
+        worker.flush();
+        worker.discard_dimension_load_replies(reopened);
+        let octrees = worker.drain_octree_responses();
+        let replies = worker.drain_responses();
+        drop(worker);
+        fs::remove_dir_all(dir).unwrap();
+
+        assert!(matches!(octrees.as_slice(), [r] if r.dimension == active));
+        assert!(matches!(
+            replies.as_slice(),
+            [IoResponse::Saved, IoResponse::Saved, IoResponse::Loaded { dimension, .. }]
+                if dimension == active
+        ));
     }
 
     #[test]
