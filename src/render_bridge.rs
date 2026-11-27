@@ -1029,7 +1029,7 @@ pub fn prepare_draws(
     let atlas_id = id(ATLAS_TEXTURE);
     let clip_dist = vanilla_clip_dist(&frame);
     // Keep mid-ground hills crisp like Voxy (`NormalRenderPipeline.java`), respecting
-    // `fog_enabled`, `fog_falloff`, and `fog_spherical`.
+    // `fog_enabled` and `fog_spherical`.
     let (fog_start, fog_end) = if frame.config.fog_enabled {
         let start = (rd_blocks * 0.55).max(frame.vanilla_far_blocks + 64.0);
         (start, rd_blocks.max(start + 64.0))
@@ -1046,7 +1046,7 @@ pub fn prepare_draws(
         [
             fog_start,
             fog_end,
-            frame.config.fog_falloff.min(2) as f32,
+            0.0, // unused fog.z lane
             f32::from(frame.config.fog_spherical),
         ],
         frame.fog_color,

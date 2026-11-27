@@ -351,19 +351,17 @@ pub fn ingest_chunk<S: ChunkVoxelSource>(
     block_id: &mut dyn FnMut(S::Block) -> u32,
     biome_id: &mut dyn FnMut(&str) -> u16,
 ) -> bool {
-    ingest_chunk_culled(store, chunk, snap, src, None, block_id, biome_id)
+    ingest_chunk_culled(store, chunk, snap, src, false, block_id, biome_id)
 }
 
-/// Like [`ingest_chunk`], with optional underground cave culling `(max_y, fill_block)`:
-/// sections wholly below `y = 0` are skipped, and enclosed underground air (`!open` and
-/// `y < max_y`) is filled with `fill_block` (stone) so distant LOD chunks do not mesh invisible
-/// underground caves, ores, and lava pools.
+/// Like [`ingest_chunk`], but skips vanilla sections wholly below [`DISTANT_SOLID_FLOOR`]
+/// when `cull_distant_underground` is true. Voxels in the remaining sections are ingested normally.
 pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
     store: &mut OctreeIngestStore,
     chunk: [i32; 2],
     snap: &S,
     src: IngestSource,
-    cave_cull: Option<(i32, u32)>,
+    cull_distant_underground: bool,
     block_id: &mut dyn FnMut(S::Block) -> u32,
     biome_id: &mut dyn FnMut(&str) -> u16,
 ) -> bool {
@@ -380,7 +378,7 @@ pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
     let mut open = [true; VANILLA_SECTION * VANILLA_SECTION];
     for index in (0..snap.section_count()).rev() {
         let y0 = snap.min_y() + (index * VANILLA_SECTION) as i32;
-        if cave_cull.is_some() && y0 + VANILLA_SECTION as i32 <= DISTANT_SOLID_FLOOR {
+        if cull_distant_underground && y0 + VANILLA_SECTION as i32 <= DISTANT_SOLID_FLOOR {
             continue;
         }
         let pos = OctreeSectionPos::new(0, sx, y0.div_euclid(edge), sz);
