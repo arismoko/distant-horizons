@@ -1809,6 +1809,8 @@ impl LodIoWorker {
 
     /// Queue a tagged background probe; every completion arrives through
     /// [`Self::drain_octree_responses`]. Probes needed by mutations go ahead of the warm sweep.
+    /// Returns `false` without queueing when the worker is shut down or never started, so no
+    /// completion will ever arrive for `request`; `true` once the probe is queued.
     pub fn load_octree_section(
         &self,
         world_dir: PathBuf,
@@ -1816,10 +1818,10 @@ impl LodIoWorker {
         pos: OctreeSectionPos,
         request: u64,
         for_write: bool,
-    ) {
+    ) -> bool {
         let mut st = self.shared.state.lock().unwrap();
         if st.shutdown {
-            return;
+            return false;
         }
         let job = ((world_dir, dimension, pos), request);
         if for_write {
@@ -1828,6 +1830,7 @@ impl LodIoWorker {
             st.pending_octree_loads.push_back(job);
         }
         self.shared.wake_worker.notify_one();
+        true
     }
 
     pub fn drain_octree_responses(&self) -> Vec<OctreeLoaded> {
@@ -2889,7 +2892,7 @@ mod tests {
             assert!(
                 matches!(refusal, Err(SaveRefusal::NoWorker(cause)) if cause.to_string() == "spawn refused")
             );
-            worker.load_octree_section(dir.to_path_buf(), dim.into(), octree, 1, true);
+            assert!(!worker.load_octree_section(dir.to_path_buf(), dim.into(), octree, 1, true));
             worker.flush().unwrap();
             worker.reset_world();
             worker.flush().unwrap();
@@ -3156,7 +3159,7 @@ mod tests {
             mapping.clone(),
         );
         worker.flush().unwrap();
-        worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 7, false);
+        assert!(worker.load_octree_section(dir.to_path_buf(), dim.into(), pos, 7, false));
         worker.flush().unwrap();
         let got = worker.drain_octree_responses();
         assert_eq!(got.len(), 1);

@@ -330,6 +330,8 @@ struct Pipeline {
     /// Changed sections not yet accepted by the save queue.
     unsaved: HashMap<String, HashSet<OctreeSectionPos>>,
     saves_refused: bool,
+    /// Set by the first octree disk probe the I/O worker refused this session.
+    probes_refused: bool,
     /// Sections already asked of a remote server, per dimension.
     requested: HashMap<String, HashSet<OctreeSectionPos>>,
     /// Sections whose full server reply could not be decoded, per dimension. They are not asked
@@ -478,6 +480,10 @@ impl DiskIntake {
         needed
     }
 
+    /// Start a disk probe of `pos`; `true` only when the worker accepted it, so `pos` is in
+    /// `loading` and a completion will arrive. A refused probe can never complete: the slot goes
+    /// to `failed` (never `loading`) and the first refusal of the session is logged.
+    #[allow(clippy::too_many_arguments)]
     fn probe(
         &mut self,
         next: &mut u64,
@@ -486,13 +492,23 @@ impl DiskIntake {
         dim: &str,
         pos: OctreeSectionPos,
         for_write: bool,
+        probes_refused: &mut bool,
     ) -> bool {
         if self.loading.contains_key(&pos) || self.probed(&pos) {
             return false;
         }
-        *next = next.wrapping_add(1);
-        self.loading.insert(pos, *next);
-        io.load_octree_section(dir.to_owned(), dim.to_owned(), pos, *next, for_write);
+        let request = next.wrapping_add(1);
+        if !io.load_octree_section(dir.to_owned(), dim.to_owned(), pos, request, for_write) {
+            self.failed.insert(pos);
+            if !std::mem::replace(probes_refused, true) {
+                eprintln!(
+                    "DH: octree disk probes refused; lod-io worker unavailable (continuing without cached disk reads)"
+                );
+            }
+            return false;
+        }
+        *next = request;
+        self.loading.insert(pos, request);
         true
     }
 }
@@ -609,8 +625,18 @@ impl Pipeline {
                     dir.display()
                 );
             } else {
-                disk.probe(&mut self.next_probe, io, dir, dim, pos, true);
-                waiting = true;
+                disk.probe(
+                    &mut self.next_probe,
+                    io,
+                    dir,
+                    dim,
+                    pos,
+                    true,
+                    &mut self.probes_refused,
+                );
+                // Only a probe in flight completes later; a refusal already moved `pos` to
+                // `failed`, which is an answer.
+                waiting |= !disk.probed(&pos);
             }
         }
         if waiting {
@@ -681,6 +707,7 @@ impl Pipeline {
         self.rendered.clear();
         self.unsaved.clear();
         self.saves_refused = false;
+        self.probes_refused = false;
         self.requested.clear();
         let mut suppressed: Vec<_> = std::mem::take(&mut self.unreadable)
             .into_iter()
@@ -1275,6 +1302,10 @@ pub fn request_stored_sections(
 ) {
     let mut guard = PIPELINE.lock().unwrap();
     let p = &mut *guard;
+    if p.probes_refused {
+        // No probe can complete: sweeping would only fill `failed` with every coordinate in range.
+        return;
+    }
     let disk = p.disk.entry(dim.to_owned()).or_default();
     let store = p.stores.get(dim);
     let mut left = budget;
@@ -1286,8 +1317,18 @@ pub fn request_stored_sections(
         crate::render_bridge::drain_gpu_node_requests(),
         left,
     ) {
-        if disk.probe(&mut p.next_probe, io, world_dir, dim, pos, false) {
+        if disk.probe(
+            &mut p.next_probe,
+            io,
+            world_dir,
+            dim,
+            pos,
+            false,
+            &mut p.probes_refused,
+        ) {
             left -= 1;
+        } else if p.probes_refused {
+            return;
         }
     }
     for level in 0..=crate::octree::MAX_OCTREE_DETAIL {
@@ -1306,8 +1347,18 @@ pub fn request_stored_sections(
                     if store.is_some_and(|s| s.section(pos).is_some()) {
                         continue;
                     }
-                    if disk.probe(&mut p.next_probe, io, world_dir, dim, pos, false) {
+                    if disk.probe(
+                        &mut p.next_probe,
+                        io,
+                        world_dir,
+                        dim,
+                        pos,
+                        false,
+                        &mut p.probes_refused,
+                    ) {
                         left -= 1;
+                    } else if p.probes_refused {
+                        return;
                     }
                 }
             }
@@ -1756,12 +1807,14 @@ mod tests {
             .insert(first.pos);
         assert!(p.disk.entry(DIM.into()).or_default().probe(
             &mut p.next_probe,
-            &refusing,
+            &io,
             &dir,
             DIM,
             first.pos,
             false,
+            &mut p.probes_refused,
         ));
+        assert!(!p.probes_refused, "an accepted probe is not a refusal");
         assert_eq!(p.flush_saves(&refusing, &dir, usize::MAX), 0);
         assert!(p.saves_refused);
         assert_eq!(
@@ -1778,6 +1831,36 @@ mod tests {
             (0, Vec::new()),
             "retirement is counted once"
         );
+    }
+
+    #[test]
+    fn refused_disk_probes_fail_the_slot_and_never_make_intake_wait() {
+        let dir = TestTempDir::new("refused-probe");
+        let refusing = LodIoWorker::spawn_unavailable();
+        let mut p = Pipeline::default();
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        stage_live(&mut p, [0, 0], 1);
+        assert!(!p.probes_refused);
+
+        // Waiting would return no changes and keep the edit pending for a reply that never comes.
+        p.advance_intake(&refusing, &dir, DIM, false);
+        assert!(
+            p.disk[DIM].pending.is_empty(),
+            "the edit was consumed, not left waiting"
+        );
+        assert!(p.probes_refused);
+        assert!(p.disk[DIM].failed.contains(&pos));
+        assert!(p.disk[DIM].loading.is_empty());
+        assert_eq!(p.next_probe, 0, "a refused probe takes no request id");
+
+        stage_live(&mut p, [0, 0], 1);
+        p.advance_intake(&refusing, &dir, DIM, false);
+        assert!(p.disk[DIM].pending.is_empty());
+        assert!(p.disk[DIM].loading.is_empty());
+        assert!(p.probes_refused);
+
+        p.reset_world(&refusing);
+        assert!(!p.probes_refused);
     }
 
     #[test]
@@ -1859,7 +1942,15 @@ mod tests {
             )
             .unwrap();
         let mut disk = DiskIntake::default();
-        disk.probe(&mut p.next_probe, &io, &dir, DIM, pos, false);
+        disk.probe(
+            &mut p.next_probe,
+            &io,
+            &dir,
+            DIM,
+            pos,
+            false,
+            &mut p.probes_refused,
+        );
         p.disk.insert(DIM.to_owned(), disk);
         io.flush().unwrap();
         p.accept_probes(&io, &dir, |_, section, _| section);
@@ -2148,10 +2239,15 @@ mod tests {
         }
         let io = LodIoWorker::spawn();
         let mut p = Pipeline::default();
-        p.disk
-            .entry(DIM.into())
-            .or_default()
-            .probe(&mut p.next_probe, &io, &dir, DIM, pos, false);
+        p.disk.entry(DIM.into()).or_default().probe(
+            &mut p.next_probe,
+            &io,
+            &dir,
+            DIM,
+            pos,
+            false,
+            &mut p.probes_refused,
+        );
         let request = p.next_probe;
         p.disk
             .get_mut(DIM)
