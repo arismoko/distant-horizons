@@ -1,6 +1,6 @@
 [package]
 name = "distantsunrises"
-version = "3.3.8"
+version = "3.3.9"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 description = "Distant Sunrises level-of-detail terrain port for Sunrise"
