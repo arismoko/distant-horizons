@@ -61,6 +61,7 @@ pub mod octree_sync {
     /// Vanilla clientbound custom-payload body limit for a channel the receiver does not know (see module docs).
     pub const CLIENTBOUND_BODY_LIMIT: usize = 1_048_576;
     /// Vanilla serverbound custom-payload body limit for a channel the receiver does not know (see module docs).
+    #[cfg(test)]
     pub const SERVERBOUND_BODY_LIMIT: usize = 32_767;
     /// Bytes a split message adds around its chunk: protocol u16, id u16, bufferId i32, size i32,
     /// isFirst bool (`FullDataSplitMessage.java:63-68`).
@@ -82,6 +83,9 @@ pub mod octree_sync {
 
     // ------------------------------------------------------------------ errors
 
+    // Payload fields are read only by derived `Debug` (`PayloadHandleError::Failed`) and `PartialEq`
+    // (tests), which `dead_code` ignores.
+    #[allow(dead_code)]
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum SyncError {
         Truncated,
@@ -692,6 +696,7 @@ pub mod octree_sync {
     }
 
     /// `Config.Common.LodBuilding.dataCompression` default (`Config.java:1687-1688`).
+    #[cfg(test)]
     pub const DEFAULT_COMPRESSION: DhV2CompressionMode = DhV2CompressionMode::ZstdBlock;
 
     fn compress(raw: &[u8], mode: DhV2CompressionMode) -> Result<Vec<u8>, SyncError> {
@@ -718,6 +723,7 @@ pub mod octree_sync {
 
     impl OctreeSectionDto {
         /// Serialize `section` (palette + runs from [`OctreeSection::to_rle`]) and `mapping`.
+        #[cfg(test)]
         pub fn from_section(
             section: &OctreeSection,
             mapping: &[MappingEntry],
@@ -1105,15 +1111,6 @@ pub mod octree_sync {
             }
         }
 
-        /// `isReady` (`ServerPlayerState.java:44`): the client sent its config.
-        pub fn is_ready(&self) -> bool {
-            self.effective.is_some()
-        }
-
-        pub fn effective(&self) -> Option<&SessionConfig> {
-            self.effective.as_ref()
-        }
-
         /// The client's `SessionConfigMessage` constrains ours; the reply is the result
         /// (`ServerPlayerState.java:62-65,104-110`).
         pub fn on_client_config(&mut self, client: &SessionConfig) -> SessionConfig {
@@ -1396,6 +1393,7 @@ pub mod octree_sync {
             Ok(self.handle(player()?, message, now, source))
         }
 
+        #[cfg(test)]
         pub fn player(&self, player: K) -> Option<&PlayerSyncState> {
             self.players.get(&player)
         }
@@ -1585,6 +1583,8 @@ pub mod octree_sync {
     // ------------------------------------------------------------------ client
 
     /// What a client learns from the server.
+    // Diagnostic payload fields (`Config`, `UpToDate`, `Failed::{kind, message}`) are never read.
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub enum ClientEvent {
         Config(SessionConfig),
@@ -1620,6 +1620,8 @@ pub mod octree_sync {
         next_future: i32,
         pending: HashMap<i32, (String, OctreeSectionPos)>,
         receiver: SplitReceiver,
+        // Recorded on the config reply and inspected by unit tests.
+        #[cfg_attr(not(test), allow(dead_code))]
         pub config: Option<SessionConfig>,
     }
 
@@ -1631,6 +1633,7 @@ pub mod octree_sync {
 
         /// Encode and track a request for callers driving the protocol directly. Live sends
         /// track it only after the connection has accepted its bytes.
+        #[cfg(test)]
         pub fn request(
             &mut self,
             level: &str,
@@ -1671,6 +1674,7 @@ pub mod octree_sync {
                 .collect();
         }
 
+        #[cfg(test)]
         pub fn on_message(
             &mut self,
             bytes: &[u8],
