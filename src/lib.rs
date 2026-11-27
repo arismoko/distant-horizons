@@ -783,19 +783,10 @@ fn ingest_chunk_snapshots(
                     } else {
                         (12, 0)
                     };
-                    let s_bot_clamped = (s_bot - 1).clamp(i16::MIN as i32 + 1, s_top - 1) as i16;
-                    extra_spans.push(crate::lod::ExtraSpan {
-                        top_y: s_top.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16,
-                        bottom_y: s_bot_clamped,
-                        rgba: [
-                            s_rgb[0],
-                            s_rgb[1],
-                            s_rgb[2],
-                            LodColumn::pack_light(s_sky, s_blk),
-                        ],
-                        is_fluid: false,
-                        material_id: classify_dh_material(s_block),
-                    });
+                    extra_spans.push(
+                        crate::lod::ExtraSpan::new(s_top, s_bot - 1, s_rgb, s_sky, s_blk, false)
+                            .with_material(classify_dh_material(s_block)),
+                    );
                 }
 
                 let sec_pos = SectionPos::from_block(0, bx, bz);

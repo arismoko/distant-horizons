@@ -273,6 +273,8 @@ pub struct ExtraSpan {
 impl ExtraSpan {
     pub const SERIALIZED_LEN: usize = 9;
 
+    /// Clamp heights while preserving `EMPTY_Y < bottom_y < top_y`.
+    /// The lowest representable span occupies one block above the empty sentinel.
     pub fn new(
         top_y: i32,
         bottom_y: i32,
@@ -281,11 +283,11 @@ impl ExtraSpan {
         block_light: u8,
         is_fluid: bool,
     ) -> Self {
-        let top = top_y.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
-        let bot = bottom_y.clamp(i16::MIN as i32 + 1, (top as i32) - 1) as i16;
+        let top = top_y.clamp(i32::from(EMPTY_Y) + 2, i32::from(i16::MAX));
+        let bot = bottom_y.clamp(i32::from(EMPTY_Y) + 1, top - 1);
         Self {
-            top_y: top,
-            bottom_y: bot,
+            top_y: top as i16,
+            bottom_y: bot as i16,
             rgba: [
                 rgb[0],
                 rgb[1],
@@ -864,6 +866,22 @@ fn collect_leaf_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_span_clamps_to_a_nonempty_range_above_the_sentinel() {
+        for top in [i32::from(i16::MIN), i32::from(i16::MIN) + 1, -100_000] {
+            let span = ExtraSpan::new(top, top - 10, [0; 3], 0, 0, false);
+            assert_eq!((span.bottom_y, span.top_y), (EMPTY_Y + 1, EMPTY_Y + 2));
+        }
+        for (top, bottom, expected) in [
+            (64, 58, (58, 64)),
+            (64, 70, (63, 64)),
+            (100_000, 99_999, (i16::MAX - 1, i16::MAX)),
+        ] {
+            let span = ExtraSpan::new(top, bottom, [0; 3], 0, 0, false);
+            assert_eq!((span.bottom_y, span.top_y), expected);
+        }
+    }
 
     #[test]
     fn section_coordinates_and_downsampling_roundtrip() {
