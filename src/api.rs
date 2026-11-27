@@ -13,6 +13,7 @@
 //! network threads, background workers, or game ticks.
 
 use crate::colors::{biome_water_color, block_color, is_skippable_for_lod, is_water_block};
+use crate::config::DEFAULT_MAX_EXTRA_SPANS;
 use crate::dh_v2::{
     DH_SECTION_MIN_DETAIL, DecodedDhV2Section, DhV2Error, DhV2FullDataDto, pack_dh_section_pos,
     unpack_dh_section_pos,
@@ -440,7 +441,6 @@ pub fn submit_lod_section(dimension: &str, section: LodSectionData) -> Result<us
     let pos = SectionPos::from(section.pos);
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
-    let max_extra = st.config.max_extra_spans();
     let save_root = st.world_dir.clone();
     let store = st.dimensions.entry(dimension.to_owned()).or_default();
 
@@ -450,7 +450,7 @@ pub fn submit_lod_section(dimension: &str, section: LodSectionData) -> Result<us
         for cz in 0..SECTION_SIZE {
             for cx in 0..SECTION_SIZE {
                 let pts = &section.columns[cz * SECTION_SIZE + cx];
-                let (col, extra) = datapoints_to_lod_column(pts, max_extra);
+                let (col, extra) = datapoints_to_lod_column(pts, DEFAULT_MAX_EXTRA_SPANS);
                 if !col.is_empty() && sec.set_cell_with_spans(cx, cz, col, extra) {
                     modified += 1;
                 }
@@ -461,7 +461,7 @@ pub fn submit_lod_section(dimension: &str, section: LodSectionData) -> Result<us
     if modified > 0 {
         let mut dirty = HashSet::new();
         dirty.insert(pos);
-        for parent in store.propagate_up_with_quality(pos, max_extra) {
+        for parent in store.propagate_up(pos) {
             dirty.insert(parent);
         }
         queue_save(rt, dimension, save_root.as_ref(), store, &dirty);
@@ -483,7 +483,6 @@ pub fn submit_lod_chunk(dimension: &str, chunk: LodChunk) -> Result<usize, DhApi
     let bz0 = chunk.chunk_z << 4;
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
-    let max_extra = st.config.max_extra_spans();
     let save_root = st.world_dir.clone();
     let store = st.dimensions.entry(dimension.to_owned()).or_default();
 
@@ -492,7 +491,7 @@ pub fn submit_lod_chunk(dimension: &str, chunk: LodChunk) -> Result<usize, DhApi
     for lz in 0..16 {
         for lx in 0..16 {
             let pts = &chunk.columns[lz * 16 + lx];
-            let (col, extra) = datapoints_to_lod_column(pts, max_extra);
+            let (col, extra) = datapoints_to_lod_column(pts, DEFAULT_MAX_EXTRA_SPANS);
             if col.is_empty() {
                 continue;
             }
@@ -513,7 +512,7 @@ pub fn submit_lod_chunk(dimension: &str, chunk: LodChunk) -> Result<usize, DhApi
     if !dirty.is_empty() {
         let mut all_dirty = dirty.clone();
         for &pos in &dirty {
-            for parent in store.propagate_up_with_quality(pos, max_extra) {
+            for parent in store.propagate_up(pos) {
                 all_dirty.insert(parent);
             }
         }

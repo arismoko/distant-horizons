@@ -656,11 +656,13 @@ fn ingest_chunk_snapshots(
     snapshots: &[([i32; 2], Option<mod_api::ChunkSnapshot>)],
     dirty_sections: &mut HashSet<SectionPos>,
 ) {
+    // This is the total span count, including the primary surface.
+    const DEFAULT_INGEST_SOLID_SPANS: usize = 1;
+
     let mut block_id_cache: HashMap<mod_api::BlockState, &str> = HashMap::new();
 
     let rt = runtime();
     let mut st = rt.inner.lock().unwrap();
-    let max_spans = st.config.vertical_quality.clamp(1, 8) as usize;
     let store = st.dimensions.entry(dim.to_owned()).or_default();
 
     for ([cx, cz], snap_opt) in snapshots {
@@ -688,7 +690,8 @@ fn ingest_chunk_snapshots(
                 let mut fluid_top: Option<i32> = None;
                 // Contiguous vertical solid spans `(top_y, lowest_solid_y, top_block_id)` for
                 // tree canopies, overhangs, and ground underneath (DH `EDhApiVerticalQuality`).
-                let mut solid_spans: Vec<(i32, i32, &str)> = Vec::with_capacity(max_spans);
+                let mut solid_spans: Vec<(i32, i32, &str)> =
+                    Vec::with_capacity(DEFAULT_INGEST_SOLID_SPANS);
                 let mut in_solid_span = false;
 
                 // Scan top-down through the sampled band for surface + vertical spans.
@@ -714,7 +717,7 @@ fn ingest_chunk_snapshots(
                         if let Some(last) = solid_spans.last_mut() {
                             last.1 = y;
                         }
-                    } else if solid_spans.len() < max_spans {
+                    } else if solid_spans.len() < DEFAULT_INGEST_SOLID_SPANS {
                         solid_spans.push((y, y, block_id));
                         in_solid_span = true;
                     }
@@ -1012,11 +1015,7 @@ fn sample_distant_sections(
         };
 
         let saved_reader = host.level(dim).and_then(|l| l.saved_chunk_reader(host));
-        let feature_stage = match cfg.distant_generation_mode {
-            2 => Some(mod_api::GenerationStage::Features),
-            3 => Some(mod_api::GenerationStage::Light),
-            _ => None,
-        };
+        let feature_stage = cfg.distant_generation_mode.feature_stage();
         if rt.gen_pool.enqueue(
             dim.to_owned(),
             pos,

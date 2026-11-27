@@ -1,6 +1,6 @@
 //! Distant Sunrises multi-detail-level LOD section store and quadtree selector.
 
-use crate::config::DhConfig;
+use crate::config::{DEFAULT_MAX_EXTRA_SPANS, DhConfig};
 use std::collections::{HashMap, HashSet};
 
 /// Width/depth in cells of one LOD section (`64 x 64`, matching DH `FullDataSourceV2.WIDTH`).
@@ -730,7 +730,7 @@ impl DimensionLodStore {
 
     /// Propagate dirty detail `d` updates up to parent detail `d + 1`..=`MAX_DETAIL`.
     pub fn propagate_up(&mut self, start_pos: SectionPos) -> Vec<SectionPos> {
-        self.propagate_up_with_quality(start_pos, DhConfig::default().max_extra_spans())
+        self.propagate_up_with_quality(start_pos, DEFAULT_MAX_EXTRA_SPANS)
     }
 
     /// Propagate dirty detail `d` updates up to parent detail `d + 1`..=`MAX_DETAIL`, preserving

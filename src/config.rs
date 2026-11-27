@@ -17,30 +17,15 @@ pub const MOD_ID: &str = "distantsunrises";
 pub const KEY_ENABLED: &str = "enabled";
 pub const KEY_RENDER_DISTANCE: &str = "render_distance_chunks";
 pub const KEY_HORIZONTAL_QUALITY: &str = "horizontal_quality";
-pub const KEY_VERTICAL_QUALITY: &str = "vertical_quality";
 pub const KEY_DISTANT_GENERATION: &str = "distant_generation";
-pub const KEY_DISTANT_GENERATION_MODE: &str = "distant_generation_mode";
-pub const KEY_CAVE_CULLING: &str = "cave_culling_enabled";
-pub const KEY_CAVE_CULLING_HEIGHT: &str = "cave_culling_height";
+// A new key keeps persisted indices from the old four-choice setting from being reinterpreted.
+pub const KEY_DISTANT_GENERATION_STAGE: &str = "distant_generation_stage";
 pub const KEY_FOG_ENABLED: &str = "fog_enabled";
-pub const KEY_NOISE_ENABLED: &str = "noise_enabled";
-pub const KEY_NOISE_INTENSITY: &str = "noise_intensity";
 pub const KEY_OVERDRAW_PREVENTION: &str = "overdraw_prevention";
-pub const KEY_FADE_ENABLED: &str = "fade_enabled";
 pub const KEY_SHADING_ENABLED: &str = "shading_enabled";
-pub const KEY_BRIGHTNESS: &str = "brightness_multiplier";
-pub const KEY_SATURATION: &str = "saturation_multiplier";
 pub const KEY_SSAO_ENABLED: &str = "ssao_enabled";
-pub const KEY_SSAO_QUALITY: &str = "ssao_quality";
-pub const KEY_SSAO_STRENGTH: &str = "ssao_strength";
 pub const KEY_DISABLE_VANILLA_FOG: &str = "disable_vanilla_fog";
-pub const KEY_FOG_FALLOFF: &str = "fog_falloff";
 pub const KEY_FOG_SPHERICAL: &str = "fog_spherical";
-pub const KEY_HEIGHT_FOG_ENABLED: &str = "height_fog_enabled";
-pub const KEY_HEIGHT_FOG_BASE_HEIGHT: &str = "height_fog_base_height";
-pub const KEY_HEIGHT_FOG_MIX_MODE: &str = "height_fog_mix_mode";
-pub const KEY_SHARPENING_AMOUNT: &str = "sharpening_amount";
-pub const KEY_DEBUG_MODE: &str = "debug_mode";
 pub const KEY_THREAD_PRESET: &str = "thread_preset";
 
 /// Mirrors `EDhApiThreadPreset` and `ThreadPresetConfigEventHandler` (percent of logical
@@ -122,12 +107,47 @@ impl ThreadPreset {
     }
 }
 
-/// Debug visualization modes matching upstream `EDhApiDebugRendering`.
-pub const DEBUG_OFF: u32 = 0;
-pub const DEBUG_SHOW_DETAIL: u32 = 1;
-pub const DEBUG_SHOW_GEN_MODE: u32 = 2;
-pub const DEBUG_SHOW_LIGHTING: u32 = 3;
-pub const DEBUG_SHOW_DETAIL_WIREFRAME: u32 = 4;
+/// Maximum extra vertical spans retained per column beneath the primary surface.
+pub const DEFAULT_MAX_EXTRA_SPANS: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DistantGenerationMode {
+    Surface,
+    Features,
+    Full,
+}
+
+impl DistantGenerationMode {
+    pub const fn from_choice_index(index: u32) -> Self {
+        match index {
+            0 => Self::Surface,
+            2 => Self::Full,
+            _ => Self::Features,
+        }
+    }
+
+    pub const fn feature_stage(self) -> Option<mod_api::GenerationStage> {
+        match self {
+            Self::Surface => None,
+            Self::Features => Some(mod_api::GenerationStage::Features),
+            Self::Full => Some(mod_api::GenerationStage::Light),
+        }
+    }
+}
+
+fn distant_generation_stage_spec() -> SettingSpec {
+    SettingSpec::choice(
+        KEY_DISTANT_GENERATION_STAGE,
+        "distantsunrises.setting.distant_generation_stage",
+        [
+            "distantsunrises.setting.gen_mode.surface",
+            "distantsunrises.setting.gen_mode.features",
+            "distantsunrises.setting.gen_mode.full",
+        ],
+        1, // Features; legacy indices are not read under this key.
+    )
+    .tooltip("distantsunrises.setting.distant_generation_stage.tooltip")
+}
 
 /// Runtime settings mirrored from Sunrise's mod settings UI (`Options > Mods > Distant Sunrises`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,37 +156,14 @@ pub struct DhConfig {
     pub render_distance_chunks: u32,
     /// 0 = Low, 1 = Medium, 2 = High.
     pub horizontal_quality: u32,
-    /// 0 = Low (1 extra layer), 1 = Medium (2), 2 = High (4), 3 = Extreme (8).
-    pub vertical_quality: u32,
     pub distant_generation: bool,
-    /// 0 = Surface, 1 = Carvers, 2 = Features, 3 = Full Light.
-    pub distant_generation_mode: u32,
-    pub cave_culling_enabled: bool,
-    pub cave_culling_height: i32,
+    pub distant_generation_mode: DistantGenerationMode,
     pub fog_enabled: bool,
-    pub noise_enabled: bool,
-    pub noise_intensity: f32,
     pub overdraw_prevention: f32,
-    pub fade_enabled: bool,
     pub shading_enabled: bool,
-    pub brightness_multiplier: f32,
-    pub saturation_multiplier: f32,
     pub ssao_enabled: bool,
-    /// 0 = Low (6 samples), 1 = Medium (12 samples), 2 = High (20 samples).
-    pub ssao_quality: u32,
-    pub ssao_strength: f32,
     pub disable_vanilla_fog: bool,
-    /// 0 = Linear, 1 = Exponential, 2 = Exponential Squared.
-    pub fog_falloff: u32,
     pub fog_spherical: bool,
-    pub height_fog_enabled: bool,
-    pub height_fog_base_height: f32,
-    /// 0 = Basic (far only), 1 = Max, 2 = Addition, 3 = Multiply, 4 = Inverse Multiply.
-    pub height_fog_mix_mode: u32,
-    /// FidelityFX Contrast-Adaptive Sharpening strength (0.0 = off, 1.0 = max).
-    pub sharpening_amount: f32,
-    /// `DEBUG_OFF..=DEBUG_SHOW_DETAIL_WIREFRAME`.
-    pub debug_mode: u32,
     /// Worldgen/ingest thread preset (`EDhApiThreadPreset`).
     pub thread_preset: ThreadPreset,
 }
@@ -177,30 +174,14 @@ impl Default for DhConfig {
             enabled: true,
             render_distance_chunks: 128,
             horizontal_quality: 1,
-            vertical_quality: 1,
             distant_generation: true,
-            distant_generation_mode: 2,
-            cave_culling_enabled: true,
-            cave_culling_height: 60,
+            distant_generation_mode: DistantGenerationMode::Features,
             fog_enabled: true,
-            noise_enabled: true,
-            noise_intensity: 0.12,
             overdraw_prevention: 0.9,
-            fade_enabled: true,
             shading_enabled: true,
-            brightness_multiplier: 1.0,
-            saturation_multiplier: 1.0,
             ssao_enabled: true,
-            ssao_quality: 1,
-            ssao_strength: 0.45,
             disable_vanilla_fog: true,
-            fog_falloff: 2,
             fog_spherical: false,
-            height_fog_enabled: true,
-            height_fog_base_height: 70.0,
-            height_fog_mix_mode: 4,
-            sharpening_amount: 0.35,
-            debug_mode: DEBUG_OFF,
             thread_preset: ThreadPreset::Balanced,
         }
     }
@@ -209,27 +190,6 @@ impl Default for DhConfig {
 impl DhConfig {
     pub fn render_distance_blocks(self) -> f32 {
         (self.render_distance_chunks as f32) * 16.0
-    }
-
-    pub fn ssao_sample_count(self) -> u32 {
-        if !self.ssao_enabled {
-            return 0;
-        }
-        match self.ssao_quality {
-            0 => 6,
-            2 => 20,
-            _ => 12,
-        }
-    }
-
-    /// Maximum extra vertical spans retained per column beneath the primary surface.
-    pub fn max_extra_spans(self) -> usize {
-        match self.vertical_quality {
-            0 => 1,
-            1 => 2,
-            2 => 4,
-            _ => 8,
-        }
     }
 
     /// Distance in blocks at which `detail` (0..=6) should subdivide to `detail - 1`.
@@ -275,68 +235,15 @@ impl DhConfig {
                 1,
             )
             .tooltip("distantsunrises.setting.horizontal_quality.tooltip"),
-            SettingSpec::choice(
-                KEY_VERTICAL_QUALITY,
-                "distantsunrises.setting.vertical_quality",
-                [
-                    "distantsunrises.setting.quality.low",
-                    "distantsunrises.setting.quality.medium",
-                    "distantsunrises.setting.quality.high",
-                    "distantsunrises.setting.quality.extreme",
-                ],
-                1,
-            )
-            .tooltip("distantsunrises.setting.vertical_quality.tooltip"),
             SettingSpec::toggle(
                 KEY_DISTANT_GENERATION,
                 "distantsunrises.setting.distant_generation",
                 true,
             )
             .tooltip("distantsunrises.setting.distant_generation.tooltip"),
-            SettingSpec::choice(
-                KEY_DISTANT_GENERATION_MODE,
-                "distantsunrises.setting.distant_generation_mode",
-                [
-                    "distantsunrises.setting.gen_mode.surface",
-                    "distantsunrises.setting.gen_mode.carvers",
-                    "distantsunrises.setting.gen_mode.features",
-                    "distantsunrises.setting.gen_mode.full",
-                ],
-                2,
-            )
-            .tooltip("distantsunrises.setting.distant_generation_mode.tooltip"),
-            SettingSpec::toggle(
-                KEY_CAVE_CULLING,
-                "distantsunrises.setting.cave_culling_enabled",
-                true,
-            )
-            .tooltip("distantsunrises.setting.cave_culling_enabled.tooltip"),
-            SettingSpec::range(
-                KEY_CAVE_CULLING_HEIGHT,
-                "distantsunrises.setting.cave_culling_height",
-                -64.0,
-                320.0,
-                4.0,
-                60.0,
-            )
-            .tooltip("distantsunrises.setting.cave_culling_height.tooltip"),
+            distant_generation_stage_spec(),
             SettingSpec::toggle(KEY_FOG_ENABLED, "distantsunrises.setting.fog_enabled", true)
                 .tooltip("distantsunrises.setting.fog_enabled.tooltip"),
-            SettingSpec::toggle(
-                KEY_NOISE_ENABLED,
-                "distantsunrises.setting.noise_enabled",
-                true,
-            )
-            .tooltip("distantsunrises.setting.noise_enabled.tooltip"),
-            SettingSpec::range(
-                KEY_NOISE_INTENSITY,
-                "distantsunrises.setting.noise_intensity",
-                0.0,
-                0.5,
-                0.02,
-                0.12,
-            )
-            .tooltip("distantsunrises.setting.noise_intensity.tooltip"),
             SettingSpec::range(
                 KEY_OVERDRAW_PREVENTION,
                 "distantsunrises.setting.overdraw_prevention",
@@ -347,134 +254,29 @@ impl DhConfig {
             )
             .tooltip("distantsunrises.setting.overdraw_prevention.tooltip"),
             SettingSpec::toggle(
-                KEY_FADE_ENABLED,
-                "distantsunrises.setting.fade_enabled",
-                true,
-            )
-            .tooltip("distantsunrises.setting.fade_enabled.tooltip"),
-            SettingSpec::toggle(
                 KEY_SHADING_ENABLED,
                 "distantsunrises.setting.shading_enabled",
                 true,
             )
             .tooltip("distantsunrises.setting.shading_enabled.tooltip"),
-            SettingSpec::range(
-                KEY_BRIGHTNESS,
-                "distantsunrises.setting.brightness_multiplier",
-                0.5,
-                2.0,
-                0.05,
-                1.0,
-            )
-            .tooltip("distantsunrises.setting.brightness_multiplier.tooltip"),
-            SettingSpec::range(
-                KEY_SATURATION,
-                "distantsunrises.setting.saturation_multiplier",
-                0.0,
-                2.0,
-                0.05,
-                1.0,
-            )
-            .tooltip("distantsunrises.setting.saturation_multiplier.tooltip"),
             SettingSpec::toggle(
                 KEY_SSAO_ENABLED,
                 "distantsunrises.setting.ssao_enabled",
                 true,
             )
             .tooltip("distantsunrises.setting.ssao_enabled.tooltip"),
-            SettingSpec::choice(
-                KEY_SSAO_QUALITY,
-                "distantsunrises.setting.ssao_quality",
-                [
-                    "distantsunrises.setting.quality.low",
-                    "distantsunrises.setting.quality.medium",
-                    "distantsunrises.setting.quality.high",
-                ],
-                1,
-            )
-            .tooltip("distantsunrises.setting.ssao_quality.tooltip"),
-            SettingSpec::range(
-                KEY_SSAO_STRENGTH,
-                "distantsunrises.setting.ssao_strength",
-                0.0,
-                1.0,
-                0.05,
-                0.45,
-            )
-            .tooltip("distantsunrises.setting.ssao_strength.tooltip"),
             SettingSpec::toggle(
                 KEY_DISABLE_VANILLA_FOG,
                 "distantsunrises.setting.disable_vanilla_fog",
                 true,
             )
             .tooltip("distantsunrises.setting.disable_vanilla_fog.tooltip"),
-            SettingSpec::choice(
-                KEY_FOG_FALLOFF,
-                "distantsunrises.setting.fog_falloff",
-                [
-                    "distantsunrises.setting.fog_falloff.linear",
-                    "distantsunrises.setting.fog_falloff.exponential",
-                    "distantsunrises.setting.fog_falloff.exponential_squared",
-                ],
-                2,
-            )
-            .tooltip("distantsunrises.setting.fog_falloff.tooltip"),
             SettingSpec::toggle(
                 KEY_FOG_SPHERICAL,
                 "distantsunrises.setting.fog_spherical",
                 false,
             )
             .tooltip("distantsunrises.setting.fog_spherical.tooltip"),
-            SettingSpec::toggle(
-                KEY_HEIGHT_FOG_ENABLED,
-                "distantsunrises.setting.height_fog_enabled",
-                true,
-            )
-            .tooltip("distantsunrises.setting.height_fog_enabled.tooltip"),
-            SettingSpec::range(
-                KEY_HEIGHT_FOG_BASE_HEIGHT,
-                "distantsunrises.setting.height_fog_base_height",
-                -64.0,
-                320.0,
-                4.0,
-                70.0,
-            )
-            .tooltip("distantsunrises.setting.height_fog_base_height.tooltip"),
-            SettingSpec::choice(
-                KEY_HEIGHT_FOG_MIX_MODE,
-                "distantsunrises.setting.height_fog_mix_mode",
-                [
-                    "distantsunrises.setting.height_fog_mix.basic",
-                    "distantsunrises.setting.height_fog_mix.max",
-                    "distantsunrises.setting.height_fog_mix.addition",
-                    "distantsunrises.setting.height_fog_mix.multiply",
-                    "distantsunrises.setting.height_fog_mix.inverse_multiply",
-                ],
-                4,
-            )
-            .tooltip("distantsunrises.setting.height_fog_mix_mode.tooltip"),
-            SettingSpec::range(
-                KEY_SHARPENING_AMOUNT,
-                "distantsunrises.setting.sharpening_amount",
-                0.0,
-                1.0,
-                0.05,
-                0.35,
-            )
-            .tooltip("distantsunrises.setting.sharpening_amount.tooltip"),
-            SettingSpec::choice(
-                KEY_DEBUG_MODE,
-                "distantsunrises.setting.debug_mode",
-                [
-                    "distantsunrises.setting.debug.off",
-                    "distantsunrises.setting.debug.detail",
-                    "distantsunrises.setting.debug.gen_mode",
-                    "distantsunrises.setting.debug.lighting",
-                    "distantsunrises.setting.debug.wireframe",
-                ],
-                0,
-            )
-            .tooltip("distantsunrises.setting.debug_mode.tooltip"),
             SettingSpec::choice(
                 KEY_THREAD_PRESET,
                 "distantsunrises.setting.thread_preset",
@@ -516,49 +318,19 @@ impl DhConfig {
                 .map(|v| (v.round() as u32).clamp(32, 512))
                 .unwrap_or(def.render_distance_chunks),
             horizontal_quality: read_choice(KEY_HORIZONTAL_QUALITY, def.horizontal_quality),
-            vertical_quality: read_choice(KEY_VERTICAL_QUALITY, def.vertical_quality),
             distant_generation: read_bool(KEY_DISTANT_GENERATION, def.distant_generation),
-            distant_generation_mode: read_choice(
-                KEY_DISTANT_GENERATION_MODE,
-                def.distant_generation_mode,
-            ),
-            cave_culling_enabled: read_bool(KEY_CAVE_CULLING, def.cave_culling_enabled),
-            cave_culling_height: read_f64(KEY_CAVE_CULLING_HEIGHT)
-                .map(|v| (v.round() as i32).clamp(-64, 320))
-                .unwrap_or(def.cave_culling_height),
+            distant_generation_mode: setting_key(KEY_DISTANT_GENERATION_STAGE)
+                .and_then(|k| host.setting_choice(k).ok())
+                .map(DistantGenerationMode::from_choice_index)
+                .unwrap_or(def.distant_generation_mode),
             fog_enabled: read_bool(KEY_FOG_ENABLED, def.fog_enabled),
-            noise_enabled: read_bool(KEY_NOISE_ENABLED, def.noise_enabled),
-            noise_intensity: read_f64(KEY_NOISE_INTENSITY)
-                .map(|v| (v as f32).clamp(0.0, 0.5))
-                .unwrap_or(def.noise_intensity),
             overdraw_prevention: read_f64(KEY_OVERDRAW_PREVENTION)
                 .map(|v| (v as f32).clamp(0.0, 1.0))
                 .unwrap_or(def.overdraw_prevention),
-            fade_enabled: read_bool(KEY_FADE_ENABLED, def.fade_enabled),
             shading_enabled: read_bool(KEY_SHADING_ENABLED, def.shading_enabled),
-            brightness_multiplier: read_f64(KEY_BRIGHTNESS)
-                .map(|v| (v as f32).clamp(0.5, 2.0))
-                .unwrap_or(def.brightness_multiplier),
-            saturation_multiplier: read_f64(KEY_SATURATION)
-                .map(|v| (v as f32).clamp(0.0, 2.0))
-                .unwrap_or(def.saturation_multiplier),
             ssao_enabled: read_bool(KEY_SSAO_ENABLED, def.ssao_enabled),
-            ssao_quality: read_choice(KEY_SSAO_QUALITY, def.ssao_quality),
-            ssao_strength: read_f64(KEY_SSAO_STRENGTH)
-                .map(|v| (v as f32).clamp(0.0, 1.0))
-                .unwrap_or(def.ssao_strength),
             disable_vanilla_fog: read_bool(KEY_DISABLE_VANILLA_FOG, def.disable_vanilla_fog),
-            fog_falloff: read_choice(KEY_FOG_FALLOFF, def.fog_falloff),
             fog_spherical: read_bool(KEY_FOG_SPHERICAL, def.fog_spherical),
-            height_fog_enabled: read_bool(KEY_HEIGHT_FOG_ENABLED, def.height_fog_enabled),
-            height_fog_base_height: read_f64(KEY_HEIGHT_FOG_BASE_HEIGHT)
-                .map(|v| (v as f32).clamp(-64.0, 320.0))
-                .unwrap_or(def.height_fog_base_height),
-            height_fog_mix_mode: read_choice(KEY_HEIGHT_FOG_MIX_MODE, def.height_fog_mix_mode),
-            sharpening_amount: read_f64(KEY_SHARPENING_AMOUNT)
-                .map(|v| (v as f32).clamp(0.0, 1.0))
-                .unwrap_or(def.sharpening_amount),
-            debug_mode: read_choice(KEY_DEBUG_MODE, def.debug_mode),
             thread_preset: ThreadPreset::from_index(read_choice(
                 KEY_THREAD_PRESET,
                 def.thread_preset as u32,
@@ -570,6 +342,52 @@ impl DhConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mod_api::SettingValue;
+
+    #[test]
+    fn distant_generation_choice_indices() {
+        use DistantGenerationMode::{Features, Full, Surface};
+        for (index, expected) in [(0, Surface), (1, Features), (2, Full), (3, Features)] {
+            assert_eq!(DistantGenerationMode::from_choice_index(index), expected);
+        }
+    }
+
+    #[test]
+    fn distant_generation_feature_stages() {
+        use DistantGenerationMode::{Features, Full, Surface};
+        use mod_api::GenerationStage;
+        assert!(Surface.feature_stage().is_none());
+        assert!(matches!(
+            Features.feature_stage(),
+            Some(GenerationStage::Features)
+        ));
+        assert!(matches!(Full.feature_stage(), Some(GenerationStage::Light)));
+    }
+
+    #[test]
+    fn distant_generation_stage_reads_new_key_without_reusing_legacy_indices() {
+        use DistantGenerationMode::{Features, Full, Surface};
+        let spec = distant_generation_stage_spec();
+        assert_eq!(spec.key, "distant_generation_stage");
+        for (stored, expected_index, expected_mode) in [
+            // An old settings folder has no value under the new key.
+            (None, 1, Features),
+            (Some("0"), 0, Surface),
+            (Some("1"), 1, Features),
+            (Some("2"), 2, Full),
+            (Some("3"), 1, Features),
+            (Some("invalid"), 1, Features),
+        ] {
+            let SettingValue::Choice(index) = spec.read(stored) else {
+                panic!("generation stage must be a choice");
+            };
+            assert_eq!(index, expected_index, "stored value: {stored:?}");
+            assert_eq!(
+                DistantGenerationMode::from_choice_index(index as u32),
+                expected_mode
+            );
+        }
+    }
 
     #[test]
     fn thread_preset_counts_match_dh_formula() {

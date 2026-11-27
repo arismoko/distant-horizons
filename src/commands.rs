@@ -4,11 +4,8 @@
 //! so every action works in single-player, LAN, and multiplayer without needing a server-side mod.
 
 use crate::config::{
-    DEBUG_OFF, DEBUG_SHOW_DETAIL, DEBUG_SHOW_DETAIL_WIREFRAME, DEBUG_SHOW_GEN_MODE,
-    DEBUG_SHOW_LIGHTING, DhConfig, KEY_CAVE_CULLING, KEY_DEBUG_MODE, KEY_DISTANT_GENERATION,
-    KEY_ENABLED, KEY_FADE_ENABLED, KEY_FOG_ENABLED, KEY_HEIGHT_FOG_ENABLED, KEY_HORIZONTAL_QUALITY,
-    KEY_NOISE_ENABLED, KEY_RENDER_DISTANCE, KEY_SHARPENING_AMOUNT, KEY_SSAO_ENABLED,
-    KEY_SSAO_QUALITY, KEY_THREAD_PRESET, KEY_VERTICAL_QUALITY, MOD_ID, ThreadPreset, setting_key,
+    DhConfig, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FOG_ENABLED, KEY_HORIZONTAL_QUALITY,
+    KEY_RENDER_DISTANCE, KEY_SSAO_ENABLED, KEY_THREAD_PRESET, MOD_ID, ThreadPreset, setting_key,
 };
 use crate::render_bridge::{runtime, stats};
 use mod_api::{
@@ -119,18 +116,11 @@ pub fn register_client_commands(commands: &mut Vec<ClientCommandRegistration>) {
         " radius <chunks:integer>",
         " distance <chunks:integer>",
         " quality <preset:word>",
-        " vquality <level:integer>",
         " preset <preset:word>",
         " fog <mode:word>",
-        " fade <mode:word>",
-        " noise <mode:word>",
-        " heightfog <mode:word>",
         " ssao <mode:word>",
-        " sharpen <mode:word>",
-        " debug <mode:word>",
         " gen <mode:word>",
         " threads <preset:word>",
-        " cavecull <mode:word>",
         " clear",
         " remesh",
         " help",
@@ -215,10 +205,7 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
                 QualityPreset {
                     radius: 64,
                     h_qual: 0,
-                    v_qual: 0,
-                    ssao_q: 0,
                     ssao_on: false,
-                    sharpen: 0.0,
                     label_key: "distantsunrises.setting.quality.low",
                 },
             ),
@@ -227,10 +214,7 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
                 QualityPreset {
                     radius: 128,
                     h_qual: 1,
-                    v_qual: 1,
-                    ssao_q: 1,
                     ssao_on: true,
-                    sharpen: 0.25,
                     label_key: "distantsunrises.setting.quality.medium",
                 },
             ),
@@ -239,10 +223,7 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
                 QualityPreset {
                     radius: 256,
                     h_qual: 2,
-                    v_qual: 2,
-                    ssao_q: 1,
                     ssao_on: true,
-                    sharpen: 0.35,
                     label_key: "distantsunrises.setting.quality.high",
                 },
             ),
@@ -251,10 +232,7 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
                 QualityPreset {
                     radius: 512,
                     h_qual: 2,
-                    v_qual: 3,
-                    ssao_q: 2,
                     ssao_on: true,
-                    sharpen: 0.45,
                     label_key: "distantsunrises.setting.quality.extreme",
                 },
             ),
@@ -266,70 +244,6 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
             }
         },
         "ssao" => handle_bool_setting(host, KEY_SSAO_ENABLED, "ssao", arg),
-        "sharpen" => match parse_toggle_arg(arg) {
-            Some(v) => {
-                write_setting(
-                    host,
-                    KEY_SHARPENING_AMOUNT,
-                    SettingValue::Range(if v { 0.35 } else { 0.0 }),
-                );
-                refresh_config(host);
-                let _ = host.chat_line(Text::translate(
-                    if v {
-                        "distantsunrises.command.setting_on"
-                    } else {
-                        "distantsunrises.command.setting_off"
-                    },
-                    vec![Text::literal("sharpen")],
-                ));
-            }
-            None => {
-                let _ = host.chat_line(Text::translate(
-                    "distantsunrises.command.usage_toggle",
-                    vec![Text::literal("sharpen")],
-                ));
-            }
-        },
-        "heightfog" => handle_bool_setting(host, KEY_HEIGHT_FOG_ENABLED, "heightfog", arg),
-        "debug" => {
-            let parsed = match arg.map(str::to_ascii_lowercase).as_deref() {
-                Some("off" | "none" | "0") => {
-                    Some((DEBUG_OFF, "distantsunrises.setting.debug.off"))
-                }
-                Some("detail" | "lod" | "1") => {
-                    Some((DEBUG_SHOW_DETAIL, "distantsunrises.setting.debug.detail"))
-                }
-                Some("gen" | "source" | "2") => Some((
-                    DEBUG_SHOW_GEN_MODE,
-                    "distantsunrises.setting.debug.gen_mode",
-                )),
-                Some("light" | "lighting" | "3") => Some((
-                    DEBUG_SHOW_LIGHTING,
-                    "distantsunrises.setting.debug.lighting",
-                )),
-                Some("wireframe" | "wire" | "4") => Some((
-                    DEBUG_SHOW_DETAIL_WIREFRAME,
-                    "distantsunrises.setting.debug.wireframe",
-                )),
-                _ => None,
-            };
-            match parsed {
-                Some((mode, label_key)) => {
-                    write_setting(host, KEY_DEBUG_MODE, SettingValue::Choice(mode as usize));
-                    refresh_config(host);
-                    let _ = host.chat_line(Text::translate(
-                        "distantsunrises.command.debug_set",
-                        vec![Text::translate(label_key, Vec::new())],
-                    ));
-                }
-                None => {
-                    let _ = host.chat_line(Text::translate(
-                        "distantsunrises.command.usage_debug",
-                        Vec::new(),
-                    ));
-                }
-            }
-        }
         "fog" => match parse_toggle_arg(arg) {
             Some(v) => {
                 write_setting(host, KEY_FOG_ENABLED, SettingValue::Toggle(v));
@@ -350,46 +264,6 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
                 ));
             }
         },
-        "fade" => match parse_toggle_arg(arg) {
-            Some(v) => {
-                write_setting(host, KEY_FADE_ENABLED, SettingValue::Toggle(v));
-                refresh_config(host);
-                let _ = host.chat_line(Text::translate(
-                    if v {
-                        "distantsunrises.command.setting_on"
-                    } else {
-                        "distantsunrises.command.setting_off"
-                    },
-                    vec![Text::literal("fade")],
-                ));
-            }
-            None => {
-                let _ = host.chat_line(Text::translate(
-                    "distantsunrises.command.usage_toggle",
-                    vec![Text::literal("fade")],
-                ));
-            }
-        },
-        "noise" => match parse_toggle_arg(arg) {
-            Some(v) => {
-                write_setting(host, KEY_NOISE_ENABLED, SettingValue::Toggle(v));
-                refresh_config(host);
-                let _ = host.chat_line(Text::translate(
-                    if v {
-                        "distantsunrises.command.setting_on"
-                    } else {
-                        "distantsunrises.command.setting_off"
-                    },
-                    vec![Text::literal("noise")],
-                ));
-            }
-            None => {
-                let _ = host.chat_line(Text::translate(
-                    "distantsunrises.command.usage_toggle",
-                    vec![Text::literal("noise")],
-                ));
-            }
-        },
         "gen" => match parse_toggle_arg(arg) {
             Some(v) => {
                 write_setting(host, KEY_DISTANT_GENERATION, SettingValue::Toggle(v));
@@ -407,42 +281,6 @@ fn dispatch_client_command(host: &mut dyn ClientHost, sub: &str, arg: Option<&st
                 let _ = host.chat_line(Text::translate(
                     "distantsunrises.command.usage_toggle",
                     vec![Text::literal("gen")],
-                ));
-            }
-        },
-        "cavecull" => match parse_toggle_arg(arg) {
-            Some(v) => {
-                write_setting(host, KEY_CAVE_CULLING, SettingValue::Toggle(v));
-                refresh_config(host);
-                let _ = host.chat_line(Text::translate(
-                    if v {
-                        "distantsunrises.command.setting_on"
-                    } else {
-                        "distantsunrises.command.setting_off"
-                    },
-                    vec![Text::literal("cavecull")],
-                ));
-            }
-            None => {
-                let _ = host.chat_line(Text::translate(
-                    "distantsunrises.command.usage_toggle",
-                    vec![Text::literal("cavecull")],
-                ));
-            }
-        },
-        "vquality" => match arg.and_then(|s| s.parse::<u32>().ok()) {
-            Some(v) if v <= 3 => {
-                write_setting(host, KEY_VERTICAL_QUALITY, SettingValue::Choice(v as usize));
-                refresh_config(host);
-                let _ = host.chat_line(Text::translate(
-                    "distantsunrises.command.quality_set",
-                    vec![Text::literal(v.to_string())],
-                ));
-            }
-            _ => {
-                let _ = host.chat_line(Text::translate(
-                    "distantsunrises.command.usage_quality",
-                    Vec::new(),
                 ));
             }
         },
@@ -568,10 +406,7 @@ fn handle_bool_setting(host: &mut dyn ClientHost, key: &str, label: &str, arg: O
 struct QualityPreset {
     radius: u32,
     h_qual: u32,
-    v_qual: u32,
-    ssao_q: u32,
     ssao_on: bool,
-    sharpen: f64,
     label_key: &'static str,
 }
 
@@ -586,18 +421,7 @@ fn apply_preset(host: &mut dyn ClientHost, p: QualityPreset) {
         KEY_HORIZONTAL_QUALITY,
         SettingValue::Choice(p.h_qual as usize),
     );
-    write_setting(
-        host,
-        KEY_VERTICAL_QUALITY,
-        SettingValue::Choice(p.v_qual as usize),
-    );
     write_setting(host, KEY_SSAO_ENABLED, SettingValue::Toggle(p.ssao_on));
-    write_setting(
-        host,
-        KEY_SSAO_QUALITY,
-        SettingValue::Choice(p.ssao_q as usize),
-    );
-    write_setting(host, KEY_SHARPENING_AMOUNT, SettingValue::Range(p.sharpen));
     refresh_config(host);
     let _ = host.chat_line(Text::translate(
         "distantsunrises.command.preset_set",
@@ -667,6 +491,6 @@ mod tests {
     fn client_command_list_covers_ds_and_distantsunrises_aliases() {
         let mut cmds = Vec::new();
         register_client_commands(&mut cmds);
-        assert!(cmds.len() >= 12);
+        assert_eq!(cmds.len(), 30);
     }
 }
