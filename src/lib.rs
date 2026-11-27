@@ -45,13 +45,13 @@ use crate::lod::{
 use crate::render_bridge::{runtime, stats, sun_brightness_from_day_time_and_weather};
 use mod_api::client::fog::FogType;
 use mod_api::{
-    self, BlockChangedEvent, ChunkLoadEvent, ClientBlockChangedEvent, ClientChunkLoadEvent,
-    ClientChunkUnloadEvent, ClientHost, ClientLevelLoadEvent, ClientLevelUnloadEvent,
-    ClientReloadHost, ClientSetupContext, ClientSetupEvent, ClientTickPreEvent, DebugEntry,
-    DebugGroup, EntityRef, Heightmap, Hooks, Host, HostSide, LevelDimension, LevelHost,
-    LevelLoadEvent, LevelTickPostEvent, LevelUnloadEvent, RegisterClientCommandsEvent,
-    RegisterDebugEntriesEvent, Registrar, RegistrationContext, RenderFogEvent, ServerHost,
-    ServerStartedEvent, ServerStoppingEvent, SettingChangedEvent,
+    self, BlockChangedEvent, ChunkLoadEvent, ClientChunkLoadEvent, ClientChunkUnloadEvent,
+    ClientHost, ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientReloadHost, ClientSetupContext,
+    ClientSetupEvent, ClientTickPreEvent, DebugEntry, DebugGroup, EntityRef, Heightmap, Hooks,
+    Host, HostSide, LevelDimension, LevelHost, LevelLoadEvent, LevelTickPostEvent,
+    LevelUnloadEvent, RegisterClientCommandsEvent, RegisterDebugEntriesEvent, Registrar,
+    RegistrationContext, RenderFogEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent,
+    SettingChangedEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -245,14 +245,6 @@ impl Hooks for DistantHorizonsMod {
             .unwrap()
             .client_loaded_chunks
             .remove(&event.chunk);
-    }
-
-    fn client_block_changed(&self, host: &dyn ClientHost, event: &mut ClientBlockChangedEvent<'_>) {
-        if !host.on(MOD_ID) || event.predicted {
-            return;
-        }
-        // Record chunk coordinate for future client-side ChunkSnapshot refresh (G1/#5233).
-        let _ = (event.dimension, [event.pos.x >> 4, event.pos.z >> 4]);
     }
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
