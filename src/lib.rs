@@ -137,6 +137,15 @@ impl Hooks for DistantHorizonsMod {
     ) {
         let _ = resource_colors::reload_from_resources(host);
         pipeline::invalidate_models();
+        render_bridge::clear_quad_mesh();
+    }
+
+    fn client_player_logging_out(
+        &self,
+        host: &mut dyn ClientHost,
+        _event: &mut mod_api::ClientPlayerLoggingOutEvent,
+    ) {
+        render_bridge::drop_quad_mesh(host);
     }
 
     fn register_client_commands(

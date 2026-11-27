@@ -573,7 +573,8 @@ pub type SectionKey = (String, u8, [i32; 3]);
 struct ArenaState {
     arena: GpuArena,
     /// Shared quad index pattern (`0,1,2,2,1,3` per quad) the indirect commands index into.
-    quad_mesh: mod_api::MeshRef,
+    /// `None` after a Sunrise mesh retirement until recreated on demand in `prepare_draws`.
+    quad_mesh: Option<mod_api::MeshRef>,
     ids: HashMap<SectionKey, u32>,
 }
 
@@ -603,7 +604,7 @@ const MAX_QUADS_PER_COMMAND: u32 = 1 << 16;
 /// vertex stages pull quads from the arena by `gl_VertexID`). It has the stride of the default
 /// `position_tex_color` binding, which a pipeline with no declared binding must be drawn with.
 fn create_quad_mesh(
-    host: &mut dyn mod_api::ClientHost,
+    host: &dyn mod_api::ClientHost,
 ) -> Result<mod_api::MeshRef, crate::gpu_arena::ArenaError> {
     use mod_api::{IndexFormat, MeshBufferInit, MeshDescriptor, MeshIndexInit};
     let mut bytes = Vec::with_capacity(MAX_QUADS_PER_COMMAND as usize * 24);
@@ -634,10 +635,10 @@ fn create_state(
     config: ArenaConfig,
 ) -> Result<ArenaState, ArenaError> {
     let arena = GpuArena::new(host, config)?;
-    match create_quad_mesh(host) {
+    match create_quad_mesh(&*host) {
         Ok(quad_mesh) => Ok(ArenaState {
             arena,
-            quad_mesh,
+            quad_mesh: Some(quad_mesh),
             ids: HashMap::new(),
         }),
         Err(e) => {
@@ -649,8 +650,62 @@ fn create_state(
 
 /// Releases the quad mesh and every arena buffer, ignoring failures.
 fn release_state(host: &mut dyn mod_api::ClientHost, state: ArenaState) {
-    let _ = state.quad_mesh.release(&*host);
+    if let Some(mesh) = state.quad_mesh {
+        let _ = mesh.release(&*host);
+    }
     state.arena.release(host);
+}
+
+/// The live quad mesh, recreated into `slot` when a Sunrise mesh retirement cleared it.
+fn ensure_quad_mesh(
+    host: &dyn mod_api::ClientHost,
+    slot: &mut Option<mod_api::MeshRef>,
+) -> Result<mod_api::MeshRef, ArenaError> {
+    if let Some(mesh) = *slot {
+        return Ok(mesh);
+    }
+    let mesh = create_quad_mesh(host)?;
+    *slot = Some(mesh);
+    Ok(mesh)
+}
+
+/// Answers world close / client disconnect (`recipe_properties.rs:37 -> 46` ->
+/// `native_lifecycle.rs:232`, `clear_mod_meshes()`), which runs after `client_player_logging_out`
+/// on both integrated and remote clients (never on dimension change). Releases best-effort and
+/// clears the handle, leaving `GpuArena` intact; `prepare_draws` recreates it on demand.
+pub fn drop_quad_mesh(host: &dyn mod_api::ClientHost) {
+    if let Some(state) = ARENA.lock().unwrap().as_mut()
+        && let Some(old) = state.quad_mesh.take()
+    {
+        let _ = old.release(host);
+    }
+}
+
+/// Answers resource reload (`packs/mod.rs:650 -> 742`), where `clear_mod_meshes()` has already
+/// retired the handle before `client_resources_reloaded` fires (and `ClientReloadHost` has no
+/// `MeshContext`). Clears the handle, leaving `GpuArena` intact.
+pub fn clear_quad_mesh() {
+    if let Some(state) = ARENA.lock().unwrap().as_mut() {
+        state.quad_mesh = None;
+    }
+}
+
+/// A draw named a mesh Sunrise already retired.
+fn is_mesh_stale(err: &mod_api::PipelineDrawError) -> bool {
+    matches!(
+        err,
+        mod_api::PipelineDrawError::Mesh(mod_api::MeshError::Stale)
+    )
+}
+
+/// `(drawn sections, drawn quads)` for the status line when a terrain draw was prepared;
+/// `None` clears the status counters without counting a drawn frame.
+fn prepared_frame_counts(
+    prepared_terrain_draws: u32,
+    section_high_water: u32,
+    live_sections: usize,
+) -> Option<(u64, u64)> {
+    (prepared_terrain_draws > 0).then_some((section_high_water as u64, live_sections as u64))
 }
 
 /// Puts `tables` back in the queue unless newer ones were queued meanwhile.
@@ -841,6 +896,8 @@ pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaErr
     let mut guard = ARENA.lock().unwrap();
     purge_pending_dimension(&mut PENDING_SECTIONS.lock().unwrap(), dimension);
     let Some(state) = guard.as_mut() else {
+        drop(guard);
+        clear_frame_stats();
         return Ok(());
     };
     let doomed: Vec<_> = state
@@ -856,6 +913,8 @@ pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaErr
             result = Err(e);
         }
     }
+    drop(guard);
+    clear_frame_stats();
     result
 }
 
@@ -1155,15 +1214,31 @@ pub fn prepare_draws(
 ) {
     use mod_api::{DrawBindings, IndirectDraw, TextureSource};
     let Some(frame) = FRAME.lock().unwrap().clone() else {
+        clear_frame_stats();
         return;
     };
-    let guard = ARENA.lock().unwrap();
-    let Some(state) = guard.as_ref() else { return };
+    let mut guard = ARENA.lock().unwrap();
+    let Some(state) = guard.as_mut() else {
+        drop(guard);
+        clear_frame_stats();
+        return;
+    };
     let arena = &state.arena;
     let sections = arena.section_high_water();
     if !frame.enabled || sections == 0 {
+        drop(guard);
+        clear_frame_stats();
         return;
     }
+    let Some(quad_mesh) = report_arena(
+        "quad mesh recreate",
+        ensure_quad_mesh(host, &mut state.quad_mesh),
+    ) else {
+        drop(guard);
+        clear_frame_stats();
+        return;
+    };
+    let mut prepared_terrain_draws = 0u32;
     let assets = host.render_assets();
     let view_proj = camera.view_projection();
     let near_dh = 8.0;
@@ -1227,16 +1302,22 @@ pub fn prepare_draws(
         && SSAO_WRITTEN.load(Ordering::Acquire)
     {
         let bindings = DrawBindings::new().texture("SsaoTex", ssao_target.source());
-        if let Some(batch) = report(
-            "ssao_apply draw",
-            context.draw_mesh(
-                TRANSLUCENT_STAGE,
-                ssao_apply,
-                state.quad_mesh,
-                mod_api::MeshDraw::indexed(0..3, 0),
-                &bindings,
-            ),
-        ) {
+        let drawn = context.draw_mesh(
+            TRANSLUCENT_STAGE,
+            ssao_apply,
+            quad_mesh,
+            mod_api::MeshDraw::indexed(0..3, 0),
+            &bindings,
+        );
+        // Proxy reconfiguration retires every mod mesh without `client_player_logging_out` or
+        // `client_resources_reloaded` (`raw_ingress.rs:518`, `Event::Reconfiguring` ->
+        // `native_lifecycle_world_closed()` -> `clear_mod_meshes()`, sunrise-org/sunrise#6622).
+        if let Err(e) = &drawn
+            && is_mesh_stale(e)
+        {
+            state.quad_mesh = None;
+        }
+        if let Some(batch) = report("ssao_apply draw", drawn) {
             PREPARED.lock().unwrap().push((TRANSLUCENT_STAGE, batch));
         }
     }
@@ -1284,9 +1365,17 @@ pub fn prepare_draws(
                 .storage_buffer("BiomeTintBuffer", s.biome_tints)
                 .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
         };
-        let draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(state.quad_mesh);
-        if let Some(batch) = report("draw_indirect", context.draw_indirect(stage, &draw)) {
+        let draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(quad_mesh);
+        let drawn = context.draw_indirect(stage, &draw);
+        // Stale after proxy reconfiguration (`raw_ingress.rs:518`, sunrise-org/sunrise#6622).
+        if let Err(e) = &drawn
+            && is_mesh_stale(e)
+        {
+            state.quad_mesh = None;
+        }
+        if let Some(batch) = report("draw_indirect", drawn) {
             PREPARED.lock().unwrap().push((stage, batch));
+            prepared_terrain_draws += 1;
         }
     }
     // The shadow pass takes the pack-linked shadow pipeline through the same world stage when the
@@ -1322,15 +1411,24 @@ pub fn prepare_draws(
             arena.opaque_command_count(),
             &bindings,
         )
-        .with_mesh(state.quad_mesh);
-        if let Some(batch) = report(
-            "shadow draw_indirect",
-            context.draw_indirect(OPAQUE_STAGE, &draw),
-        ) {
+        .with_mesh(quad_mesh);
+        let drawn = context.draw_indirect(OPAQUE_STAGE, &draw);
+        // Stale after proxy reconfiguration (`raw_ingress.rs:518`, sunrise-org/sunrise#6622).
+        if let Err(e) = &drawn
+            && is_mesh_stale(e)
+        {
+            state.quad_mesh = None;
+        }
+        if let Some(batch) = report("shadow draw_indirect", drawn) {
             PREPARED.lock().unwrap().push((OPAQUE_STAGE, batch));
         }
     }
-    record_frame_stats(sections as u64, arena.live_sections() as u64);
+    let counts = prepared_frame_counts(prepared_terrain_draws, sections, arena.live_sections());
+    drop(guard);
+    match counts {
+        Some((drawn_sections, drawn_quads)) => record_frame_stats(drawn_sections, drawn_quads),
+        None => clear_frame_stats(),
+    }
 }
 
 /// Issues the draws prepared for `stage`. Called from `Hooks::render_level_stage`.
@@ -1524,6 +1622,13 @@ pub fn record_frame_stats(rendered_sections: u64, rendered_quads: u64) {
         .store(rendered_sections, Ordering::Relaxed);
     rt.rendered_quads.store(rendered_quads, Ordering::Relaxed);
     rt.frames_drawn.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Clears the status line's drawn counts without counting a drawn frame (unload or no-draw).
+pub fn clear_frame_stats() {
+    let rt = runtime();
+    rt.rendered_sections.store(0, Ordering::Relaxed);
+    rt.rendered_quads.store(0, Ordering::Relaxed);
 }
 
 /// Snapshot stats for the F3 debug screen.
@@ -1888,6 +1993,26 @@ mod tests {
         assert_eq!(arena_slot, Some(2));
         assert_eq!(released, [1]);
         assert_eq!(pending_dims(&pending), ["dim_b"]);
+    }
+
+    #[test]
+    fn prepared_frame_counts_skips_frame_when_no_terrain_draw_was_prepared() {
+        assert_eq!(prepared_frame_counts(0, 7, 5), None);
+        assert_eq!(prepared_frame_counts(1, 7, 5), Some((7, 5)));
+        assert_eq!(prepared_frame_counts(2, 7, 5), Some((7, 5)));
+    }
+
+    #[test]
+    fn is_mesh_stale_matches_only_a_retired_quad_mesh() {
+        use mod_api::{MeshError, PipelineDrawError};
+        assert!(is_mesh_stale(&PipelineDrawError::Mesh(MeshError::Stale)));
+        assert!(!is_mesh_stale(&PipelineDrawError::Mesh(
+            MeshError::Unavailable
+        )));
+        assert!(!is_mesh_stale(&PipelineDrawError::InvalidRange));
+        assert!(!is_mesh_stale(&PipelineDrawError::Buffer(
+            BufferError::Stale
+        )));
     }
 
     #[test]
