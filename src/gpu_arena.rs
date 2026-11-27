@@ -469,21 +469,23 @@ fn octree_ancestors(
 /// costs one node and every occupied internal parent an 8-child block, so the counts equal
 /// [`build_node_tree`]'s output lengths for the same sections.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NodeOccupancy {
+struct NodeOccupancy {
     roots: HashMap<[i32; 3], u32>,
     parents: HashMap<(u8, [i32; 3]), u32>,
 }
 
 impl NodeOccupancy {
-    pub fn node_count(&self) -> usize {
+    #[cfg(test)]
+    fn node_count(&self) -> usize {
         self.roots.len() + self.parents.len() * 8
     }
 
-    pub fn root_count(&self) -> usize {
+    #[cfg(test)]
+    fn root_count(&self) -> usize {
         self.roots.len()
     }
 
-    pub fn insert(&mut self, level: u8, pos: [i32; 3]) {
+    fn insert(&mut self, level: u8, pos: [i32; 3]) {
         let (root, steps) = octree_ancestors(level, pos);
         *self.roots.entry(root).or_insert(0) += 1;
         for (parent_level, parent_pos, _) in steps {
@@ -492,7 +494,7 @@ impl NodeOccupancy {
     }
 
     /// Releases one section previously passed to [`Self::insert`].
-    pub fn remove(&mut self, level: u8, pos: [i32; 3]) {
+    fn remove(&mut self, level: u8, pos: [i32; 3]) {
         fn release<K: std::hash::Hash + Eq>(counts: &mut HashMap<K, u32>, key: K) {
             if let Some(count) = counts.get_mut(&key) {
                 *count -= 1;
@@ -510,11 +512,7 @@ impl NodeOccupancy {
 
     /// Exact `(node_count, root_count)` after removing `old` (if any) and inserting `new`,
     /// without mutating. Ancestors `old` and `new` share are neither freed nor added.
-    pub fn projected_counts(
-        &self,
-        old: Option<(u8, [i32; 3])>,
-        new: (u8, [i32; 3]),
-    ) -> (usize, usize) {
+    fn projected_counts(&self, old: Option<(u8, [i32; 3])>, new: (u8, [i32; 3])) -> (usize, usize) {
         let ancestors = |(level, pos): (u8, [i32; 3])| {
             let (root, steps) = octree_ancestors(level, pos);
             (root, steps.map(|(l, p, _)| (l, p)).collect::<Vec<_>>())
@@ -1372,6 +1370,54 @@ mod tests {
             assert_eq!(actual, tree_of(&live), "tree at step {step}");
         }
         assert!(admitted > 0 && refused > 0, "{admitted} / {refused}");
+    }
+
+    #[test]
+    fn node_occupancy_keeps_shared_coordinates_until_both_ids_are_removed() {
+        let key = (0, [-3, 2, 5]);
+        let mut occupancy = NodeOccupancy::default();
+        let mut live = HashMap::new();
+        let expected = tree_of(&HashMap::from([(1, key)]));
+        assert_eq!(expected, (33, 1));
+        for id in [1, 2] {
+            let projected = occupancy.projected_counts(None, key);
+            live.insert(id, key);
+            occupancy.insert(key.0, key.1);
+            let actual = (occupancy.node_count(), occupancy.root_count());
+            assert_eq!(projected, expected);
+            assert_eq!(actual, projected);
+            assert_eq!(actual, tree_of(&live));
+        }
+        for (id, expected) in [(1, expected), (2, (0, 0))] {
+            let (level, pos) = live.remove(&id).unwrap();
+            occupancy.remove(level, pos);
+            let actual = (occupancy.node_count(), occupancy.root_count());
+            assert_eq!(actual, expected);
+            assert_eq!(actual, tree_of(&live));
+        }
+    }
+
+    #[test]
+    fn node_occupancy_and_built_tree_clamp_above_max_detail() {
+        use crate::octree::MAX_OCTREE_DETAIL;
+
+        let level = MAX_OCTREE_DETAIL + 2;
+        let pos = [-3, 2, 5];
+        let mut occupancy = NodeOccupancy::default();
+        let projected = occupancy.projected_counts(None, (level, pos));
+        occupancy.insert(level, pos);
+
+        let (nodes, roots) =
+            build_node_tree(&HashMap::from([(1, (level, pos, SectionAabb::FULL))]));
+        assert_eq!(projected, (1, 1));
+        assert_eq!((occupancy.node_count(), occupancy.root_count()), projected);
+        assert_eq!((nodes.len(), roots.len()), projected);
+        let root = nodes[roots[0] as usize];
+        assert_eq!(
+            unpack_section_pos([root.pos0, root.pos1]),
+            (MAX_OCTREE_DETAIL, pos)
+        );
+        assert_eq!(root.section_id, 1);
     }
 
     #[test]

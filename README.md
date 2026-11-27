@@ -69,12 +69,13 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
 
 ## Known limits
 
-- The GPU quad arena requests 128 MiB by default (falling back as low as 64 MiB if the GPU
-  refuses) and has no distance-based eviction yet. Once it is full, or the GPU octree reaches its
-  cap of 1,048,576 nodes (32 MiB) or 131,072 top-level roots, new sections are not stored or
-  drawn: the farthest newly loaded sections stay blank until terrain is cleared or unloaded.
-  Sections already stored keep drawing. A full quad arena is logged, and hitting the node cap is
-  logged once per session.
+- The GPU quad arena requests 128 MiB by default and can fall back to 64 MiB on constrained GPUs.
+  The GPU octree defaults to a cap of 1,048,576 nodes (32 MiB), halving alongside the quad arena
+  fallback down to 65,536 nodes (2 MiB), with a cap of 131,072 top-level roots. There is no
+  distance-based eviction. When capacity runs out, additional newly loaded sections are not stored
+  in the GPU arena or drawn, and fail to appear until terrain is cleared or unloaded. Sections
+  already stored keep drawing. A full quad arena is logged, and hitting the node cap is logged
+  once per session.
 - `octree_sync` serves sections by dimension. A published server drains all dimensions' outgoing
   terrain traffic after successful Overworld ticks when the mod is enabled and the server has time.
 - Shader-pack shadows draw with the camera-culled command list, so casters outside the view are

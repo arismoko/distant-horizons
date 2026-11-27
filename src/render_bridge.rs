@@ -623,13 +623,14 @@ struct ArenaState<Arena, Mesh> {
     node_cap: NodeCapGate,
 }
 
-/// Sections the arena refused for lack of octree nodes, and whether that was logged yet. A
-/// refused key is not tried again, even if the pipeline submits it again, until a section is
-/// removed and nodes may be free; the log line is printed once per session.
+/// Whether the cap was logged in this play session, independent of GPU arena lifetime.
+static NODE_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Sections the arena refused for lack of octree nodes. A refused key is not tried again
+/// until a section is removed and nodes may be free, or the arena is recreated.
 #[derive(Default)]
 struct NodeCapGate {
     refused: HashSet<SectionKey>,
-    logged: bool,
 }
 
 impl NodeCapGate {
@@ -642,11 +643,12 @@ impl NodeCapGate {
         &mut self,
         key: SectionKey,
         (needed_nodes, max_nodes, needed_roots, max_roots): (usize, usize, usize, usize),
+        logged: &AtomicBool,
     ) -> Option<String> {
         self.refused.insert(key);
-        (!std::mem::replace(&mut self.logged, true)).then(|| {
+        (!logged.swap(true, Ordering::AcqRel)).then(|| {
             format!(
-                "distantsunrises: GPU octree node cap reached ({needed_nodes}/{max_nodes} nodes, {needed_roots}/{max_roots} roots); skipping additional far sections until sections are removed"
+                "distantsunrises: GPU octree node cap reached ({needed_nodes}/{max_nodes} nodes, {needed_roots}/{max_roots} roots); skipping additional sections until sections are removed"
             )
         })
     }
@@ -654,12 +656,6 @@ impl NodeCapGate {
     /// A section was removed, so refused keys may fit again.
     fn lift(&mut self) {
         self.refused.clear();
-    }
-
-    /// A new play session: the cap may be logged again.
-    fn reset_session(&mut self) {
-        self.lift();
-        self.logged = false;
     }
 }
 
@@ -982,7 +978,7 @@ fn try_upload_pending(
                 max_roots,
             }) => {
                 let counts = (needed_nodes, max_nodes, needed_roots, max_roots);
-                if let Some(line) = state.node_cap.refuse(key, counts) {
+                if let Some(line) = state.node_cap.refuse(key, counts, &NODE_CAP_LOGGED) {
                     eprintln!("{line}");
                 }
             }
@@ -1021,12 +1017,12 @@ pub(crate) fn clear_sections(dimension: Option<&str>) {
             false
         });
         state.node_cap.refused.retain(|key| keep(key));
-        if dimension.is_none() {
-            state.node_cap.reset_session();
-        }
         if state.arena.section_high_water() == 0 {
             clear_arena_stats();
         }
+    }
+    if dimension.is_none() {
+        NODE_CAP_LOGGED.store(false, Ordering::Release);
     }
 }
 
@@ -2145,37 +2141,43 @@ mod tests {
     #[test]
     fn node_cap_gate_suppresses_logs_once_and_resets_with_removals_and_sessions() {
         let key = |x: i32| -> SectionKey { ("minecraft:overworld".into(), 0, [x, 0, 0]) };
+        let logged = AtomicBool::new(false);
+        let counts = (66, 33, 2, 8);
+        {
+            let mut gate = NodeCapGate::default();
+            assert!(!gate.is_suppressed(&key(1)));
+            assert_eq!(
+                gate.refuse(key(1), counts, &logged).as_deref(),
+                Some(
+                    "distantsunrises: GPU octree node cap reached (66/33 nodes, 2/8 roots); skipping additional sections until sections are removed"
+                )
+            );
+            assert!(gate.is_suppressed(&key(1)));
+            assert!(!gate.is_suppressed(&key(2)));
+
+            // A second refusal in the same session is suppressed but not logged again.
+            assert_eq!(gate.refuse(key(2), counts, &logged), None);
+            assert!(gate.is_suppressed(&key(2)));
+
+            // A removal lifts suppression, but does not rearm the log.
+            gate.lift();
+            assert!(!gate.is_suppressed(&key(1)) && !gate.is_suppressed(&key(2)));
+            assert_eq!(gate.refuse(key(1), counts, &logged), None);
+        }
+
+        // GPU retirement drops the gate, not the session diagnostic.
+        {
+            let mut gate = NodeCapGate::default();
+            assert!(!gate.is_suppressed(&key(1)));
+            assert_eq!(gate.refuse(key(1), counts, &logged), None);
+            assert!(gate.is_suppressed(&key(1)));
+        }
+
+        // A session reset rearms the log even if no arena exists at the time.
+        logged.store(false, Ordering::Release);
         let mut gate = NodeCapGate::default();
-        assert!(!gate.is_suppressed(&key(1)));
-
-        let line = gate.refuse(key(1), (66, 33, 2, 8));
-        assert_eq!(
-            line.as_deref(),
-            Some(
-                "distantsunrises: GPU octree node cap reached (66/33 nodes, 2/8 roots); skipping additional far sections until sections are removed"
-            )
-        );
-        assert!(gate.is_suppressed(&key(1)));
-        assert!(!gate.is_suppressed(&key(2)));
-
-        // A second refusal in the same session is suppressed but not logged again.
-        assert_eq!(gate.refuse(key(2), (99, 33, 3, 8)), None);
-        assert!(gate.is_suppressed(&key(2)));
-
-        // A removal lifts suppression, so the key can be attempted again; the log stays spent.
-        gate.lift();
-        assert!(!gate.is_suppressed(&key(1)) && !gate.is_suppressed(&key(2)));
-        assert_eq!(gate.refuse(key(1), (66, 33, 2, 8)), None);
-
-        // A session clear lifts suppression and lets the next session log once more.
-        gate.reset_session();
-        assert!(!gate.is_suppressed(&key(1)));
-        assert!(
-            gate.refuse(key(1), (70, 33, 2, 8))
-                .unwrap()
-                .contains("(70/33 nodes")
-        );
-        assert_eq!(gate.refuse(key(3), (70, 33, 2, 8)), None);
+        assert!(gate.refuse(key(1), counts, &logged).is_some());
+        assert_eq!(gate.refuse(key(2), counts, &logged), None);
     }
 
     #[test]
