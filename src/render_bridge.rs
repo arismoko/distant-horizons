@@ -508,7 +508,12 @@ fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<HizTarge
     Some(made)
 }
 
-/// Mod-owned `R32Float` SSAO output target, resized with the viewport.
+/// Half-resolution SSAO target size, rounded up.
+fn ssao_size(viewport: [u32; 2]) -> [u32; 2] {
+    [viewport[0].div_ceil(2), viewport[1].div_ceil(2)]
+}
+
+/// Mod-owned half-resolution `R32Float` SSAO output target, resized with the viewport.
 struct SsaoTarget {
     target: mod_api::RenderTargetRef,
     size: [u32; 2],
@@ -1206,12 +1211,13 @@ pub fn setup_compute(
     report("add_compute_pass", added);
 
     // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
-    // Uses the target ensured during `prepare_draws` so a resize never frees a handle already
-    // bound by this frame's `ssao_apply` draw.
+    // `frame_graph_setup` runs before `prepare_render_buffers` in Dev 2, so compute ensures the
+    // `ssao_size` target first and `prepare_draws` ensures the same size before binding it.
+    let [sw, sh] = ssao_size([w, h]);
     if frame.config.ssao_enabled
         && let (Ok(ssao_pipe), Some(ssao_target)) = (
             assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
-            ensure_ssao(host, [w, h]),
+            ensure_ssao(host, [sw, sh]),
         )
     {
         let clip_dist = vanilla_clip_dist(&frame);
@@ -1222,7 +1228,7 @@ pub fn setup_compute(
                 camera.near,
                 clip_dist,
             ])
-            .i32s(&[w as i32, h as i32, 0, 0])
+            .i32s(&[sw as i32, sh as i32, w as i32, h as i32])
             .0;
         let ssao_desc = ComputePassDescriptor::new("distantsunrises:ssao")
             .reads(FrameTarget::MainDepth)
@@ -1239,7 +1245,7 @@ pub fn setup_compute(
                 ctx.dispatch(
                     ssao_pipe,
                     &bindings,
-                    [w.div_ceil(HIZ_WORKGROUP), h.div_ceil(HIZ_WORKGROUP), 1],
+                    [sw.div_ceil(HIZ_WORKGROUP), sh.div_ceil(HIZ_WORKGROUP), 1],
                 ),
             );
         });
@@ -1334,15 +1340,14 @@ pub fn prepare_draws(
     };
     let s = arena.slices;
     // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws.
-    // Ensure the target for the current window size here (before `setup_compute`) so resize
-    // reallocations happen once per frame before any draw holds the handle.
+    // Ensure the same `ssao_size` as `setup_compute` so the draw uses its target.
     if frame.config.ssao_enabled
         && let (Some(win_size), Ok(ssao_apply), Ok(_)) = (
             host.window_size(),
             assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
             assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
         )
-        && let Some(ssao_target) = ensure_ssao(host, win_size)
+        && let Some(ssao_target) = ensure_ssao(host, ssao_size(win_size))
         // Checked after `ensure_ssao`, which clears the flag when it reallocates the target.
         && SSAO_WRITTEN.load(Ordering::Acquire)
     {
@@ -1871,6 +1876,13 @@ mod tests {
     use super::*;
     use mod_api::BufferError;
     use std::cell::Cell;
+
+    #[test]
+    fn ssao_size_rounds_up_to_half_resolution() {
+        assert_eq!(ssao_size([1920, 1080]), [960, 540]);
+        assert_eq!(ssao_size([1921, 1081]), [961, 541]);
+        assert_eq!(ssao_size([1, 1]), [1, 1]);
+    }
 
     #[test]
     fn dh_state_clears_dimension_world_and_client_session_state_preserving_api_hooks() {
