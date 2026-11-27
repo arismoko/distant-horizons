@@ -1614,9 +1614,10 @@ pub mod octree_sync {
             level: String,
             pos: OctreeSectionPos,
         },
-        /// A full response whose assembled buffer failed to decode or rebuild. The server sent
-        /// the same unreadable bytes it would send again, so the client stops asking for `pos`
-        /// for the rest of the play session.
+        /// A full response whose assembled buffer failed to decode or rebuild, or held a section
+        /// for another position than the request. The server sent the same unreadable bytes it
+        /// would send again, so the client stops asking for `pos` for the rest of the play
+        /// session.
         Unreadable {
             level: String,
             pos: OctreeSectionPos,
@@ -1725,7 +1726,15 @@ pub mod octree_sync {
                             None => events.push(ClientEvent::Lost { level, pos }),
                             Some(buffer) => match OctreeSectionDto::decode(&buffer)
                                 .and_then(|dto| dto.into_section())
-                            {
+                                .and_then(|(section, mapping)| {
+                                    // The reply answers the pending request, so it must carry
+                                    // that request's section.
+                                    if section.pos == pos {
+                                        Ok((section, mapping))
+                                    } else {
+                                        Err(SyncError::BadPos)
+                                    }
+                                }) {
                                 Ok((section, mapping)) => events.push(ClientEvent::Section {
                                     level,
                                     section,
@@ -2096,6 +2105,52 @@ pub mod octree_sync {
             assert!(matches!(
                 intake.events.as_slice(),
                 [ClientEvent::Unreadable { level, pos: bad }] if level == LEVEL && *bad == pos
+            ));
+
+            intake.events.clear();
+            intake.receive(&response, now, || true).unwrap();
+            assert!(intake.events.is_empty(), "a retired future completes once");
+        }
+
+        #[test]
+        fn full_response_for_another_position_queues_unreadable_and_retires_the_future() {
+            let now = Instant::now();
+            let pos_a = OctreeSectionPos::new(0, 2, 1, -3);
+            let pos_b = OctreeSectionPos::new(0, 3, 1, -3);
+            let dto = OctreeSectionDto::from_section(
+                &varied_section(pos_b, 1),
+                &[],
+                DhV2CompressionMode::Uncompressed,
+                0,
+            )
+            .unwrap();
+            let (payload, buffer) = OctreePayload::new(&dto, Vec::new()).unwrap();
+            let split = Message::Split(SplitMessage {
+                buffer_id: payload.buffer_id,
+                buffer,
+                is_first: true,
+            })
+            .encode()
+            .unwrap();
+            let response = Message::Response(OctreeSectionResponse {
+                future_id: 0,
+                payload: Some(payload),
+            })
+            .encode()
+            .unwrap();
+            let mut intake = ClientIntake::default();
+            assert!(intake.configure(|_| Ok(PayloadAccepted::Queued)));
+            assert!(intake.send_request(LEVEL, pos_a, None, |_| Ok(PayloadAccepted::Queued)));
+
+            intake.receive(&split, now, || true).unwrap();
+            assert_eq!(
+                intake.receive(&response, now, || true),
+                Err(SyncError::BadPos)
+            );
+            assert!(intake.session.pending.is_empty());
+            assert!(matches!(
+                intake.events.as_slice(),
+                [ClientEvent::Unreadable { level, pos }] if level == LEVEL && *pos == pos_a
             ));
 
             intake.events.clear();
