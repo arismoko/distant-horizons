@@ -9,6 +9,7 @@ use crate::bakery::{
     MODEL_TRANSLUCENT, SpriteError, SpritePixels, SpriteSource, default_translucent, pack_rgba,
 };
 use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
+use crate::lod::SectionPos;
 use crate::mesh::{SectionQuads, mesh_octree_section_masked};
 use crate::network::octree_sync::{ClientEvent, MappingEntry, OctreeSectionDto, ServerSource};
 use crate::octree::Voxel;
@@ -384,6 +385,53 @@ impl Pipeline {
             }
         }
         queued
+    }
+
+    /// Collect up to `budget` unrequested octree disk loads in desired-leaf order, probing
+    /// missing leaves and their coarser ancestor chain through `MAX_OCTREE_DETAIL` so saved
+    /// coarser sections survive movement or quality increases. Advance `cursor` only after
+    /// every cell and ancestor probe of the current leaf is stored or requested.
+    fn collect_stored_requests_for_leaves(
+        &mut self,
+        dim: &str,
+        leaves: &[SectionPos],
+        cursor: &mut usize,
+        budget: usize,
+    ) -> Vec<OctreeSectionPos> {
+        if budget == 0 || *cursor >= leaves.len() {
+            return Vec::new();
+        }
+        const Y_SECTIONS: std::ops::RangeInclusive<i32> = -2..=9;
+        let requested = self.requested.entry(dim.to_owned()).or_default();
+        let store = self.stores.get(dim);
+        let mut out = Vec::new();
+        while let Some(leaf) = leaves.get(*cursor) {
+            let level = leaf.detail.min(crate::octree::MAX_OCTREE_DETAIL);
+            let span = 2i32 << (leaf.detail - level);
+            let (sx0, sz0) = (leaf.x * span, leaf.z * span);
+            for sx in sx0..sx0 + span {
+                for sz in sz0..sz0 + span {
+                    for sy in (Y_SECTIONS.start() >> level)..=(Y_SECTIONS.end() >> level) {
+                        let mut cur = Some(OctreeSectionPos::new(level, sx, sy, sz));
+                        while let Some(candidate) = cur {
+                            if store.is_some_and(|s| s.section(candidate).is_some()) {
+                                break;
+                            }
+                            if !requested.contains(&candidate) {
+                                if out.len() >= budget {
+                                    return out;
+                                }
+                                requested.insert(candidate);
+                                out.push(candidate);
+                            }
+                            cur = candidate.parent();
+                        }
+                    }
+                }
+            }
+            *cursor += 1;
+        }
+        out
     }
 
     fn adopt_loaded_entries(
@@ -993,44 +1041,28 @@ pub fn flush_saves(io: &LodIoWorker, world_dir: &Path, limit: usize) -> usize {
     PIPELINE.lock().unwrap().flush_saves(io, world_dir, limit)
 }
 
-/// Ask disk (single player and server) for stored sections around `center` that the store does not
-/// hold yet: every level from fine to coarse, `radius` sections out, at most `budget` requests.
-pub fn request_stored_sections(
+/// Ask disk for stored octree sections covering the desired leaves across the full configured
+/// render distance, paced by `cursor` and bounded by `budget`.
+pub fn request_stored_sections_for_leaves(
     io: &LodIoWorker,
     world_dir: &Path,
     dim: &str,
-    center: [f64; 3],
-    radius: i32,
+    leaves: &[SectionPos],
+    cursor: &mut usize,
     budget: usize,
-) {
-    const Y_SECTIONS: std::ops::RangeInclusive<i32> = -2..=9;
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
-    let requested = p.requested.entry(dim.to_owned()).or_default();
-    let store = p.stores.get(dim);
-    let mut left = budget;
-    for level in 0..=crate::octree::MAX_OCTREE_DETAIL {
-        let edge = (crate::octree::SECTION_EDGE as f64) * f64::from(1u32 << level);
-        let (cx, cz) = (
-            (center[0] / edge).floor() as i32,
-            (center[2] / edge).floor() as i32,
-        );
-        for sx in cx - radius..=cx + radius {
-            for sz in cz - radius..=cz + radius {
-                for sy in (Y_SECTIONS.start() >> level)..=(Y_SECTIONS.end() >> level) {
-                    let pos = OctreeSectionPos::new(level, sx, sy, sz);
-                    if left == 0 {
-                        return;
-                    }
-                    if store.is_some_and(|s| s.section(pos).is_some()) || !requested.insert(pos) {
-                        continue;
-                    }
-                    io.load_octree_section(world_dir.to_owned(), dim.to_owned(), pos);
-                    left -= 1;
-                }
-            }
-        }
+) -> usize {
+    if budget == 0 {
+        return 0;
     }
+    let positions = PIPELINE
+        .lock()
+        .unwrap()
+        .collect_stored_requests_for_leaves(dim, leaves, cursor, budget);
+    let count = positions.len();
+    for pos in positions {
+        io.load_octree_section(world_dir.to_owned(), dim.to_owned(), pos);
+    }
+    count
 }
 
 /// Adopt sections the I/O worker finished loading, translating their ids to this session's.
@@ -1170,6 +1202,130 @@ pub fn install_sync_source() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DhConfig;
+    use crate::lod::DimensionLodStore;
+    use crate::octree::MAX_OCTREE_DETAIL;
+
+    #[test]
+    fn leaf_disk_reload_covers_full_render_distance_with_cursor_and_backpressure() {
+        let dim = "minecraft:overworld";
+        let mut leaves =
+            DimensionLodStore::desired_sections_coarse_to_fine(0.0, 0.0, DhConfig::default());
+        leaves.extend([SectionPos::new(5, -3, 2), SectionPos::new(6, 3, -3)]);
+        let mut p = Pipeline::default();
+        let mut cursor = 0;
+        assert!(
+            p.collect_stored_requests_for_leaves(dim, &leaves, &mut cursor, 0)
+                .is_empty()
+        );
+        assert_eq!(cursor, 0);
+        assert!(p.requested.is_empty());
+
+        let mut expected = HashSet::new();
+        for &leaf in &leaves {
+            let (x, z) = leaf.block_origin();
+            let width = leaf.block_span();
+            for detail in leaf.detail.min(MAX_OCTREE_DETAIL)..=MAX_OCTREE_DETAIL {
+                let edge = OctreeSectionPos::new(detail, 0, 0, 0).block_span();
+                for sx in x.div_euclid(edge)..=(x + width - 1).div_euclid(edge) {
+                    for sz in z.div_euclid(edge)..=(z + width - 1).div_euclid(edge) {
+                        for sy in (-64i32).div_euclid(edge)..=319i32.div_euclid(edge) {
+                            expected.insert(OctreeSectionPos::new(detail, sx, sy, sz));
+                        }
+                    }
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        while cursor < leaves.len() {
+            let previous = cursor;
+            let batch = p.collect_stored_requests_for_leaves(dim, &leaves, &mut cursor, 20);
+            assert!(batch.len() <= 20);
+            assert!(cursor > previous || !batch.is_empty());
+            if seen.is_empty() {
+                let (x, z) = leaves[0].block_origin();
+                assert_eq!(batch.len(), 20);
+                assert_eq!(batch[0], OctreeSectionPos::new(0, x / 32, -2, z / 32));
+                assert_eq!(cursor, 0, "the first leaf is still being drained");
+            }
+            for pos in batch {
+                assert!(seen.insert(pos), "duplicate request for {pos:?}");
+            }
+        }
+        assert_eq!(cursor, leaves.len());
+        assert!(
+            seen.iter()
+                .any(|p| p.detail == 0 && p.x.abs().max(p.z.abs()) > 8)
+        );
+        assert_eq!(seen, expected);
+
+        // Isolate one fine cell's chain: every other fine cell of this leaf is resident.
+        let leaf = [SectionPos::new(0, 0, 0)];
+        let fine = OctreeSectionPos::new(0, 0, -2, 0);
+        for (resident, want) in [(fine, vec![]), (fine.parent().unwrap(), vec![fine])] {
+            let mut p = Pipeline::default();
+            let store = p.stores.entry(dim.to_owned()).or_default();
+            for &pos in &expected {
+                if pos.detail == 0
+                    && (0..2).contains(&pos.x)
+                    && (0..2).contains(&pos.z)
+                    && pos != fine
+                {
+                    store.adopt_section(OctreeSection::new(pos));
+                }
+            }
+            store.adopt_section(OctreeSection::new(resident));
+            let mut cursor = 0;
+            assert_eq!(
+                p.collect_stored_requests_for_leaves(dim, &leaf, &mut cursor, 20),
+                want
+            );
+            assert_eq!(cursor, leaf.len());
+        }
+    }
+
+    #[test]
+    fn leaf_disk_reload_recovers_saved_coarse_d1_section_under_high_quality_d0_leaves() {
+        use crate::storage::{RegionCache, fresh_tmp_dir};
+
+        let cfg = DhConfig::default();
+        let (x, z) = (384, 0);
+        let desired = |config| DimensionLodStore::desired_sections_coarse_to_fine(0.0, 0.0, config);
+        assert!(desired(cfg).contains(&SectionPos::from_block(1, x, z)));
+        let leaves = desired(DhConfig {
+            horizontal_quality: 2,
+            ..cfg
+        });
+        assert!(leaves.contains(&SectionPos::from_block(0, x, z)));
+
+        let dim = "minecraft:overworld";
+        let dir = fresh_tmp_dir("reload-coarse-section");
+        let saved = OctreeSectionPos::new(1, 6, 1, 0);
+        let voxel = Voxel::new(1, 0, 15, 0);
+        let section = OctreeSection::filled(saved, voxel);
+        RegionCache::default()
+            .save_octree_section(
+                &dir,
+                dim,
+                &section,
+                &OctreeMapping::default(),
+                DEFAULT_OCTREE_COMPRESSION,
+            )
+            .unwrap();
+        let mut p = Pipeline::default();
+        let mut cache = RegionCache::default();
+        let mut cursor = 0;
+        let found: Vec<_> = p
+            .collect_stored_requests_for_leaves(dim, &leaves, &mut cursor, usize::MAX)
+            .into_iter()
+            .filter_map(|pos| cache.load_octree_section(&dir, dim, pos))
+            .map(|(section, _)| (section.pos, section.get(0, 0, 0)))
+            .collect();
+        drop(cache);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(cursor, leaves.len());
+        assert_eq!(found, [(saved, voxel)]);
+    }
 
     #[test]
     fn flush_saves_before_clear_dimension_persists_dirty_octree_section() {

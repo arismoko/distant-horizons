@@ -1600,6 +1600,11 @@ impl LodIoWorker {
         self.shared.wake_worker.notify_one();
     }
 
+    /// Number of queued octree disk loads waiting for the worker thread.
+    pub(crate) fn pending_octree_loads_len(&self) -> usize {
+        self.shared.state.lock().unwrap().pending_octree_loads.len()
+    }
+
     /// Discard queued loads and buffered load replies without interrupting saves.
     /// An in-flight load may still finish, but its reply is skipped at drain.
     pub fn cancel_loads_and_advance_session(&self) {
@@ -2090,17 +2095,11 @@ mod tests {
         worker.request_save(world_a.clone(), dim.into(), column.clone());
         worker.load_octree_section(world_a.clone(), dim.into(), octree_pos);
         worker.request_load(world_a.clone(), dim.into(), column_pos);
-        {
-            let st = worker.shared.state.lock().unwrap();
-            assert_eq!(st.pending_octree_loads.len(), 1);
-            assert_eq!(st.pending_loads.len(), 1);
-        }
+        assert_eq!(worker.pending_octree_loads_len(), 1);
+        assert_eq!(worker.shared.state.lock().unwrap().pending_loads.len(), 1);
         worker.cancel_loads_and_advance_session();
-        {
-            let st = worker.shared.state.lock().unwrap();
-            assert!(st.pending_octree_loads.is_empty());
-            assert!(st.pending_loads.is_empty());
-        }
+        assert_eq!(worker.pending_octree_loads_len(), 0);
+        assert!(worker.shared.state.lock().unwrap().pending_loads.is_empty());
 
         let shared = Arc::clone(&worker.shared);
         *worker.handle.lock().unwrap() = Some(thread::spawn(move || run_io_worker(shared)));

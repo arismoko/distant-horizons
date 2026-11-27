@@ -42,7 +42,9 @@ use crate::lod::{
     DimensionLodStore, LodColumn, SECTION_SIZE, SOURCE_DISTANT_SURFACE, SOURCE_LOADED_CHUNK,
     SectionPos,
 };
-use crate::render_bridge::{runtime, stats, sun_brightness_from_day_time_and_weather};
+use crate::render_bridge::{
+    DesiredCache, DhState, runtime, stats, sun_brightness_from_day_time_and_weather,
+};
 use mod_api::client::fog::FogType;
 use mod_api::{
     self, BlockChangedEvent, ChunkLoadEvent, ClientBlockChangedEvent, ClientChunkLoadEvent,
@@ -54,8 +56,8 @@ use mod_api::{
     ServerStartedEvent, ServerStoppedEvent, ServerStoppingEvent, SettingChangedEvent,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 /// Depth below the `WorldSurface` heightmap scanned per loaded chunk column to see through
 /// foliage/water to the solid ocean/ground floor.
@@ -528,11 +530,44 @@ fn enqueue_chunk(dimension: &str, chunk: [i32; 2]) {
     }
 }
 
-/// Level-0 sections around a player asked of disk per tick budget / radius.
+/// Radius in level-0 sections for remote octree sync.
 const STORED_RADIUS_SECTIONS: i32 = 8;
+/// Queue cap matching `MAX_PENDING_MESH_JOBS`. Voxy paces `RenderDistanceTracker` at
+/// 40 updates/frame and `HierarchicalOcclusionTraverser` at up to 50 requests/frame
+/// toward 4000 pending mesh tasks.
 const STORED_REQUESTS_PER_TICK: usize = 64;
 const SYNC_REQUESTS_PER_TICK: usize = 16;
 const SAVES_PER_TICK: usize = 32;
+
+/// Selects the next unexhausted `(dimension, target_key, center)` from sorted `targets`
+/// starting at `*cursor`, advancing `*cursor` past it. When `open == 0`, returns `None`
+/// without advancing `*cursor`.
+fn pick_disk_reload_target(
+    targets: &[(String, u128, [f64; 3])],
+    open: usize,
+    cursor: &mut usize,
+    is_exhausted: impl Fn(&str, u128, [f64; 3]) -> bool,
+) -> Option<(String, u128, [f64; 3])> {
+    let n = targets.len();
+    if n == 0 {
+        *cursor = 0;
+        return None;
+    }
+    if open == 0 {
+        return None;
+    }
+    let start = *cursor % n;
+    for offset in 0..n {
+        let idx = (start + offset) % n;
+        let (dim, key, pos) = &targets[idx];
+        if is_exhausted(dim, *key, *pos) {
+            continue;
+        }
+        *cursor = (idx + 1) % n;
+        return Some((dim.clone(), *key, *pos));
+    }
+    None
+}
 
 fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
     let rt = runtime();
@@ -596,13 +631,6 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             .filter_map(|p| EntityRef::from(p).position(host).map(|pos| (p.uuid(), pos)))
             .collect();
         if !player_centers.is_empty() {
-            // Evict cache entries for players no longer in this dimension.
-            {
-                let mut st = rt.inner.lock().unwrap();
-                st.desired_cache.retain(|(d, key), _| {
-                    d != dim || *key == 0 || player_centers.iter().any(|(u, _)| u == key)
-                });
-            }
             let n = player_centers.len();
             for offset in 0..n {
                 let idx = (rr_cursor + offset) % n;
@@ -638,8 +666,8 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
         }
     }
 
-    // 4. Octree persistence and sync: adopt stored sections near the players, save changed ones,
-    //    and serve connected clients.
+    // 4. Octree persistence and sync: adopt stored sections across the configured render
+    //    distance, save changed ones, and serve connected clients.
     let players: Vec<_> = host
         .players()
         .server_players()
@@ -652,18 +680,67 @@ fn tick_server_dimension(host: &mut dyn ServerHost, dim: &str) {
             .map(|&(p, pos)| (p, (pos[0] as i32, pos[2] as i32)))
             .collect(),
     );
-    if let Some(dir) = rt.inner.lock().unwrap().world_dir.clone() {
+    let save_root = rt.inner.lock().unwrap().world_dir.clone();
+    let mut reload_targets = Vec::new();
+    let mut reload = None;
+    let budget = STORED_REQUESTS_PER_TICK.saturating_sub(rt.io.pending_octree_loads_len());
+    if cfg.enabled {
+        reload_targets.extend(players.iter().filter_map(|&(p, pos)| {
+            let d = p.dimension(host)?;
+            Some((d.as_str().to_owned(), p.uuid(), pos))
+        }));
+        if reload_targets.is_empty()
+            && let Some(center) = cam
+        {
+            reload_targets.push((active_dim.clone(), 0, center));
+        }
+        reload_targets.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+
+        let mut guard = rt.inner.lock().unwrap();
+        let st = &mut *guard;
+        st.desired_cache.retain(|(d, key), _| {
+            d != dim
+                || (*key == 0 && cam.is_some() && dim == active_dim)
+                || reload_targets
+                    .iter()
+                    .any(|(td, tk, _)| td == dim && tk == key)
+        });
+        if save_root.is_some() {
+            let caches = &st.desired_cache;
+            let chosen = pick_disk_reload_target(
+                &reload_targets,
+                budget,
+                &mut st.disk_reload_cursor,
+                |d, key, pos| {
+                    caches.get(&(d.to_owned(), key)).is_some_and(|c| {
+                        c.octree_disk_cursor >= c.list.len() && desired_cache_matches(c, pos, cfg)
+                    })
+                },
+            );
+            if let Some((target_dim, target_key, center)) = chosen {
+                let key = (target_dim, target_key);
+                let cache = ensure_desired_cache(st, key.clone(), center, cfg);
+                reload = Some((key, Arc::clone(&cache.list), cache.octree_disk_cursor));
+            }
+        }
+    }
+    if let Some(dir) = save_root {
         pipeline::adopt_loaded(host, &rt.io);
-        let center = players.first().map(|&(_, pos)| pos).or(cam);
-        if let Some(center) = center {
-            pipeline::request_stored_sections(
+        if let Some((key, list, mut cursor)) = reload {
+            pipeline::request_stored_sections_for_leaves(
                 &rt.io,
                 &dir,
-                dim,
-                center,
-                STORED_RADIUS_SECTIONS,
-                STORED_REQUESTS_PER_TICK,
+                &key.0,
+                &list,
+                &mut cursor,
+                budget,
             );
+            let mut st = rt.inner.lock().unwrap();
+            if let Some(cache) = st.desired_cache.get_mut(&key)
+                && Arc::ptr_eq(&cache.list, &list)
+            {
+                cache.octree_disk_cursor = cache.octree_disk_cursor.max(cursor);
+            }
         }
         pipeline::flush_saves(&rt.io, &dir, SAVES_PER_TICK);
     }
@@ -837,8 +914,43 @@ enum SampleOutcome {
     Sampled,
 }
 
-/// Advances unthrottled async disk-load checks and, when this dimension's cooldown has elapsed,
-/// runs distant-sampling batches up to `DISTANT_SAMPLE_BUDGET` (4 ms/tick).
+fn desired_cache_matches(cache: &DesiredCache, cam: [f64; 3], cfg: DhConfig) -> bool {
+    cache.config == cfg
+        && cache.center[0]
+            .abs_diff(cam[0].floor() as i32)
+            .saturating_add(cache.center[1].abs_diff(cam[2].floor() as i32))
+            < SECTION_SIZE as u32
+}
+
+/// Rebuilds the desired leaves after a config change or movement of at least 64 blocks
+/// Manhattan distance, matching DH's `QuadTree.setCenterBlockPos` node-clearing threshold
+/// `FullDataSourceV2.WIDTH`.
+fn ensure_desired_cache(
+    st: &mut DhState,
+    cache_key: (String, u128),
+    cam: [f64; 3],
+    cfg: DhConfig,
+) -> &mut DesiredCache {
+    let rebuild = || DesiredCache {
+        center: [cam[0].floor() as i32, cam[2].floor() as i32],
+        config: cfg,
+        list: DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg).into(),
+        disk_cursor: 0,
+        octree_disk_cursor: 0,
+        sample_cursor: 0,
+    };
+    st.desired_cache
+        .entry(cache_key)
+        .and_modify(|cache| {
+            if !desired_cache_matches(cache, cam, cfg) {
+                *cache = rebuild();
+            }
+        })
+        .or_insert_with(rebuild)
+}
+
+/// Advances unthrottled column-store load checks and, once this dimension's cooldown has
+/// elapsed, runs distant-sampling batches up to `DISTANT_SAMPLE_BUDGET` (4 ms/tick).
 fn sample_distant_sections(
     host: &dyn ServerHost,
     dim: &str,
@@ -847,38 +959,10 @@ fn sample_distant_sections(
     cfg: DhConfig,
 ) -> SampleOutcome {
     let rt = runtime();
-    let cam_block = [cam[0].floor() as i32, cam[2].floor() as i32];
     let cache_key = (dim.to_owned(), player_key);
-
-    // Refresh the cached desired-section list for `(dim, player_key)` when config changes or the
-    // camera moves at least `SECTION_SIZE` (64) blocks Manhattan distance (matching DH's
-    // `QuadTree.setCenterBlockPos` using `FullDataSourceV2.WIDTH` = 64 for
-    // `blockDistanceForNodeClearing`). Within that 64-block window, ordering and detail splits
-    // may lag by up to 63 blocks. Async disk loads always run unthrottled.
     {
         let mut st = rt.inner.lock().unwrap();
-        let needs_rebuild = match st.desired_cache.get(&cache_key) {
-            Some(c) => {
-                c.config != cfg
-                    || (c.center[0] - cam_block[0]).abs() + (c.center[1] - cam_block[1]).abs()
-                        >= SECTION_SIZE as i32
-            }
-            None => true,
-        };
-        if needs_rebuild {
-            let list = DimensionLodStore::desired_sections_coarse_to_fine(cam[0], cam[2], cfg);
-            st.desired_cache.insert(
-                cache_key.clone(),
-                render_bridge::DesiredCache {
-                    center: cam_block,
-                    config: cfg,
-                    list,
-                    disk_cursor: 0,
-                    sample_cursor: 0,
-                },
-            );
-        }
-
+        ensure_desired_cache(&mut st, cache_key.clone(), cam, cfg);
         let save_root = st.world_dir.clone();
         let now = std::time::Instant::now();
         let sample_due = st
@@ -1193,4 +1277,41 @@ fn flush_dirty_sections(world_dir: Option<std::path::PathBuf>) {
         while pipeline::flush_saves(&rt.io, &dir, usize::MAX) > 0 {}
     }
     rt.io.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_reload_rotating_cursor_is_fair_across_players_and_dimensions() {
+        let (ow, nether) = ("minecraft:overworld", "minecraft:the_nether");
+        let p1 = (ow.to_owned(), 1, [0.0, 64.0, 0.0]);
+        let p2 = (ow.to_owned(), 2, [128.0, 64.0, 0.0]);
+        let tick = |targets: &[_], open, exhausted, cursor: &mut usize| {
+            pick_disk_reload_target(targets, open, cursor, |_, key, _| key == exhausted)
+        };
+        let mut cursor = 0;
+        let both = [p1.clone(), p2.clone()];
+        assert_eq!(tick(&both, 64, 0, &mut cursor), Some(p1.clone()));
+        assert_eq!(cursor, 1);
+        assert_eq!(tick(&both, 0, 0, &mut cursor), None);
+        assert_eq!(cursor, 1);
+        assert_eq!(tick(&both, 64, 0, &mut cursor), Some(p2.clone()));
+        assert_eq!(cursor, 0);
+        assert_eq!(tick(&both, 64, 0, &mut cursor), Some(p1.clone()));
+
+        // Only Overworld's callback runs: Nether is already past the shared deadline.
+        cursor = 0;
+        let nether_player = (nether.to_owned(), p2.1, p2.2);
+        let split = [p1.clone(), nether_player.clone()];
+        assert_eq!(tick(&split, 64, 0, &mut cursor), Some(p1.clone()));
+        assert_eq!(cursor, 1);
+        assert_eq!(tick(&split, 0, 0, &mut cursor), None);
+        assert_eq!(cursor, 1);
+        assert_eq!(tick(&split, 64, 0, &mut cursor), Some(nether_player));
+        assert_eq!(cursor, 0);
+        assert_eq!(tick(&split, 64, 0, &mut cursor), Some(p1.clone()));
+        assert_eq!(tick(&split, 64, 2, &mut cursor), Some(p1));
+    }
 }

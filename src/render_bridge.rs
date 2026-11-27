@@ -1553,6 +1553,8 @@ pub struct DhState {
     /// Manhattan distance (matching DH's `QuadTree.setCenterBlockPos` threshold
     /// `FullDataSourceV2.WIDTH`).
     pub desired_cache: HashMap<(String, u128), DesiredCache>,
+    /// Rotating index over sorted active `(dimension, player)` targets for full-RD `.dhoct` reload.
+    pub disk_reload_cursor: usize,
     /// Earliest instant the next synchronous distant-sampling batch may run for each dimension.
     pub next_distant_sample: HashMap<String, Instant>,
 }
@@ -1561,8 +1563,9 @@ pub struct DhState {
 pub struct DesiredCache {
     pub center: [i32; 2],
     pub config: DhConfig,
-    pub list: Vec<SectionPos>,
+    pub list: Arc<[SectionPos]>,
     pub disk_cursor: usize,
+    pub octree_disk_cursor: usize,
     pub sample_cursor: usize,
 }
 
@@ -1592,6 +1595,7 @@ impl Default for DhState {
             remote_requested: HashMap::new(),
             server_player_round_robin: HashMap::new(),
             desired_cache: HashMap::new(),
+            disk_reload_cursor: 0,
             next_distant_sample: HashMap::new(),
         }
     }
@@ -1611,6 +1615,7 @@ impl DhState {
         self.world_dir = None;
         self.dimensions.clear();
         self.desired_cache.clear();
+        self.disk_reload_cursor = 0;
         self.pending_chunks.clear();
         self.pending_chunk_set.clear();
         self.server_player_round_robin.clear();
@@ -1902,6 +1907,7 @@ mod tests {
             thunder_level: 0.75,
             vanilla_render_distance_chunks: 32,
             client_loaded_chunks: chunks.clone(),
+            disk_reload_cursor: 3,
             ..DhState::default()
         };
         let generator: Arc<dyn LodWorldGenerator> = Arc::new(Hooks);
@@ -1918,8 +1924,9 @@ mod tests {
                 DesiredCache {
                     center: [2, 3],
                     config,
-                    list: vec![pos],
+                    list: Arc::from([pos]),
                     disk_cursor: 1,
+                    octree_disk_cursor: 1,
                     sample_cursor: 0,
                 },
             );
@@ -1935,6 +1942,7 @@ mod tests {
         }
 
         st.clear_dimension_server_state(unloaded);
+        assert_eq!(st.disk_reload_cursor, 3);
         for expected in [Some(active), None] {
             assert_eq!(st.world_dir.as_deref(), expected.map(|_| path.as_path()));
             for actual in [
@@ -1958,6 +1966,7 @@ mod tests {
             }
             if expected.is_some() {
                 st.clear_server_world_state();
+                assert_eq!(st.disk_reload_cursor, 0);
             }
         }
         st.clear_client_session_state();
