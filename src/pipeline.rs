@@ -213,55 +213,85 @@ struct MeshJob {
 
 type MeshDone = (String, OctreeSectionPos, u64, BuiltSection);
 
+type MeshQueue = (Mutex<VecDeque<MeshJob>>, std::sync::Condvar);
+
 struct MeshWorker {
-    queue: Arc<(Mutex<VecDeque<MeshJob>>, std::sync::Condvar)>,
+    queue: Arc<MeshQueue>,
     done: Arc<Mutex<Vec<MeshDone>>>,
+    /// `false` when the mesher thread could not start: nothing would ever consume a job.
+    available: bool,
+}
+
+fn run_mesher(queue: Arc<MeshQueue>, done: Arc<Mutex<Vec<MeshDone>>>) {
+    loop {
+        let job = {
+            let (lock, cv) = &*queue;
+            let mut q = lock.lock().unwrap();
+            while q.is_empty() {
+                q = cv.wait(q).unwrap();
+            }
+            q.pop_front().unwrap()
+        };
+        let quads =
+            mesh_octree_section_masked(&job.section, &job.borders, &*job.metas, job.covered);
+        let built = built_section(&quads);
+        done.lock()
+            .unwrap()
+            .push((job.dim, job.pos, job.epoch, built));
+    }
 }
 
 impl MeshWorker {
     fn new() -> Self {
+        Self::new_with_spawn(|queue, done| {
+            std::thread::Builder::new()
+                .name("dh-mesher".to_owned())
+                .spawn(move || run_mesher(queue, done))
+        })
+    }
+
+    fn new_with_spawn(
+        spawn: impl FnOnce(
+            Arc<MeshQueue>,
+            Arc<Mutex<Vec<MeshDone>>>,
+        ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Self {
         let queue = Arc::new((
             Mutex::new(VecDeque::<MeshJob>::new()),
             std::sync::Condvar::new(),
         ));
         let done = Arc::new(Mutex::new(Vec::<MeshDone>::new()));
-        let q_bg = Arc::clone(&queue);
-        let d_bg = Arc::clone(&done);
-        let _ = std::thread::Builder::new()
-            .name("dh-mesher".to_owned())
-            .spawn(move || {
-                loop {
-                    let job = {
-                        let (lock, cv) = &*q_bg;
-                        let mut q = lock.lock().unwrap();
-                        while q.is_empty() {
-                            q = cv.wait(q).unwrap();
-                        }
-                        q.pop_front().unwrap()
-                    };
-                    let quads = mesh_octree_section_masked(
-                        &job.section,
-                        &job.borders,
-                        &*job.metas,
-                        job.covered,
-                    );
-                    let built = built_section(&quads);
-                    d_bg.lock()
-                        .unwrap()
-                        .push((job.dim, job.pos, job.epoch, built));
-                }
-            });
-        Self { queue, done }
+        let available = match spawn(Arc::clone(&queue), Arc::clone(&done)) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("DH: failed to spawn dh-mesher worker thread: {e}");
+                false
+            }
+        };
+        Self {
+            queue,
+            done,
+            available,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.available
     }
 
     fn pending_len(&self) -> usize {
         self.queue.0.lock().unwrap().len()
     }
 
-    fn push(&self, job: MeshJob) {
+    /// Admit `job` for the mesher thread; `false` (nothing queued) when no thread is running.
+    fn push(&self, job: MeshJob) -> bool {
+        if !self.available {
+            return false;
+        }
         let (lock, cv) = &*self.queue;
         lock.lock().unwrap().push_back(job);
         cv.notify_one();
+        true
     }
 
     fn clear_dim(&self, dim: &str) {
@@ -1021,6 +1051,11 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         p.queue(&anc_dim, [anc_pos]);
     }
 
+    // Without a mesher thread nothing would consume a job: leave the dirty queue, `queued` and
+    // the section epochs untouched. The spawn failure was logged once at startup.
+    if !MESH_WORKER.is_available() {
+        return;
+    }
     let metas = Arc::clone(&p.meta_snapshot);
     let mut pending = MESH_WORKER.pending_len();
     for _ in 0..MESHES_PER_TICK {
@@ -1070,7 +1105,7 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
         p.next_epoch = p.next_epoch.wrapping_add(1);
         let epoch = p.next_epoch;
         p.section_epoch.insert((dim.to_owned(), pos), epoch);
-        MESH_WORKER.push(MeshJob {
+        let admitted = MESH_WORKER.push(MeshJob {
             dim: dim.to_owned(),
             pos,
             epoch,
@@ -1079,6 +1114,7 @@ pub fn client_tick(host: &mut dyn ClientHost, dim: &str) {
             covered,
             metas: Arc::clone(&metas),
         });
+        debug_assert!(admitted, "availability was checked before dispatch");
         pending += 1;
     }
 }
@@ -2475,6 +2511,25 @@ mod tests {
             ]
         );
         assert!(p.unreadable.is_empty());
+    }
+
+    #[test]
+    fn mesh_worker_that_failed_to_spawn_refuses_jobs_without_queueing_them() {
+        let worker = MeshWorker::new_with_spawn(|_, _| Err(std::io::Error::other("spawn refused")));
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let job = MeshJob {
+            dim: DIM.to_owned(),
+            pos,
+            epoch: 1,
+            section: OctreeSection::filled(pos, Voxel::new(1, 0, 12, 0)),
+            borders: NeighborBorders::from_neighbors([None; 6]),
+            covered: 0,
+            metas: Arc::default(),
+        };
+        assert!(!worker.is_available());
+        assert!(!worker.push(job));
+        assert_eq!(worker.pending_len(), 0);
+        assert!(worker.drain_done().is_empty());
     }
 
     #[test]
