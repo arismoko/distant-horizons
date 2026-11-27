@@ -991,8 +991,10 @@ pub mod octree_sync {
             Ok(())
         }
 
-        /// Remove and return the completed buffer (`decodeDataSource`, `:56-71`).
-        pub fn take(&mut self, buffer_id: i32) -> Option<Vec<u8>> {
+        /// Remove and return the completed buffer (`decodeDataSource`, `:56-71`). A buffer idle
+        /// for `RECEIVE_BUFFER_TTL` has expired by `now` and is not returned.
+        pub fn take(&mut self, buffer_id: i32, now: Instant) -> Option<Vec<u8>> {
+            self.expire(now);
             self.buffers.remove(&buffer_id).map(|(buf, _)| buf)
         }
 
@@ -1722,7 +1724,7 @@ pub mod octree_sync {
                     };
                     match resp.payload {
                         None => events.push(ClientEvent::UpToDate { level, pos }),
-                        Some(payload) => match self.receiver.take(payload.buffer_id) {
+                        Some(payload) => match self.receiver.take(payload.buffer_id, now) {
                             None => events.push(ClientEvent::Lost { level, pos }),
                             Some(buffer) => match OctreeSectionDto::decode(&buffer)
                                 .and_then(|dto| dto.into_section())
@@ -1752,7 +1754,7 @@ pub mod octree_sync {
                     }
                 }
                 Message::PartialUpdate(update) => {
-                    if let Some(buffer) = self.receiver.take(update.payload.buffer_id) {
+                    if let Some(buffer) = self.receiver.take(update.payload.buffer_id, now) {
                         let (section, mapping) =
                             OctreeSectionDto::decode(&buffer)?.into_section()?;
                         events.push(ClientEvent::PartialUpdate {
@@ -2799,8 +2801,78 @@ pub mod octree_sync {
                     )
                     .unwrap();
             }
-            assert!(receiver.take(0).is_some());
-            assert!(receiver.take(MAX_PENDING_BUFFERS as i32).is_none());
+            assert!(receiver.take(0, now).is_some());
+            assert!(receiver.take(MAX_PENDING_BUFFERS as i32, now).is_none());
+        }
+
+        #[test]
+        fn split_receiver_take_drops_a_buffer_idle_for_the_ttl() {
+            let now = Instant::now();
+            let mut receiver = SplitReceiver::default();
+            for buffer_id in [1, 2] {
+                receiver
+                    .receive(
+                        SplitMessage {
+                            buffer_id,
+                            buffer: vec![1, 2, 3],
+                            is_first: true,
+                        },
+                        now,
+                    )
+                    .unwrap();
+            }
+            let almost = now + RECEIVE_BUFFER_TTL - Duration::from_nanos(1);
+            assert_eq!(receiver.take(1, almost), Some(vec![1, 2, 3]));
+            assert_eq!(receiver.take(2, now + RECEIVE_BUFFER_TTL), None);
+            assert!(receiver.buffers.is_empty());
+        }
+
+        #[test]
+        fn expired_transfer_buffer_is_lost_for_a_response_and_ignored_for_a_partial() {
+            let now = Instant::now();
+            let expired = now + RECEIVE_BUFFER_TTL;
+            let pos = OctreeSectionPos::new(0, 2, 1, -3);
+            let payload = OctreePayload {
+                buffer_id: 7,
+                beacon_beams: Vec::new(),
+            };
+            // Bytes that would fail to decode, so a decoded stale buffer would be an `Err`.
+            let split = Message::Split(SplitMessage {
+                buffer_id: 7,
+                buffer: vec![1, 2, 3],
+                is_first: true,
+            })
+            .encode()
+            .unwrap();
+            let response = Message::Response(OctreeSectionResponse {
+                future_id: 0,
+                payload: Some(payload.clone()),
+            })
+            .encode()
+            .unwrap();
+            let partial = Message::PartialUpdate(OctreePartialUpdate {
+                level: LEVEL.into(),
+                payload,
+            })
+            .encode()
+            .unwrap();
+            let mut intake = ClientIntake::default();
+            assert!(intake.configure(|_| Ok(PayloadAccepted::Queued)));
+            assert!(intake.send_request(LEVEL, pos, None, |_| Ok(PayloadAccepted::Queued)));
+            intake.receive(&split, now, || true).unwrap();
+            intake.receive(&response, expired, || true).unwrap();
+            assert!(intake.session.pending.is_empty());
+            assert!(matches!(
+                intake.events.as_slice(),
+                [ClientEvent::Lost { level, pos: lost }] if level == LEVEL && *lost == pos
+            ));
+
+            let mut intake = ClientIntake::default();
+            assert!(intake.configure(|_| Ok(PayloadAccepted::Queued)));
+            intake.receive(&split, now, || true).unwrap();
+            intake.receive(&partial, expired, || true).unwrap();
+            assert!(intake.events.is_empty());
+            assert!(intake.session.receiver.buffers.is_empty());
         }
 
         #[test]
@@ -2855,8 +2927,8 @@ pub mod octree_sync {
                 receiver.receive(s, now).unwrap();
             }
             assert_eq!(sizes, vec![1_048_000, 1_048_000, 404_000]);
-            assert_eq!(receiver.take(9).unwrap(), buffer);
-            assert!(receiver.take(9).is_none());
+            assert_eq!(receiver.take(9, now).unwrap(), buffer);
+            assert!(receiver.take(9, now).is_none());
         }
 
         #[test]
