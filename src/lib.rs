@@ -248,6 +248,14 @@ impl Hooks for DistantHorizonsMod {
     }
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
+        if host.playing() {
+            let kb = self.keybinds.lock().unwrap();
+            kb.poll(host);
+        }
+
+        let cfg = DhConfig::read_from_host(host);
+        render_bridge::set_enabled(cfg.enabled);
+
         if host.on(MOD_ID) {
             // The retained renderer can service a retired ticket between play worlds, even
             // when there is no mesh or connected level to upload to.
@@ -265,14 +273,6 @@ impl Hooks for DistantHorizonsMod {
             }
         }
         let rt = runtime();
-        let cfg = DhConfig::read_from_host(host);
-        render_bridge::set_enabled(cfg.enabled);
-
-        if host.playing() {
-            let kb = self.keybinds.lock().unwrap();
-            kb.poll(host);
-        }
-
         let cam = host.camera();
         let clock = host.clock();
         let gfx_opts = host.graphics_options();
@@ -284,7 +284,7 @@ impl Hooks for DistantHorizonsMod {
 
         let remote_batch = {
             let mut st = rt.inner.lock().unwrap();
-            st.config = DhConfig::read_from_host(host);
+            st.config = cfg;
             st.vanilla_render_distance_chunks = gfx_opts.render_distance.max(2);
             st.rain_level = rain_level.clamp(0.0, 1.0);
             st.thunder_level = thunder_level.clamp(0.0, 1.0);
