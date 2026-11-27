@@ -627,49 +627,185 @@ pub fn upload_pending(host: &mut dyn mod_api::ClientHost, config: ArenaConfig) {
     report_arena("arena upload", try_upload_pending(host, config));
 }
 
+/// Allocates the arena buffers first, then the shared quad mesh; a mesh failure releases every
+/// buffer so nothing leaks.
+fn create_state(
+    host: &mut dyn mod_api::ClientHost,
+    config: ArenaConfig,
+) -> Result<ArenaState, ArenaError> {
+    let arena = GpuArena::new(host, config)?;
+    match create_quad_mesh(host) {
+        Ok(quad_mesh) => Ok(ArenaState {
+            arena,
+            quad_mesh,
+            ids: HashMap::new(),
+        }),
+        Err(e) => {
+            arena.release(host);
+            Err(e)
+        }
+    }
+}
+
+/// Releases the quad mesh and every arena buffer, ignoring failures.
+fn release_state(host: &mut dyn mod_api::ClientHost, state: ArenaState) {
+    let _ = state.quad_mesh.release(&*host);
+    state.arena.release(host);
+}
+
+/// Puts `tables` back in the queue unless newer ones were queued meanwhile.
+fn restore_tables_if_empty(slot: &mut Option<Tables>, tables: Tables) {
+    if slot.is_none() {
+        *slot = Some(tables);
+    }
+}
+
+/// Drops every queued mesh of `dimension`.
+fn purge_pending_dimension(pending: &mut Vec<(SectionKey, BuiltSection)>, dimension: &str) {
+    pending.retain(|(key, _)| key.0 != dimension);
+}
+
+/// The arena is dead: keeps the `queued` tables for the replacement, hands the old state to
+/// `teardown_state`, and drops every queued mesh (they may belong to dimensions that unload
+/// before the replacement exists, and the replacement is re-filled from the stores).
+fn apply_arena_loss<T>(
+    arena_slot: &mut Option<T>,
+    tables_slot: &mut Option<Tables>,
+    pending: &mut Vec<(SectionKey, BuiltSection)>,
+    queued: Tables,
+    teardown_state: impl FnOnce(T),
+) {
+    restore_tables_if_empty(tables_slot, queued);
+    if let Some(state) = arena_slot.take() {
+        teardown_state(state);
+    }
+    pending.clear();
+}
+
+/// The renderer or a handle is gone, so a new arena is needed. Payload errors such as
+/// `OutOfRange` are not: an identical arena would refuse the same payload again.
+fn is_arena_lost(err: &ArenaError) -> bool {
+    matches!(
+        err,
+        ArenaError::Buffer(
+            mod_api::BufferError::Unavailable
+                | mod_api::BufferError::Stale
+                | mod_api::BufferError::NotOwned
+        )
+    )
+}
+
+/// What became of a table publication.
+#[derive(Debug, PartialEq, Eq)]
+enum Published {
+    Done,
+    /// The atlas was refused; keep the arena and try again next tick.
+    Retry(Tables),
+    /// A write found the arena dead; the tables are kept for the replacement.
+    ArenaLost(Tables),
+}
+
+/// Writes the tables through the given writers. Write failures go to `on_error` with their
+/// site; only a lost arena stops the publication.
+fn publish_tables_with(
+    tables: Tables,
+    mut on_error: impl FnMut(&'static str, ArenaError),
+    mut write_models: impl FnMut(&[u32]) -> Result<(), ArenaError>,
+    mut write_tints: impl FnMut(&[u32]) -> Result<(), ArenaError>,
+    mut write_atlas: impl FnMut(&[u8]) -> bool,
+) -> Published {
+    if let Err(e) = write_models(&tables.0) {
+        let lost = is_arena_lost(&e);
+        on_error("write models", e);
+        if lost {
+            return Published::ArenaLost(tables);
+        }
+    }
+    if let Err(e) = write_tints(&tables.1) {
+        let lost = is_arena_lost(&e);
+        on_error("write biome tints", e);
+        if lost {
+            return Published::ArenaLost(tables);
+        }
+    }
+    if write_atlas(&tables.2) {
+        Published::Done
+    } else {
+        Published::Retry(tables)
+    }
+}
+
+/// Creates the baked face atlas on first use and updates it afterwards. A refused atlas leaves
+/// every model on its flat colour: tile size stays in the table, so the caller keeps trying
+/// rather than drawing from a missing texture.
+fn write_atlas(host: &mut dyn mod_api::ClientHost, atlas: &[u8]) -> bool {
+    let id = mod_api::Identifier::parse(ATLAS_TEXTURE).expect("static texture id");
+    let side = crate::pipeline::ATLAS_SIDE as u32;
+    let done = if ATLAS_CREATED.load(std::sync::atomic::Ordering::Relaxed) {
+        host.update_dynamic_texture(&id, side, side, atlas)
+    } else {
+        host.create_dynamic_texture(&id, side, side, atlas)
+    };
+    let wrote = done.is_ok();
+    if wrote {
+        ATLAS_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    wrote
+}
+
+// Lock order: `ARENA` -> `PENDING_TABLES` -> `PENDING_SECTIONS` (nothing takes the last two in
+// the reverse order). `ARENA` is never held across a call into `crate::pipeline`.
 fn try_upload_pending(
     host: &mut dyn mod_api::ClientHost,
     config: ArenaConfig,
 ) -> Result<(), crate::gpu_arena::ArenaError> {
     let mut guard = ARENA.lock().unwrap();
-    if guard.is_none() {
-        let quad_mesh = create_quad_mesh(host)?;
-        *guard = Some(ArenaState {
-            arena: GpuArena::new(host, config)?,
-            quad_mesh,
-            ids: HashMap::new(),
-        });
+    let created = guard.is_none();
+    if created {
+        *guard = Some(create_state(host, config)?);
     }
-    let state = guard.as_mut().unwrap();
-    let pending_tables = PENDING_TABLES.lock().unwrap().take();
-    if let Some((models, tints, atlas)) = pending_tables {
-        let wrote_models = report_arena("write models", state.arena.write_models(host, 0, &models));
-        let wrote_tints = report_arena(
-            "write biome tints",
-            state.arena.write_biome_tints(host, 0, &tints),
+    let tables = PENDING_TABLES.lock().unwrap().take();
+    if let Some(queued) = tables {
+        let state = guard.as_ref().unwrap();
+        // Each writer needs the host mutably, but only one runs at a time.
+        let host_cell = std::cell::RefCell::new(&mut *host);
+        let published = publish_tables_with(
+            queued,
+            |what, e| {
+                report_arena::<()>(what, Err(e));
+            },
+            |words| {
+                state
+                    .arena
+                    .write_models(&mut **host_cell.borrow_mut(), 0, words)
+            },
+            |words| {
+                state
+                    .arena
+                    .write_biome_tints(&mut **host_cell.borrow_mut(), 0, words)
+            },
+            |atlas| write_atlas(&mut **host_cell.borrow_mut(), atlas),
         );
-        let id = mod_api::Identifier::parse(ATLAS_TEXTURE).expect("static texture id");
-        let side = crate::pipeline::ATLAS_SIDE as u32;
-        let done = if ATLAS_CREATED.load(std::sync::atomic::Ordering::Relaxed) {
-            host.update_dynamic_texture(&id, side, side, &atlas)
-        } else {
-            host.create_dynamic_texture(&id, side, side, &atlas)
-        };
-        // A refused atlas leaves every model on its flat colour: tile size stays in the table, so
-        // keep trying next time rather than drawing from a missing texture.
-        let wrote_atlas = done.is_ok();
-        if wrote_atlas {
-            ATLAS_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        // A failed table or atlas write is retried next frame unless newer tables were queued
-        // meanwhile.
-        if wrote_models.is_none() || wrote_tints.is_none() || !wrote_atlas {
-            let mut slot = PENDING_TABLES.lock().unwrap();
-            if slot.is_none() {
-                *slot = Some((models, tints, atlas));
+        match published {
+            Published::Done => {}
+            Published::Retry(queued) => {
+                restore_tables_if_empty(&mut PENDING_TABLES.lock().unwrap(), queued);
+            }
+            Published::ArenaLost(queued) => {
+                apply_arena_loss(
+                    &mut *guard,
+                    &mut PENDING_TABLES.lock().unwrap(),
+                    &mut PENDING_SECTIONS.lock().unwrap(),
+                    queued,
+                    |state| release_state(host, state),
+                );
+                drop(guard);
+                crate::pipeline::reset_arena_state();
+                return Ok(());
             }
         }
     }
+    let state = guard.as_mut().unwrap();
     // One section failing (arena full, bad write) never drops the rest of the batch: each is
     // handled on its own, logged through `report`, and the metadata flush still runs.
     for (key, section) in std::mem::take(&mut *PENDING_SECTIONS.lock().unwrap()) {
@@ -690,13 +826,20 @@ fn try_upload_pending(
             state.ids.insert(key, new);
         }
     }
-    state.arena.flush(host)
+    let flushed = state.arena.flush(host);
+    drop(guard);
+    if created {
+        crate::pipeline::mark_models_dirty();
+    }
+    flushed
 }
 
-/// Drops every section of `dimension` (world / dimension change); the buffers stay.
+/// Drops every section of `dimension` (world / dimension change); the buffers stay. Queued
+/// meshes of the dimension are dropped even when no arena exists.
 pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaError> {
     flush_report_summaries();
     let mut guard = ARENA.lock().unwrap();
+    purge_pending_dimension(&mut PENDING_SECTIONS.lock().unwrap(), dimension);
     let Some(state) = guard.as_mut() else {
         return Ok(());
     };
@@ -1534,6 +1677,218 @@ fn report_arena<T>(what: &'static str, result: Result<T, ArenaError>) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mod_api::BufferError;
+    use std::cell::Cell;
+
+    fn tables() -> Tables {
+        (vec![1, 2], vec![3], vec![4, 5, 6])
+    }
+
+    fn buffer_err(e: BufferError) -> Result<(), ArenaError> {
+        Err(ArenaError::Buffer(e))
+    }
+
+    /// `(site, Debug of the error)` pairs, since `ArenaError` is not comparable.
+    fn sites(errors: &[(&'static str, ArenaError)]) -> Vec<(&'static str, String)> {
+        errors.iter().map(|(w, e)| (*w, format!("{e:?}"))).collect()
+    }
+
+    fn mesh() -> BuiltSection {
+        BuiltSection {
+            level: 0,
+            pos: [0; 3],
+            aabb: crate::gpu_arena::SectionAabb::FULL,
+            quads: vec![crate::gpu_arena::PackedQuad::default()],
+            counts: [1, 0, 0, 0, 0, 0, 0, 0],
+        }
+    }
+
+    fn key(dim: &str) -> SectionKey {
+        (dim.to_owned(), 0u8, [0; 3])
+    }
+
+    fn pending_dims(pending: &[(SectionKey, BuiltSection)]) -> Vec<&str> {
+        pending.iter().map(|(k, _)| k.0.as_str()).collect()
+    }
+
+    #[test]
+    fn publish_tables_fatal_buffer_error_marks_arena_lost_and_skips_later_writes() {
+        let fatal = |i: u8| match i {
+            0 => BufferError::Stale,
+            1 => BufferError::Unavailable,
+            _ => BufferError::NotOwned,
+        };
+        for kind in 0..3 {
+            for on_models in [true, false] {
+                let (tints, atlas) = (Cell::new(0), Cell::new(0));
+                let mut errors = Vec::new();
+                let published = publish_tables_with(
+                    tables(),
+                    |what, e| errors.push((what, e)),
+                    |_| {
+                        if on_models {
+                            buffer_err(fatal(kind))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |_| {
+                        tints.set(tints.get() + 1);
+                        if on_models {
+                            Ok(())
+                        } else {
+                            buffer_err(fatal(kind))
+                        }
+                    },
+                    |_| {
+                        atlas.set(atlas.get() + 1);
+                        true
+                    },
+                );
+                assert_eq!(published, Published::ArenaLost(tables()));
+                assert_eq!(tints.get(), u32::from(!on_models));
+                assert_eq!(atlas.get(), 0);
+                let site = if on_models {
+                    "write models"
+                } else {
+                    "write biome tints"
+                };
+                assert_eq!(
+                    sites(&errors),
+                    [(site, format!("{:?}", ArenaError::Buffer(fatal(kind))))]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn publish_tables_out_of_range_keeps_arena_without_retry_loop() {
+        for on_models in [true, false] {
+            let atlas = Cell::new(0);
+            let mut errors = Vec::new();
+            let published = publish_tables_with(
+                tables(),
+                |what, e| errors.push((what, e)),
+                |_| {
+                    if on_models {
+                        buffer_err(BufferError::OutOfRange)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    if on_models {
+                        Ok(())
+                    } else {
+                        buffer_err(BufferError::OutOfRange)
+                    }
+                },
+                |_| {
+                    atlas.set(atlas.get() + 1);
+                    true
+                },
+            );
+            assert_eq!(published, Published::Done);
+            assert_eq!(atlas.get(), 1);
+            let site = if on_models {
+                "write models"
+            } else {
+                "write biome tints"
+            };
+            assert_eq!(
+                sites(&errors),
+                [(
+                    site,
+                    format!("{:?}", ArenaError::Buffer(BufferError::OutOfRange))
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn publish_tables_refused_atlas_retries_without_losing_arena() {
+        let mut errors = Vec::new();
+        let published = publish_tables_with(
+            tables(),
+            |what, e| errors.push((what, e)),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| false,
+        );
+        assert_eq!(published, Published::Retry(tables()));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn restore_tables_if_empty_keeps_newer_queued_tables() {
+        let mut slot = None;
+        restore_tables_if_empty(&mut slot, tables());
+        assert_eq!(slot, Some(tables()));
+        let newer = (vec![9], vec![], vec![]);
+        let mut slot = Some(newer.clone());
+        restore_tables_if_empty(&mut slot, tables());
+        assert_eq!(slot, Some(newer));
+    }
+
+    #[test]
+    fn arena_loss_and_dimension_unload_leave_no_stale_meshes_for_recovery() {
+        let mut arena_slot = Some(1u32);
+        let mut tables_slot: Option<Tables> = None;
+        let mut pending = vec![(key("dim_a"), mesh()), (key("dim_b"), mesh())];
+        let mut released = Vec::new();
+        let mut errors = Vec::new();
+
+        // The table write finds the arena dead.
+        let lost = publish_tables_with(
+            tables(),
+            |what, e| errors.push((what, e)),
+            |_| buffer_err(BufferError::Stale),
+            |_| Ok(()),
+            |_| true,
+        );
+        let Published::ArenaLost(queued) = lost else {
+            panic!("expected ArenaLost, got {lost:?}");
+        };
+        assert_eq!(
+            sites(&errors),
+            [(
+                "write models",
+                format!("{:?}", ArenaError::Buffer(BufferError::Stale))
+            )]
+        );
+
+        apply_arena_loss(
+            &mut arena_slot,
+            &mut tables_slot,
+            &mut pending,
+            queued,
+            |state| released.push(state),
+        );
+        assert!(arena_slot.is_none());
+        assert_eq!(released, [1]);
+        assert_eq!(tables_slot, Some(tables()));
+        assert!(pending.is_empty());
+
+        // Before recovery, meshes arrive and one dimension unloads.
+        pending.push((key("dim_a"), mesh()));
+        pending.push((key("dim_b"), mesh()));
+        purge_pending_dimension(&mut pending, "dim_a");
+
+        // The replacement arena takes the kept tables.
+        arena_slot = Some(2u32);
+        let recovered = publish_tables_with(
+            tables_slot.take().unwrap(),
+            |what, e| errors.push((what, e)),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| true,
+        );
+        assert_eq!(recovered, Published::Done);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(arena_slot, Some(2));
+        assert_eq!(released, [1]);
+        assert_eq!(pending_dims(&pending), ["dim_b"]);
+    }
 
     #[test]
     fn reporting_counts_each_site_and_cause_independently() {

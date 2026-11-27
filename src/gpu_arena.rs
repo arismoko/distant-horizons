@@ -596,6 +596,8 @@ impl GpuArena {
         loop {
             match Self::try_new(host, sections, geometry) {
                 Ok(arena) => return Ok(arena),
+                // No renderer: smaller buffers cannot help.
+                Err(e @ ArenaError::Buffer(BufferError::Unavailable)) => return Err(e),
                 Err(ArenaError::Buffer(_))
                     if geometry > MIN_GEOMETRY_BYTES || sections > min_sections =>
                 {
@@ -879,24 +881,24 @@ impl GpuArena {
 
     /// Frees every GPU buffer (ruling point 1). Call on mod unload or re-init only; the arena
     /// otherwise survives resource reload and world close (ruling point 2). To empty it on a
-    /// world change, `remove` each section instead.
-    pub fn release(self, host: &mut dyn ClientHost) -> Result<(), ArenaError> {
-        self.quads.release(&*host)?;
-        self.sections.release(&*host)?;
-        self.opaque_commands.release(&*host)?;
-        self.translucent_commands.release(&*host)?;
-        self.trans_sort_meta.release(&*host)?;
-        self.trans_sort_entries.release(&*host)?;
-        self.nodes.release(&*host)?;
-        self.roots.release(&*host)?;
-        self.visibility.release(&*host)?;
-        self.queue_a.release(&*host)?;
-        self.queue_b.release(&*host)?;
-        self.dispatch_a.release(&*host)?;
-        self.dispatch_b.release(&*host)?;
-        self.models.release(&*host)?;
-        self.biome_tints.release(&*host)?;
-        Ok(())
+    /// world change, `remove` each section instead. Failures are ignored, so one stale handle
+    /// cannot leak the rest.
+    pub fn release(self, host: &mut dyn ClientHost) {
+        let _ = self.quads.release(&*host);
+        let _ = self.sections.release(&*host);
+        let _ = self.opaque_commands.release(&*host);
+        let _ = self.translucent_commands.release(&*host);
+        let _ = self.trans_sort_meta.release(&*host);
+        let _ = self.trans_sort_entries.release(&*host);
+        let _ = self.nodes.release(&*host);
+        let _ = self.roots.release(&*host);
+        let _ = self.visibility.release(&*host);
+        let _ = self.queue_a.release(&*host);
+        let _ = self.queue_b.release(&*host);
+        let _ = self.dispatch_a.release(&*host);
+        let _ = self.dispatch_b.release(&*host);
+        let _ = self.models.release(&*host);
+        let _ = self.biome_tints.release(&*host);
     }
 }
 
