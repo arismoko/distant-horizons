@@ -347,6 +347,13 @@ pub enum ArenaError {
     /// Nothing to upload (Voxy throws on an empty `BuiltSection`).
     EmptySection,
     UnknownSection(u32),
+    /// The GPU octree would need more nodes or top-level roots than the arena holds.
+    NodesFull {
+        needed_nodes: usize,
+        max_nodes: usize,
+        needed_roots: usize,
+        max_roots: usize,
+    },
     Buffer(BufferError),
 }
 
@@ -366,8 +373,10 @@ pub const TRANSLUCENT_COUNT_OFFSET: u64 = 0;
 pub const TRANS_SORT_ENTRY_BYTES: u64 = 8;
 /// Size in bytes of one `GpuNode` record (`uvec4 a; uvec4 b;`).
 pub const GPU_NODE_BYTES: u64 = 32;
-/// Maximum nodes in the GPU hierarchical octree (`8 MiB` at 32 bytes/node).
-pub const GPU_MAX_NODES: u64 = 1 << 18;
+/// Maximum nodes in the GPU hierarchical octree (`32 MiB` at 32 bytes/node).
+pub const GPU_MAX_NODES: u64 = 1 << 20;
+/// Fewest octree nodes a halved arena keeps room for.
+const MIN_GPU_NODES: usize = 1 << 16;
 /// Maximum node indices in each ping-pong traversal queue (`512 KiB`).
 pub const GPU_TRAV_QUEUE_CAP: u32 = 1 << 17;
 /// Size in bytes of one ping-pong queue buffer (`4 * u32` header + `GPU_TRAV_QUEUE_CAP * u32`).
@@ -430,12 +439,139 @@ impl GpuNode {
     }
 }
 
+/// Where a section sits in the GPU node tree: the `detail = MAX_OCTREE_DETAIL` root position and,
+/// from the root down, each internal parent `(parent_detail, parent_pos, octant)` on the way to
+/// the section's node (none for a section at `MAX_OCTREE_DETAIL`). The one definition of which
+/// nodes exist, shared by [`build_node_tree`] and [`NodeOccupancy`].
+fn octree_ancestors(
+    level: u8,
+    pos: [i32; 3],
+) -> ([i32; 3], impl Iterator<Item = (u8, [i32; 3], usize)>) {
+    use crate::octree::{MAX_OCTREE_DETAIL, child_index};
+
+    let level = level.min(MAX_OCTREE_DETAIL);
+    let at = move |detail: u8| pos.map(|c| c >> (detail - level));
+    let steps = (level + 1..=MAX_OCTREE_DETAIL)
+        .rev()
+        .map(move |parent_level| {
+            let child = at(parent_level - 1);
+            let octant = child_index(
+                (child[0] & 1) as usize,
+                (child[1] & 1) as usize,
+                (child[2] & 1) as usize,
+            );
+            (parent_level, at(parent_level), octant)
+        });
+    (at(MAX_OCTREE_DETAIL), steps)
+}
+
+/// Ref-counted occupancy of the GPU node tree: every occupied `detail = MAX_OCTREE_DETAIL` root
+/// costs one node and every occupied internal parent an 8-child block, so the counts equal
+/// [`build_node_tree`]'s output lengths for the same sections.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeOccupancy {
+    roots: HashMap<[i32; 3], u32>,
+    parents: HashMap<(u8, [i32; 3]), u32>,
+}
+
+impl NodeOccupancy {
+    pub fn node_count(&self) -> usize {
+        self.roots.len() + self.parents.len() * 8
+    }
+
+    pub fn root_count(&self) -> usize {
+        self.roots.len()
+    }
+
+    pub fn insert(&mut self, level: u8, pos: [i32; 3]) {
+        let (root, steps) = octree_ancestors(level, pos);
+        *self.roots.entry(root).or_insert(0) += 1;
+        for (parent_level, parent_pos, _) in steps {
+            *self.parents.entry((parent_level, parent_pos)).or_insert(0) += 1;
+        }
+    }
+
+    /// Releases one section previously passed to [`Self::insert`].
+    pub fn remove(&mut self, level: u8, pos: [i32; 3]) {
+        fn release<K: std::hash::Hash + Eq>(counts: &mut HashMap<K, u32>, key: K) {
+            if let Some(count) = counts.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(&key);
+                }
+            }
+        }
+        let (root, steps) = octree_ancestors(level, pos);
+        release(&mut self.roots, root);
+        for (parent_level, parent_pos, _) in steps {
+            release(&mut self.parents, (parent_level, parent_pos));
+        }
+    }
+
+    /// Exact `(node_count, root_count)` after removing `old` (if any) and inserting `new`,
+    /// without mutating. Ancestors `old` and `new` share are neither freed nor added.
+    pub fn projected_counts(
+        &self,
+        old: Option<(u8, [i32; 3])>,
+        new: (u8, [i32; 3]),
+    ) -> (usize, usize) {
+        let ancestors = |(level, pos): (u8, [i32; 3])| {
+            let (root, steps) = octree_ancestors(level, pos);
+            (root, steps.map(|(l, p, _)| (l, p)).collect::<Vec<_>>())
+        };
+        let (new_root, new_parents) = ancestors(new);
+        let (old_root, old_parents) = old.map_or((None, Vec::new()), |old| {
+            let (root, parents) = ancestors(old);
+            (Some(root), parents)
+        });
+        let mut roots = self.roots.len();
+        let mut parents = self.parents.len();
+        if let Some(root) = old_root
+            && root != new_root
+            && self.roots.get(&root) == Some(&1)
+        {
+            roots -= 1;
+        }
+        for key in &old_parents {
+            if !new_parents.contains(key) && self.parents.get(key) == Some(&1) {
+                parents -= 1;
+            }
+        }
+        if old_root != Some(new_root) && !self.roots.contains_key(&new_root) {
+            roots += 1;
+        }
+        for key in &new_parents {
+            if !old_parents.contains(key) && !self.parents.contains_key(key) {
+                parents += 1;
+            }
+        }
+        (roots + parents * 8, roots)
+    }
+}
+
+/// `Err(NodesFull)` when a tree of `nodes` nodes and `roots` roots exceeds either cap.
+fn check_node_caps(
+    (nodes, roots): (usize, usize),
+    max_nodes: usize,
+    max_roots: usize,
+) -> Result<(), ArenaError> {
+    if nodes > max_nodes || roots > max_roots {
+        return Err(ArenaError::NodesFull {
+            needed_nodes: nodes,
+            max_nodes,
+            needed_roots: roots,
+            max_roots,
+        });
+    }
+    Ok(())
+}
+
 /// Builds a compact top-down octree node table (`detail = MAX_OCTREE_DETAIL` roots down to
 /// `detail = 0` leaves) with contiguous 8-child blocks for `voxy_traversal.csh`.
 pub fn build_node_tree(
     live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
 ) -> (Vec<GpuNode>, Vec<u32>) {
-    use crate::octree::{MAX_OCTREE_DETAIL, child_index};
+    use crate::octree::MAX_OCTREE_DETAIL;
 
     let mut nodes: Vec<GpuNode> = Vec::new();
     let mut root_index: HashMap<[i32; 3], usize> = HashMap::new();
@@ -466,26 +602,11 @@ pub fn build_node_tree(
     };
 
     for (&section_id, &(level, pos, aabb)) in live_meta {
-        let clamped_level = level.min(MAX_OCTREE_DETAIL);
-        // Walk from root down to `clamped_level`, allocating 8-child blocks as needed.
-        let shift = MAX_OCTREE_DETAIL - clamped_level;
-        let root_pos = [pos[0] >> shift, pos[1] >> shift, pos[2] >> shift];
+        // Walk from the root down to the section, allocating 8-child blocks as needed.
+        let (root_pos, steps) = octree_ancestors(level, pos);
         let mut cur_idx = ensure_root(root_pos, &mut nodes, &mut root_index, &mut roots);
-        let mut cur_pos = root_pos;
-        let mut cur_level = MAX_OCTREE_DETAIL;
-        while cur_level > clamped_level {
+        for (cur_level, cur_pos, oct) in steps {
             let next_level = cur_level - 1;
-            let next_shift = next_level - clamped_level;
-            let next_pos = [
-                pos[0] >> next_shift,
-                pos[1] >> next_shift,
-                pos[2] >> next_shift,
-            ];
-            let oct = child_index(
-                (next_pos[0] & 1) as usize,
-                (next_pos[1] & 1) as usize,
-                (next_pos[2] & 1) as usize,
-            );
             let child_base = if nodes[cur_idx].child_base != GpuNode::NONE {
                 nodes[cur_idx].child_base as usize
             } else {
@@ -512,8 +633,6 @@ pub fn build_node_tree(
             // iteration order so frustum/Hi-Z culling never drops children outside a masked mesh.
             nodes[cur_idx].aabb = SectionAabb::FULL.pack();
             cur_idx = child_base + oct;
-            cur_pos = next_pos;
-            cur_level = next_level;
         }
         nodes[cur_idx].section_id = section_id;
         // Leaf nodes tighten to their exact geometry AABB; internal nodes keep FULL.
@@ -585,12 +704,16 @@ pub struct GpuArena {
     /// Whole-buffer slices for set-1 bindings.
     pub slices: ArenaSlices,
     max_sections: u32,
+    /// Node-table capacity: `GPU_MAX_NODES`, halved with the other buffers on a constrained device.
+    max_nodes: usize,
     quad_alloc: FreeList,
     ids: IdAllocator,
     /// Quad-arena start (in quads) per live section id.
     live: HashMap<u32, u32>,
     /// `(level, pos, aabb)` per live section id for building the GPU octree node table.
     live_meta: HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    /// Node and root counts of the tree `live_meta` builds, for admission before allocation.
+    occupancy: NodeOccupancy,
     nodes_dirty: bool,
     root_count: u32,
     dirty: BTreeMap<u32, SectionMeta>,
@@ -602,14 +725,18 @@ impl GpuArena {
         let min_sections = initial_sections.min(1 << 14);
         let mut sections = initial_sections;
         let mut geometry = config.geometry_bytes.max(MIN_GEOMETRY_BYTES);
+        let mut max_nodes = GPU_MAX_NODES as usize;
         loop {
-            match Self::try_new(host, sections, geometry) {
+            match Self::try_new(host, sections, geometry, max_nodes) {
                 Ok(arena) => return Ok(arena),
                 Err(ArenaError::Buffer(_))
-                    if geometry > MIN_GEOMETRY_BYTES || sections > min_sections =>
+                    if geometry > MIN_GEOMETRY_BYTES
+                        || sections > min_sections
+                        || max_nodes > MIN_GPU_NODES =>
                 {
                     geometry = (geometry / 2).max(MIN_GEOMETRY_BYTES);
                     sections = (sections / 2).max(min_sections);
+                    max_nodes = (max_nodes / 2).max(MIN_GPU_NODES);
                 }
                 Err(e) => return Err(e),
             }
@@ -620,6 +747,7 @@ impl GpuArena {
         host: &mut dyn ClientHost,
         max_sections: u32,
         geometry_bytes: u64,
+        max_nodes: usize,
     ) -> Result<Self, ArenaError> {
         let geometry_bytes = geometry_bytes / QUAD_BYTES * QUAD_BYTES;
         let n = max_sections as u64;
@@ -656,7 +784,7 @@ impl GpuArena {
             StorageBufferDescriptor::new(TRANS_SORT_META_BYTES).indirect(true),
         )?;
         let trans_sort_entries = make(host, StorageBufferDescriptor::new(tsort_entry_bytes))?;
-        let node_bytes = GPU_MAX_NODES * GPU_NODE_BYTES;
+        let node_bytes = max_nodes as u64 * GPU_NODE_BYTES;
         let root_bytes = GPU_TRAV_QUEUE_CAP as u64 * 4;
         let vis_bytes = n * 4;
         let nodes = make(host, StorageBufferDescriptor::new(node_bytes))?;
@@ -717,10 +845,12 @@ impl GpuArena {
             dispatch_a,
             dispatch_b,
             max_sections,
+            max_nodes,
             quad_alloc: FreeList::new(geometry_bytes / QUAD_BYTES),
             ids: IdAllocator::new(max_sections),
             live: HashMap::new(),
             live_meta: HashMap::new(),
+            occupancy: NodeOccupancy::default(),
             nodes_dirty: false,
             root_count: 0,
             dirty: BTreeMap::new(),
@@ -778,6 +908,17 @@ impl GpuArena {
         {
             return Err(ArenaError::UnknownSection(old));
         }
+        // Refuse before anything is allocated or written, so a refusal changes nothing.
+        let old_node = old_id.map(|old| {
+            let (level, pos, _) = self.live_meta[&old];
+            (level, pos)
+        });
+        check_node_caps(
+            self.occupancy
+                .projected_counts(old_node, (section.level, section.pos)),
+            self.max_nodes,
+            GPU_TRAV_QUEUE_CAP as usize,
+        )?;
         let start = self
             .quad_alloc
             .alloc(section.quads.len() as u64)
@@ -798,6 +939,7 @@ impl GpuArena {
         self.live.insert(id, start as u32);
         self.live_meta
             .insert(id, (section.level, section.pos, section.aabb));
+        self.occupancy.insert(section.level, section.pos);
         self.nodes_dirty = true;
         self.dirty
             .insert(id, SectionMeta::new(section, start as u32));
@@ -813,7 +955,9 @@ impl GpuArena {
             .live
             .remove(&id)
             .ok_or(ArenaError::UnknownSection(id))?;
-        self.live_meta.remove(&id);
+        if let Some((level, pos, _)) = self.live_meta.remove(&id) {
+            self.occupancy.remove(level, pos);
+        }
         self.nodes_dirty = true;
         self.quad_alloc.free(start as u64);
         self.ids.free(id);
@@ -849,30 +993,26 @@ impl GpuArena {
         self.dirty.clear();
         if self.nodes_dirty {
             let (node_list, root_list) = build_node_tree(&self.live_meta);
-            if (node_list.len() as u64) > GPU_MAX_NODES {
-                eprintln!(
-                    "distantsunrises: GPU node tree ({} nodes) exceeds GPU_MAX_NODES ({GPU_MAX_NODES}); skipping node/root upload",
-                    node_list.len()
-                );
-                self.nodes_dirty = false;
-                return Ok(());
-            }
+            // A tree the buffers cannot hold is an error, never a silently stale or cut-off one;
+            // `nodes_dirty` and `root_count` stay as they were.
+            check_node_caps(
+                (node_list.len(), root_list.len()),
+                self.max_nodes,
+                GPU_TRAV_QUEUE_CAP as usize,
+            )?;
             if !node_list.is_empty() {
                 let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
                 for n in &node_list {
                     nbytes.extend_from_slice(&n.to_bytes());
                 }
                 self.nodes.write_range(&*host, 0, &nbytes)?;
-            }
-            let rcount = root_list.len().min(GPU_TRAV_QUEUE_CAP as usize);
-            if rcount > 0 {
-                let mut rbytes = Vec::with_capacity(rcount * 4);
-                for &r in &root_list[..rcount] {
+                let mut rbytes = Vec::with_capacity(root_list.len() * 4);
+                for &r in &root_list {
                     rbytes.extend_from_slice(&r.to_le_bytes());
                 }
                 self.roots.write_range(&*host, 0, &rbytes)?;
             }
-            self.root_count = rcount as u32;
+            self.root_count = root_list.len() as u32;
             self.nodes_dirty = false;
         }
         Ok(())
@@ -1150,6 +1290,126 @@ mod tests {
         }
         assert_eq!(cur.section_id, 10);
         assert_eq!(unpack_section_pos([cur.pos0, cur.pos1]), (0, [-3, 2, 5]));
+    }
+
+    /// Live sections as `(level, pos)` per id, mirrored into a `NodeOccupancy` the way the arena does.
+    fn tree_of(live: &HashMap<u32, (u8, [i32; 3])>) -> (usize, usize) {
+        let meta = live
+            .iter()
+            .map(|(&id, &(level, pos))| (id, (level, pos, SectionAabb::FULL)))
+            .collect();
+        let (nodes, roots) = build_node_tree(&meta);
+        (nodes.len(), roots.len())
+    }
+
+    #[test]
+    fn node_occupancy_matches_built_tree_and_projects_exactly() {
+        const MAX_NODES: usize = 200;
+        const MAX_ROOTS: usize = 5;
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self, n: u64) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (self.0 >> 33) % n
+            }
+            fn coord(&mut self) -> i32 {
+                self.next(19) as i32 - 9
+            }
+        }
+        let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
+        let mut live: HashMap<u32, (u8, [i32; 3])> = HashMap::new();
+        let mut occupancy = NodeOccupancy::default();
+        let (mut admitted, mut refused) = (0, 0);
+        for step in 0..600u32 {
+            let ids: Vec<u32> = live.keys().copied().collect();
+            let existing = (!ids.is_empty()).then(|| ids[rng.next(ids.len() as u64) as usize]);
+            let level = rng.next(5) as u8;
+            let key = (level, [rng.coord(), rng.coord(), rng.coord()]);
+            // (old id, new key): insert, same-key replace, different-pos replace, or remove.
+            let (old, new) = match (rng.next(4), existing) {
+                (0, Some(id)) => (Some(id), live[&id]),
+                (1, Some(id)) => (Some(id), key),
+                (2, Some(id)) => {
+                    let (level, pos) = live.remove(&id).unwrap();
+                    occupancy.remove(level, pos);
+                    assert_eq!(
+                        (occupancy.node_count(), occupancy.root_count()),
+                        tree_of(&live),
+                        "after removal at step {step}"
+                    );
+                    continue;
+                }
+                _ => (None, key),
+            };
+            // A position holds one live section; reusing it is a same-key replace.
+            let occupant = live.iter().find(|&(_, &k)| k == new).map(|(&id, _)| id);
+            let old = old.or(occupant);
+            if old != occupant && occupant.is_some() {
+                continue;
+            }
+            let old_key = old.map(|id| live[&id]);
+            let projected = occupancy.projected_counts(old_key, new);
+            let before = occupancy.clone();
+            if check_node_caps(projected, MAX_NODES, MAX_ROOTS).is_err() {
+                refused += 1;
+                assert!(projected.0 > MAX_NODES || projected.1 > MAX_ROOTS);
+                assert_eq!(occupancy, before, "refusal mutated at step {step}");
+                continue;
+            }
+            admitted += 1;
+            occupancy.insert(new.0, new.1);
+            if let Some(id) = old {
+                let (level, pos) = live[&id];
+                occupancy.remove(level, pos);
+                live.remove(&id);
+            }
+            live.insert(step, new);
+            let actual = (occupancy.node_count(), occupancy.root_count());
+            assert_eq!(actual, projected, "projection at step {step}");
+            assert_eq!(actual, tree_of(&live), "tree at step {step}");
+        }
+        assert!(admitted > 0 && refused > 0, "{admitted} / {refused}");
+    }
+
+    #[test]
+    fn node_cap_refusal_reports_exact_counts_and_same_key_replace_is_free() {
+        let mut occupancy = NodeOccupancy::default();
+        occupancy.insert(0, [0, 0, 0]);
+        assert_eq!((occupancy.node_count(), occupancy.root_count()), (33, 1));
+        let (nodes, roots) = (occupancy.node_count(), occupancy.root_count());
+        // Replacing a section with itself, or with a sibling, needs no new nodes.
+        for new in [(0, [0, 0, 0]), (0, [1, 0, 0])] {
+            assert_eq!(
+                occupancy.projected_counts(Some((0, [0, 0, 0])), new),
+                (nodes, roots)
+            );
+            assert!(check_node_caps((nodes, roots), nodes, roots).is_ok());
+        }
+        let before = occupancy.clone();
+        let far = (0, [100, 0, 0]);
+        let projected = occupancy.projected_counts(None, far);
+        assert_eq!(projected, (66, 2));
+        assert!(matches!(
+            check_node_caps(projected, nodes, 8),
+            Err(ArenaError::NodesFull {
+                needed_nodes: 66,
+                max_nodes: 33,
+                needed_roots: 2,
+                max_roots: 8,
+            })
+        ));
+        assert!(matches!(
+            check_node_caps(projected, 100, 1),
+            Err(ArenaError::NodesFull {
+                needed_roots: 2,
+                max_roots: 1,
+                ..
+            })
+        ));
+        assert_eq!(occupancy, before);
     }
 
     #[test]
