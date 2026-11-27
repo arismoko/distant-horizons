@@ -54,7 +54,9 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
   refresh the active dimension. For an integrated world (including the LAN host), they keep
   resident terrain and rebuild its meshes.
   On a remote server they drop cached server sections and fetch them again as needed, keeping and
-  remeshing unsaved sections during the clear. Neither action deletes disk files.
+  remeshing unsaved sections during the clear. A remote clear also lifts unreadable-section
+  suppression for the active dimension, so those sections get one more try (and are suppressed
+  again for the rest of the session if still unreadable). Neither action deletes disk files.
 
 ## Differences from the original
 

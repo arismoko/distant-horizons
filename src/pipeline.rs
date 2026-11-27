@@ -302,6 +302,10 @@ struct Pipeline {
     saves_refused: bool,
     /// Sections already asked of a remote server, per dimension.
     requested: HashMap<String, HashSet<OctreeSectionPos>>,
+    /// Sections whose full server reply could not be decoded, per dimension. They are not asked
+    /// again for the rest of the play session (the server would resend the same bytes); a valid
+    /// reply, a remote `/ds clear` of the dimension or a world reset lifts the suppression.
+    unreadable: HashMap<String, HashSet<OctreeSectionPos>>,
     disk: HashMap<String, DiskIntake>,
     next_probe: u64,
 }
@@ -620,9 +624,12 @@ impl Pipeline {
 /// monotonically increasing mesh/probe IDs. No client tick can enqueue uploads during this reset.
 pub(crate) fn reset_world(io: &LodIoWorker) {
     let mut p = PIPELINE.lock().unwrap();
-    let abandoned = p.reset_world(io);
+    let (abandoned, suppressed) = p.reset_world(io);
     if abandoned != 0 {
         eprintln!("DH: abandoned {abandoned} unsaved octree sections at world reset");
+    }
+    for (dim, count) in suppressed {
+        eprintln!("DH: suppressed {count} unreadable remote octree sections in {dim}");
     }
     MESH_WORKER.clear();
     PLAYER_XZ.lock().unwrap().clear();
@@ -630,7 +637,9 @@ pub(crate) fn reset_world(io: &LodIoWorker) {
 }
 
 impl Pipeline {
-    fn reset_world(&mut self, io: &LodIoWorker) -> usize {
+    /// Returns the unsaved sections abandoned and, sorted by dimension, how many sections each
+    /// dimension suppressed as unreadable during the play session that just ended.
+    fn reset_world(&mut self, io: &LodIoWorker) -> (usize, Vec<(String, usize)>) {
         io.reset_world();
         // Accepted operations drained above. If no worker could start, nothing can write
         // the refused sections now, and their old world keys must not survive this reset.
@@ -643,8 +652,13 @@ impl Pipeline {
         self.unsaved.clear();
         self.saves_refused = false;
         self.requested.clear();
+        let mut suppressed: Vec<_> = std::mem::take(&mut self.unreadable)
+            .into_iter()
+            .map(|(dim, set)| (dim, set.len()))
+            .collect();
+        suppressed.sort();
         self.disk.clear();
-        abandoned
+        (abandoned, suppressed)
     }
 
     fn clear_dimension(&mut self, dim: &str) -> usize {
@@ -654,6 +668,7 @@ impl Pipeline {
         self.section_epoch.retain(|(d, _), _| d != dim);
         self.rendered.remove(dim);
         self.requested.remove(dim);
+        self.unreadable.remove(dim);
         self.disk.remove(dim);
         self.unsaved.remove(dim).map_or(0, |set| set.len())
     }
@@ -682,6 +697,8 @@ pub(crate) fn clear_client_cache(dim: &str, remote: bool) -> (usize, usize) {
 impl Pipeline {
     fn clear_client_cache(&mut self, dim: &str, remote: bool) -> (usize, usize) {
         let dropped = if remote {
+            // Give unreadable sections one more try; a reply that still fails suppresses them again.
+            self.unreadable.remove(dim);
             let unsaved = self.unsaved.get(dim);
             self.stores
                 .get_mut(dim)
@@ -1177,11 +1194,12 @@ impl Pipeline {
 /// Level-0 section rows (`y`) the sweeps cover; level `n` covers them shifted right by `n`.
 const Y_SECTIONS: std::ops::RangeInclusive<i32> = -2..=9;
 
-/// The sections the GPU traversal asked for that are not resident, outstanding or duplicated
-/// within this sweep. Positions outside the vertical range the sweeps cover are ignored.
+/// The sections the GPU traversal asked for that are not resident, outstanding, unreadable or
+/// duplicated within this sweep. Positions outside the vertical range the sweeps cover are ignored.
 fn take_gpu_requested(
     store: Option<&OctreeIngestStore>,
     requested: &HashSet<OctreeSectionPos>,
+    unreadable: Option<&HashSet<OctreeSectionPos>>,
     demand: impl IntoIterator<Item = (u8, [i32; 3])>,
     budget: usize,
 ) -> Vec<OctreeSectionPos> {
@@ -1198,6 +1216,7 @@ fn take_gpu_requested(
         let pos = OctreeSectionPos::new(detail, x, y, z);
         if store.is_some_and(|s| s.section(pos).is_some())
             || requested.contains(&pos)
+            || unreadable.is_some_and(|set| set.contains(&pos))
             || out.contains(&pos)
         {
             continue;
@@ -1227,6 +1246,7 @@ pub fn request_stored_sections(
     for pos in take_gpu_requested(
         store,
         &HashSet::new(),
+        None,
         crate::render_bridge::drain_gpu_node_requests(),
         left,
     ) {
@@ -1372,7 +1392,40 @@ pub fn client_sync(
     let events = crate::network::octree_sync::drain_client_events();
     {
         let mut guard = PIPELINE.lock().unwrap();
-        let p = &mut *guard;
+        guard.apply_client_events(events, |mapper, section, blocks, biomes| {
+            mapper.remap(host, section, blocks, biomes)
+        });
+    }
+    let mut guard = PIPELINE.lock().unwrap();
+    let p = &mut *guard;
+    // PIPELINE -> client intake only for the nonblocking send. Reset closes intake and drops
+    // that guard before retiring PIPELINE, so an accepted send cannot mark the next world.
+    request_remote_sections(
+        p.stores.get(dim),
+        p.requested.entry(dim.to_owned()).or_default(),
+        p.unreadable.get(dim),
+        center,
+        radius,
+        budget,
+        crate::render_bridge::drain_gpu_node_requests(),
+        |pos| crate::network::octree_sync::client_send_request(host, dim, pos, None),
+    );
+}
+
+impl Pipeline {
+    /// Apply what the server sent. A valid section replaces ours and lifts any unreadable
+    /// suppression of its key; an unreadable reply stops further requests for its key, while a
+    /// lost or refused request is simply asked again later.
+    fn apply_client_events(
+        &mut self,
+        events: Vec<ClientEvent>,
+        mut remap: impl FnMut(
+            &mut Mapper,
+            &OctreeSection,
+            &BTreeMap<u32, String>,
+            &BTreeMap<u16, String>,
+        ) -> OctreeSection,
+    ) {
         for event in events {
             let (level, section, mapping) = match event {
                 ClientEvent::Section {
@@ -1385,9 +1438,16 @@ pub fn client_sync(
                     section,
                     mapping,
                 } => (level, section, mapping),
+                ClientEvent::Unreadable { level, pos } => {
+                    if let Some(r) = self.requested.get_mut(&level) {
+                        r.remove(&pos);
+                    }
+                    self.unreadable.entry(level).or_default().insert(pos);
+                    continue;
+                }
                 ClientEvent::Lost { level, pos } | ClientEvent::Failed { level, pos, .. } => {
                     // Ask again later.
-                    if let Some(r) = p.requested.get_mut(&level) {
+                    if let Some(r) = self.requested.get_mut(&level) {
                         r.remove(&pos);
                     }
                     continue;
@@ -1404,41 +1464,39 @@ pub fn client_sync(
                 .filter(|e| e.kind == 1)
                 .map(|e| (e.id as u16, e.name.clone()))
                 .collect();
-            let section = p.mapper.remap(host, &section, &blocks, &biomes);
+            let section = remap(&mut self.mapper, &section, &blocks, &biomes);
             let pos = section.pos;
-            let store = p.stores.entry(level.clone()).or_default();
             // A newer server copy replaces ours.
-            store.replace_section(section);
-            p.queue(&level, [pos]);
+            self.stores
+                .entry(level.clone())
+                .or_default()
+                .replace_section(section);
+            if let Some(set) = self.unreadable.get_mut(&level) {
+                set.remove(&pos);
+                if set.is_empty() {
+                    self.unreadable.remove(&level);
+                }
+            }
+            self.queue(&level, [pos]);
         }
     }
-    let mut guard = PIPELINE.lock().unwrap();
-    let p = &mut *guard;
-    // PIPELINE -> client intake only for the nonblocking send. Reset closes intake and drops
-    // that guard before retiring PIPELINE, so an accepted send cannot mark the next world.
-    request_remote_sections(
-        p.stores.get(dim),
-        p.requested.entry(dim.to_owned()).or_default(),
-        center,
-        radius,
-        budget,
-        crate::render_bridge::drain_gpu_node_requests(),
-        |pos| crate::network::octree_sync::client_send_request(host, dim, pos, None),
-    );
 }
 
 /// Select up to the existing per-tick budget, GPU demand first. Selection itself is temporary:
-/// only a queued send marks a key, while every attempt uses the same budget as before.
+/// only a queued send marks a key, while every attempt uses the same budget as before. Keys in
+/// `unreadable` are never selected.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn request_remote_sections(
     store: Option<&OctreeIngestStore>,
     requested: &mut HashSet<OctreeSectionPos>,
+    unreadable: Option<&HashSet<OctreeSectionPos>>,
     center: [f64; 3],
     radius: i32,
     budget: usize,
     gpu_demand: impl IntoIterator<Item = (u8, [i32; 3])>,
     mut send: impl FnMut(OctreeSectionPos) -> bool,
 ) {
-    let mut want = take_gpu_requested(store, requested, gpu_demand, budget);
+    let mut want = take_gpu_requested(store, requested, unreadable, gpu_demand, budget);
     let edge = crate::octree::SECTION_EDGE as f64;
     let (cx, cz) = (
         (center[0] / edge).floor() as i32,
@@ -1453,6 +1511,7 @@ pub(crate) fn request_remote_sections(
                 let pos = OctreeSectionPos::new(0, sx, sy, sz);
                 if store.is_some_and(|s| s.section(pos).is_some())
                     || requested.contains(&pos)
+                    || unreadable.is_some_and(|set| set.contains(&pos))
                     || want.contains(&pos)
                 {
                     continue;
@@ -1674,11 +1733,15 @@ mod tests {
             0,
             "server stopping drains but does not retire terrain"
         );
-        assert_eq!(p.reset_world(&refusing), 1, "only the unaccepted save");
+        assert_eq!(p.reset_world(&refusing).0, 1, "only the unaccepted save");
         assert!(p.unsaved.is_empty());
         assert!(p.disk.is_empty());
         assert!(!p.saves_refused);
-        assert_eq!(p.reset_world(&refusing), 0, "retirement is counted once");
+        assert_eq!(
+            p.reset_world(&refusing),
+            (0, Vec::new()),
+            "retirement is counted once"
+        );
     }
 
     #[test]
@@ -2221,6 +2284,197 @@ mod tests {
         assert_eq!(merged.get(0, 0, 0), Voxel::air_with_light(15, 0));
         assert_eq!(merged.get(16, 0, 0), sibling);
         drop(fresh);
+    }
+
+    const NETHER: &str = "minecraft:the_nether";
+
+    fn keep(
+        _: &mut Mapper,
+        section: &OctreeSection,
+        _: &BTreeMap<u32, String>,
+        _: &BTreeMap<u16, String>,
+    ) -> OctreeSection {
+        section.clone()
+    }
+
+    fn column(y: i32) -> OctreeSectionPos {
+        OctreeSectionPos::new(0, 0, y, 0)
+    }
+
+    /// One production sweep over `DIM`: GPU demand for the `ys` sections alone, or the radius
+    /// scan alone. Every selected key is accepted by the send, so it becomes requested.
+    fn sweep(p: &mut Pipeline, gpu: bool, ys: &[i32]) -> Vec<OctreeSectionPos> {
+        let (radius, demand): (i32, Vec<(u8, [i32; 3])>) = if gpu {
+            (-1, ys.iter().map(|&y| (0, [0, y, 0])).collect())
+        } else {
+            (0, Vec::new())
+        };
+        let mut sent = Vec::new();
+        request_remote_sections(
+            p.stores.get(DIM),
+            p.requested.entry(DIM.into()).or_default(),
+            p.unreadable.get(DIM),
+            [0.0; 3],
+            radius,
+            64,
+            demand,
+            |pos| {
+                sent.push(pos);
+                true
+            },
+        );
+        sent
+    }
+
+    fn section_event(pos: OctreeSectionPos, partial: bool) -> ClientEvent {
+        let section = OctreeSection::filled(pos, Voxel::new(1, 0, 12, 0));
+        let level = DIM.to_owned();
+        let mapping = Vec::new();
+        if partial {
+            ClientEvent::PartialUpdate {
+                level,
+                section,
+                mapping,
+            }
+        } else {
+            ClientEvent::Section {
+                level,
+                section,
+                mapping,
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_keys_are_skipped_by_both_sweeps_while_lost_and_failed_keys_retry() {
+        use crate::network::octree_sync::ExceptionKind;
+        let (bad, lost, failed) = (column(0), column(1), column(2));
+        for gpu in [false, true] {
+            let mut p = Pipeline::default();
+            let first = sweep(&mut p, gpu, &[0, 1, 2]);
+            assert!([bad, lost, failed].iter().all(|pos| first.contains(pos)));
+            assert!(
+                sweep(&mut p, gpu, &[0, 1, 2]).is_empty(),
+                "all are outstanding"
+            );
+
+            p.apply_client_events(
+                vec![
+                    ClientEvent::Unreadable {
+                        level: DIM.into(),
+                        pos: bad,
+                    },
+                    ClientEvent::Lost {
+                        level: DIM.into(),
+                        pos: lost,
+                    },
+                    ClientEvent::Failed {
+                        level: DIM.into(),
+                        pos: failed,
+                        kind: ExceptionKind::RateLimited,
+                        message: String::new(),
+                    },
+                ],
+                keep,
+            );
+            assert_eq!(p.unreadable[DIM], HashSet::from([bad]));
+            assert!(!p.requested[DIM].contains(&bad));
+            let again = sweep(&mut p, gpu, &[0, 1, 2]);
+            assert!(!again.contains(&bad), "unreadable stays suppressed");
+            assert!(again.contains(&lost) && again.contains(&failed));
+            assert!(!sweep(&mut p, gpu, &[0, 1, 2]).contains(&bad));
+        }
+    }
+
+    #[test]
+    fn a_valid_section_or_partial_update_lifts_unreadable_and_is_adopted() {
+        for partial in [false, true] {
+            let mut p = Pipeline::default();
+            let (bad, other) = (column(0), column(1));
+            p.apply_client_events(
+                [bad, other]
+                    .map(|pos| ClientEvent::Unreadable {
+                        level: DIM.into(),
+                        pos,
+                    })
+                    .into(),
+                keep,
+            );
+            assert_eq!(p.unreadable[DIM].len(), 2);
+
+            p.apply_client_events(vec![section_event(bad, partial)], keep);
+            assert_eq!(p.unreadable[DIM], HashSet::from([other]));
+            assert!(p.stores[DIM].section(bad).is_some());
+            assert!(p.queued[DIM].contains(&bad));
+
+            p.apply_client_events(vec![section_event(other, partial)], keep);
+            assert!(
+                !p.unreadable.contains_key(DIM),
+                "no empty entry remains after the last key is lifted"
+            );
+            assert!(p.stores[DIM].section(other).is_some());
+        }
+    }
+
+    #[test]
+    fn portal_retire_keeps_suppression_and_remote_clear_retries_only_the_active_dimension() {
+        let bad = column(0);
+        let unreadable = ClientEvent::Unreadable {
+            level: DIM.into(),
+            pos: bad,
+        };
+        for gpu in [false, true] {
+            let mut p = Pipeline::default();
+            p.unreadable.insert(NETHER.into(), HashSet::from([bad]));
+            assert!(sweep(&mut p, gpu, &[0]).contains(&bad));
+            p.apply_client_events(vec![unreadable.clone()], keep);
+            assert!(!sweep(&mut p, gpu, &[0]).contains(&bad));
+
+            p.retire_client_rendering(DIM);
+            assert_eq!(p.unreadable[DIM], HashSet::from([bad]), "same play session");
+            assert_eq!(p.clear_client_cache(DIM, false), (0, 0));
+            assert_eq!(p.unreadable[DIM], HashSet::from([bad]), "local clear");
+
+            assert_eq!(p.clear_client_cache(DIM, true), (0, 0));
+            assert!(!p.unreadable.contains_key(DIM));
+            assert_eq!(p.unreadable[NETHER], HashSet::from([bad]));
+            assert!(sweep(&mut p, gpu, &[0]).contains(&bad), "one more try");
+
+            p.apply_client_events(vec![unreadable.clone()], keep);
+            assert!(!sweep(&mut p, gpu, &[0]).contains(&bad), "suppressed again");
+
+            p.clear_dimension(DIM);
+            assert!(!p.unreadable.contains_key(DIM));
+            assert!(p.unreadable.contains_key(NETHER));
+        }
+    }
+
+    #[test]
+    fn world_reset_clears_suppression_and_reports_each_dimension_once() {
+        let io = LodIoWorker::spawn();
+        let mut p = Pipeline::default();
+        p.unreadable
+            .insert(NETHER.into(), HashSet::from([column(0)]));
+        p.unreadable
+            .insert(DIM.into(), HashSet::from([column(0), column(1)]));
+        let state = Mutex::new(crate::render_bridge::DhState::default());
+        let mut resets = Vec::new();
+        for _ in 0..2 {
+            crate::reset_world(
+                &state,
+                crate::WorldBoundary::ClientLogin(Some(false)),
+                || {},
+                || resets.push(p.reset_world(&io)),
+            );
+        }
+        assert_eq!(
+            resets,
+            [
+                (0, vec![(DIM.to_owned(), 2), (NETHER.to_owned(), 1)]),
+                (0, Vec::new())
+            ]
+        );
+        assert!(p.unreadable.is_empty());
     }
 
     #[test]
