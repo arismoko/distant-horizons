@@ -18,7 +18,7 @@ use crate::lod::SectionPos;
 use mod_api::{
     ChunkSnapshot, DetachedChunkGenerator, GenerationStage, SavedChunkReader, TerrainColumn,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -221,13 +221,14 @@ impl GenWorkerPool {
         )
     }
 
-    pub fn is_in_flight(&self, dim: &str, pos: SectionPos) -> bool {
-        let set = self
-            .shared
+    pub(crate) fn in_flight_sections(&self, dim: &str) -> HashSet<SectionPos> {
+        self.shared
             .in_flight
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        set.iter().any(|((d, p), _)| d == dim && *p == pos)
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter_map(|(d, pos)| (d == dim).then_some(*pos))
+            .collect()
     }
 
     /// Enqueue a distant section for off-thread sampling. Returns `true` if queued,

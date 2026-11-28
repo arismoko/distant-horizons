@@ -571,8 +571,6 @@ fn vanilla_clip_dist(frame: &RenderFrameParams) -> f32 {
 
 /// Sections built off-thread and waiting for a `&mut ClientHost` to reach the arena.
 static PENDING_SECTIONS: Mutex<Vec<(SectionKey, BuiltSection)>> = Mutex::new(Vec::new());
-static PENDING_Y_BOUNDS: Mutex<std::collections::BTreeMap<String, (i32, i32)>> =
-    Mutex::new(std::collections::BTreeMap::new());
 
 /// One shared GPU geometry arena ([`crate::gpu_arena::VOXY_GEOMETRY_BYTES`], 128 MiB by default)
 /// survives dimension and world changes. Like Voxy's `MixinLevelRenderer.voxy$setWorld`, only
@@ -614,14 +612,6 @@ pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
     PENDING_SECTIONS.lock().unwrap().push((key, section));
 }
 
-/// Publish the build height alongside meshes, including on the tick that creates the arena.
-pub(crate) fn set_dimension_y_bounds(dimension: &str, bounds: (i32, i32)) {
-    PENDING_Y_BOUNDS
-        .lock()
-        .unwrap()
-        .insert(dimension.to_owned(), bounds);
-}
-
 /// Most quads one indirect command can span (a 32³ section's worth of faces in one bucket).
 const MAX_QUADS_PER_COMMAND: u32 = 1 << 16;
 
@@ -649,8 +639,15 @@ fn create_quad_mesh(
 /// Creates the arena on first use (ruling 2: it then survives reloads and world close),
 /// uploads pending sections and flushes metadata. Call from `client_tick_pre`. Errors are logged
 /// through [`report`]; the frame goes on without them.
-pub fn upload_pending(host: &mut dyn mod_api::ClientHost, config: ArenaConfig) {
-    report_arena("arena upload", try_upload_pending(host, config));
+pub(crate) fn upload_pending(
+    host: &mut dyn mod_api::ClientHost,
+    active_dim: Option<&str>,
+    y_bounds: Option<(i32, i32)>,
+) {
+    report_arena(
+        "arena upload",
+        try_upload_pending(host, active_dim, y_bounds),
+    );
 }
 
 /// Allocates the arena buffers first, then the shared quad mesh; a mesh failure releases every
@@ -834,16 +831,22 @@ fn write_atlas(host: &mut dyn mod_api::ClientHost, atlas: &[u8]) -> bool {
 }
 
 // Lock order: `ARENA` -> `PENDING_TABLES` -> `PENDING_SECTIONS` when nested.
-// `PENDING_Y_BOUNDS` is taken alone or immediately under `ARENA`.
 // `ARENA` is never held across a call into `crate::pipeline`.
 fn try_upload_pending(
     host: &mut dyn mod_api::ClientHost,
-    config: ArenaConfig,
+    active_dim: Option<&str>,
+    y_bounds: Option<(i32, i32)>,
 ) -> Result<(), crate::gpu_arena::ArenaError> {
     let mut guard = ARENA.lock().unwrap();
     let created = guard.is_none();
     if created {
-        *guard = Some(create_state(host, config)?);
+        *guard = Some(create_state(
+            host,
+            ArenaConfig {
+                max_sections: crate::gpu_arena::VOXY_MAX_SECTIONS,
+                geometry_bytes: crate::gpu_arena::VOXY_GEOMETRY_BYTES,
+            },
+        )?);
     }
     let tables = PENDING_TABLES.lock().unwrap().take();
     if let Some(queued) = tables {
@@ -887,12 +890,12 @@ fn try_upload_pending(
         }
     }
     let state = guard.as_mut().unwrap();
-    for (dimension, bounds) in std::mem::take(&mut *PENDING_Y_BOUNDS.lock().unwrap()) {
-        state.arena.set_dimension_y_bounds(dimension, bounds);
-    }
     // One section failing (arena full, bad write) never drops the rest of the batch: each is
     // handled on its own, logged through `report`, and the metadata flush still runs.
     for (key, section) in std::mem::take(&mut *PENDING_SECTIONS.lock().unwrap()) {
+        if active_dim != Some(key.0.as_str()) {
+            continue;
+        }
         let old = state.ids.get(&key).copied();
         let [x, y, z] = section.pos;
         let pos = OctreeSectionPos::new(section.level, x, y, z);
@@ -920,8 +923,7 @@ fn try_upload_pending(
         }
     }
     // Only the active dimension owns arena section slots.
-    let dimension = state.ids.keys().next().map(|key| key.0.as_str());
-    let flushed = state.arena.flush(host, dimension);
+    let flushed = state.arena.flush(host, active_dim, y_bounds);
     drop(guard);
     if created {
         crate::pipeline::mark_models_dirty();
@@ -935,7 +937,6 @@ pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaErr
     flush_report_summaries();
     let mut guard = ARENA.lock().unwrap();
     purge_pending_dimension(&mut PENDING_SECTIONS.lock().unwrap(), dimension);
-    PENDING_Y_BOUNDS.lock().unwrap().remove(dimension);
     let Some(state) = guard.as_mut() else {
         drop(guard);
         clear_frame_stats();
@@ -980,7 +981,6 @@ fn clear_all_pending_and_ids(
 pub fn clear_all_sections() -> Result<(), crate::gpu_arena::ArenaError> {
     flush_report_summaries();
     let mut guard = ARENA.lock().unwrap();
-    PENDING_Y_BOUNDS.lock().unwrap().clear();
     let mut pending = PENDING_SECTIONS.lock().unwrap();
     let result = match guard.as_mut() {
         Some(state) => {
@@ -1581,6 +1581,8 @@ pub struct DhState {
     pub pending_chunk_set: HashMap<String, HashSet<[i32; 2]>>,
     /// Public API: per-dimension custom world generators overriding built-in distant sampling.
     pub world_generators: HashMap<String, Arc<dyn LodWorldGenerator>>,
+    /// Changes on every successful registration or removal, including same-Arc replacement.
+    pub world_generator_epoch: u64,
     /// Public API: per-dimension client-side remote LOD providers.
     pub remote_providers: HashMap<String, Arc<dyn RemoteLodProvider>>,
     /// Public API: dimensions where built-in distant generation is explicitly disabled.
@@ -1633,6 +1635,7 @@ impl Default for DhState {
             pending_chunks: HashMap::new(),
             pending_chunk_set: HashMap::new(),
             world_generators: HashMap::new(),
+            world_generator_epoch: 0,
             remote_providers: HashMap::new(),
             disabled_builtin_gen: HashSet::new(),
             disabled_builtin_net: HashSet::new(),

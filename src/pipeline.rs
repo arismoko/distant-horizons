@@ -8,6 +8,7 @@ use crate::bakery::{
     BakeQuad, BakeRequest, BakedModel, BakedModelTable, BakedTint, BiomeTintTable, FluidKind,
     MODEL_TRANSLUCENT, SpriteError, SpritePixels, SpriteSource, default_translucent, pack_rgba,
 };
+use crate::gen_worker::GenOutcome;
 use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
 use crate::lod::SectionPos;
 use crate::mesh::{SectionQuads, mesh_octree_section};
@@ -15,9 +16,10 @@ use crate::network::octree_sync::{ClientEvent, MappingEntry, OctreeSectionDto, S
 use crate::octree::Voxel;
 use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
 use crate::octree_ingest::{
-    DistantColumn, DistantSample, OctreeIngestStore, ingest_chunk_snapshot, ingest_saved_chunk,
+    DistantColumn, DistantSample, OctreeIngestStore, coarse_cell_covered, ingest_chunk_snapshot,
+    ingest_saved_chunk,
 };
-use crate::render_bridge::submit_built_section;
+use crate::render_bridge::{SectionKey, submit_built_section};
 use crate::storage::{DEFAULT_OCTREE_COMPRESSION, LodIoWorker, OctreeLoaded, OctreeMapping};
 use mod_api::{
     BlockKey, BlockState, ChunkSnapshot, ClientHost, Direction, Host, HostBlockStates, PlayerRef,
@@ -197,6 +199,12 @@ struct MeshJob {
     complete: bool,
     borders: NeighborBorders,
     metas: Arc<MetaTable>,
+}
+
+#[derive(Default)]
+struct DispatchedMeshes {
+    empty_submissions: Vec<(SectionKey, BuiltSection)>,
+    jobs: Vec<MeshJob>,
 }
 
 type MeshDone = (String, OctreeSectionPos, u64, BuiltSection);
@@ -380,7 +388,9 @@ impl Pipeline {
                     for sy in (Y_SECTIONS.start() >> level)..=(Y_SECTIONS.end() >> level) {
                         let mut cur = Some(OctreeSectionPos::new(level, sx, sy, sz));
                         while let Some(candidate) = cur {
-                            if store.is_some_and(|s| s.section(candidate).is_some()) {
+                            if store.is_some_and(|s| {
+                                s.section(candidate).is_some() || s.is_section_complete(candidate)
+                            }) {
                                 break;
                             }
                             if !requested.contains(&candidate) {
@@ -474,16 +484,11 @@ impl Pipeline {
         }
     }
 
-    fn dispatch_meshes(
-        &mut self,
-        dim: &str,
-        mut pending: usize,
-        mut submit: impl FnMut(crate::render_bridge::SectionKey, BuiltSection),
-        mut enqueue: impl FnMut(MeshJob),
-    ) {
+    fn dispatch_meshes(&mut self, dim: &str, pending: usize) -> DispatchedMeshes {
+        let mut dispatched = DispatchedMeshes::default();
         let metas = Arc::clone(&self.meta_snapshot);
         for _ in 0..MESHES_PER_TICK {
-            if pending >= MAX_PENDING_MESH_JOBS {
+            if pending + dispatched.jobs.len() >= MAX_PENDING_MESH_JOBS {
                 break;
             }
             let Some(pos) = self.dirty.get_mut(dim).and_then(VecDeque::pop_front) else {
@@ -503,7 +508,9 @@ impl Pipeline {
                 }
                 let key = (dim.to_owned(), pos.detail, [pos.x, pos.y, pos.z]);
                 // Incomplete air withdraws any previous empty proof for this position.
-                submit(key, empty_section(pos, complete));
+                dispatched
+                    .empty_submissions
+                    .push((key, empty_section(pos, complete)));
                 continue;
             };
             let neighbors: [Option<&OctreeSection>; 6] =
@@ -513,7 +520,7 @@ impl Pipeline {
             self.next_epoch = self.next_epoch.wrapping_add(1);
             let epoch = self.next_epoch;
             self.section_epoch.insert((dim.to_owned(), pos), epoch);
-            enqueue(MeshJob {
+            dispatched.jobs.push(MeshJob {
                 dim: dim.to_owned(),
                 pos,
                 epoch,
@@ -522,8 +529,8 @@ impl Pipeline {
                 borders,
                 metas: Arc::clone(&metas),
             });
-            pending += 1;
         }
+        dispatched
     }
 
     fn apply_mesh_completions(
@@ -887,20 +894,19 @@ pub fn client_tick(host: &mut dyn ClientHost, active_dim: Option<&str>) {
     let p = &mut *guard;
     let Some(dim) = active_dim else {
         p.apply_mesh_completions(None, MESH_WORKER.drain_done(), |_, _| {});
+        drop(guard);
+        crate::render_bridge::upload_pending(host, None, None);
         return;
     };
 
-    if let Some(bounds) = p
-        .stores
-        .get(dim)
-        .and_then(OctreeIngestStore::y_bounds)
-        .or_else(|| {
-            let (min_y, height) = host.level(dim)?.height(host)?;
-            Some((min_y, min_y + height))
-        })
+    let store = p.stores.entry(dim.to_owned()).or_default();
+    if store.y_bounds().is_none()
+        && let Some((min_y, height)) = host.level(dim).and_then(|level| level.height(host))
     {
-        crate::render_bridge::set_dimension_y_bounds(dim, bounds);
+        store.set_y_bounds((min_y, min_y + height));
+        propagate_and_queue(p, dim);
     }
+    let y_bounds = p.stores[dim].y_bounds();
 
     let sprites = AtlasSprites { host };
     let mut baked_now = 0;
@@ -932,20 +938,18 @@ pub fn client_tick(host: &mut dyn ClientHost, active_dim: Option<&str>) {
         p.meta_snapshot = Arc::new(MetaTable(metas));
         crate::render_bridge::queue_model_tables(words, tint_words, atlas);
     }
-    if p.baked < p.mapper.states.len() {
-        return;
-    }
-
-    p.apply_mesh_completions(Some(dim), MESH_WORKER.drain_done(), submit_built_section);
-
-    p.dispatch_meshes(
-        dim,
-        MESH_WORKER.pending_len(),
-        submit_built_section,
-        |job| {
+    if p.baked == p.mapper.states.len() {
+        p.apply_mesh_completions(Some(dim), MESH_WORKER.drain_done(), submit_built_section);
+        let dispatched = p.dispatch_meshes(dim, MESH_WORKER.pending_len());
+        for (key, built) in dispatched.empty_submissions {
+            submit_built_section(key, built);
+        }
+        for job in dispatched.jobs {
             MESH_WORKER.push(job);
-        },
-    );
+        }
+    }
+    drop(guard);
+    crate::render_bridge::upload_pending(host, active_dim, y_bounds);
 }
 
 fn empty_section(pos: OctreeSectionPos, complete: bool) -> BuiltSection {
@@ -969,25 +973,19 @@ pub(crate) enum DistantCoverage {
 }
 
 impl Pipeline {
-    fn coarse_coverage(&self, dim: &str, pos: SectionPos) -> [[u64; 16]; 4] {
-        self.stores
-            .get(dim)
-            .map_or([[0; 16]; 4], |store| store.coarse_coverage(pos))
-    }
-
     fn ingest_coarse_job<'a, B>(
         &mut self,
         dim: &str,
         pos: SectionPos,
         columns: impl IntoIterator<Item = DistantSample<'a, B>>,
         materials: (u32, u32),
+        outcome: GenOutcome,
         mut resolve_block: impl FnMut(&mut Mapper, B) -> u32,
     ) -> DistantCoverage {
         let store = self.stores.entry(dim.to_owned()).or_default();
         let coverage =
             (pos.detail <= crate::octree::MAX_OCTREE_DETAIL).then(|| store.coarse_coverage(pos));
-        // The worker may also have sampled cells solely to refill the legacy row, or
-        // disk adoption may have covered them since dispatch. Preserve their octree bytes.
+        // Disk adoption or live ingestion may have covered cells since dispatch.
         let columns = columns.into_iter().filter(|column| {
             coverage.as_ref().is_none_or(|bits| {
                 let (x, z) = match column {
@@ -1007,7 +1005,10 @@ impl Pipeline {
             &mut |name| mapper.borrow_mut().biome(name),
             &|id| mapper.borrow().opacity(id),
         );
-        let complete = store.coarse_coverage(pos) == [[u64::MAX; 16]; 4];
+        let complete = coverage.is_none() || store.coarse_coverage(pos) == [[u64::MAX; 16]; 4];
+        if !complete && unavailable && outcome == GenOutcome::Complete {
+            store.mark_coarse_target_unavailable(pos);
+        }
         propagate_and_queue(self, dim);
         if complete {
             DistantCoverage::Complete
@@ -1019,16 +1020,33 @@ impl Pipeline {
     }
 }
 
-pub(crate) fn coarse_coverage(dim: &str, pos: SectionPos) -> [[u64; 16]; 4] {
-    PIPELINE.lock().unwrap().coarse_coverage(dim, pos)
+pub(crate) fn pick_distant_target(
+    dim: &str,
+    cache: &mut crate::render_bridge::DesiredCache,
+    legacy: &crate::lod::DimensionLodStore,
+    custom: Option<(
+        &Arc<dyn crate::api::LodWorldGenerator>,
+        std::ops::RangeInclusive<u8>,
+    )>,
+    in_flight: &HashSet<SectionPos>,
+) -> Option<(SectionPos, crate::DistantTarget)> {
+    let p = PIPELINE.lock().unwrap();
+    crate::pick_distant_target(cache, legacy, custom, in_flight, p.stores.get(dim))
 }
 
-pub(crate) fn coarse_cell_covered(coverage: &[[u64; 16]; 4], x: usize, z: usize) -> bool {
-    use crate::octree::SECTION_EDGE;
+pub(crate) fn invalidate_coarse_target(dim: &str, pos: SectionPos) {
+    if let Some(store) = PIPELINE.lock().unwrap().stores.get_mut(dim) {
+        store.invalidate_coarse_target(pos);
+    }
+}
 
-    let stack = x / SECTION_EDGE + 2 * (z / SECTION_EDGE);
-    let bit = x % SECTION_EDGE + (z % SECTION_EDGE) * SECTION_EDGE;
-    coverage[stack][bit / 64] & (1 << (bit % 64)) != 0
+pub(crate) fn set_y_bounds(dim: &str, bounds: (i32, i32)) {
+    let mut p = PIPELINE.lock().unwrap();
+    let store = p.stores.entry(dim.to_owned()).or_default();
+    if store.y_bounds().is_none() {
+        store.set_y_bounds(bounds);
+        propagate_and_queue(&mut p, dim);
+    }
 }
 
 /// G4: ingest the returned prefix of one finished distant-generation job. Each cell covers
@@ -1039,6 +1057,7 @@ pub(crate) fn ingest_distant(
     pos: SectionPos,
     cells: &[(usize, usize)],
     samples: &[Option<TerrainColumn>],
+    outcome: GenOutcome,
 ) -> DistantCoverage {
     // Detail 0 retains its existing snapshot/surface scheduler and completion behavior.
     if pos.detail == 0 && !samples.iter().any(Option::is_some) {
@@ -1073,7 +1092,7 @@ pub(crate) fn ingest_distant(
         store.set_y_bounds((min_y, min_y + height));
     }
     if pos.detail > 0 {
-        return p.ingest_coarse_job(dim, pos, columns, (water, stone), |mapper, key| {
+        return p.ingest_coarse_job(dim, pos, columns, (water, stone), outcome, |mapper, key| {
             mapper.block_key(host, key)
         });
     }
@@ -1273,6 +1292,7 @@ mod tests {
     struct FixtureChunk {
         sections: usize,
         bottom_block: u32,
+        edit_at_origin: Option<u32>,
     }
 
     impl ChunkVoxelSource for FixtureChunk {
@@ -1285,10 +1305,18 @@ mod tests {
             self.sections
         }
         fn section_uniform_block(&self, index: usize) -> Option<u32> {
-            Some(if index == 0 { self.bottom_block } else { 0 })
+            match index {
+                0 if self.edit_at_origin.is_some() => None,
+                0 => Some(self.bottom_block),
+                _ => Some(0),
+            }
         }
-        fn block(&self, _: usize, _: i32, _: usize) -> Option<u32> {
-            unreachable!("fixture slabs are uniform")
+        fn block(&self, x: usize, y: i32, z: usize) -> Option<u32> {
+            Some(if (x, y, z) == (0, 0, 0) {
+                self.edit_at_origin.unwrap_or(self.bottom_block)
+            } else {
+                self.bottom_block
+            })
         }
         fn biome(&self, _: usize, _: i32, _: usize) -> Option<&str> {
             None
@@ -1498,14 +1526,16 @@ mod tests {
         drop(cache);
         let mut p = Pipeline::default();
         let store = p.stores.entry(dim.into()).or_default();
-        assert!(store.adopt_section(old, complete));
+        assert!(store.adopt_section(old.clone(), complete));
         assert!(store.is_section_complete(pos));
+        store.replace_section(old); // An unproven server copy supersedes the proof on disk.
         assert!(crate::octree_ingest::ingest_chunk_snapshot(
             store,
             [0, 0],
             &FixtureChunk {
                 sections: 1,
-                bottom_block: 0
+                bottom_block: 0,
+                edit_at_origin: None,
             },
             &mut |b| b,
             &mut |_| 0,
@@ -1528,6 +1558,75 @@ mod tests {
         assert!(reopened.section(pos).unwrap().is_empty());
         assert_eq!(reopened.section(pos).unwrap().get(3, 3, 3), air);
         assert!(!reopened.is_section_complete(pos));
+    }
+
+    #[test]
+    fn reingesting_one_loaded_chunk_keeps_complete_tile_for_save_and_handoff() {
+        use crate::storage::{RegionCache, fresh_tmp_dir};
+
+        let dim = "test:complete-chunk-reingest";
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let mut p = Pipeline::default();
+        let ingest = |p: &mut Pipeline, chunk, bottom_block, edit_at_origin| {
+            assert!(ingest_chunk_snapshot(
+                p.stores.entry(dim.into()).or_default(),
+                chunk,
+                &FixtureChunk {
+                    sections: 2,
+                    bottom_block,
+                    edit_at_origin,
+                },
+                &mut |b| b,
+                &mut |_| 0,
+            ));
+        };
+        for chunk in [[0, 0], [1, 0], [0, 1], [1, 1]] {
+            ingest(&mut p, chunk, 1, None);
+        }
+        assert!(p.stores[dim].is_section_complete(pos));
+        propagate_and_queue(&mut p, dim);
+        let before = p.stores[dim].section(pos).unwrap().revision;
+        p.unsaved.get_mut(dim).unwrap().clear();
+        drain_fixture_meshes(&mut p, dim);
+
+        ingest(&mut p, [0, 0], 1, None);
+        assert!(p.stores[dim].is_section_complete(pos));
+        assert_eq!(p.stores[dim].section(pos).unwrap().revision, before);
+        propagate_and_queue(&mut p, dim);
+        assert!(p.unsaved[dim].is_empty());
+
+        for (bottom_block, edit, expected) in [(1, Some(2), 2), (0, None, 0)] {
+            ingest(&mut p, [0, 0], bottom_block, edit);
+            let store = &p.stores[dim];
+            assert!(store.is_section_complete(pos));
+            assert_eq!(store.voxel_at(0, 0, 0).block_id(), expected);
+            assert_eq!(store.voxel_at(1, 0, 0).block_id(), bottom_block);
+            for (x, z) in [(16, 0), (0, 16), (16, 16)] {
+                assert_eq!(store.voxel_at(x, 0, z).block_id(), 1);
+            }
+            propagate_and_queue(&mut p, dim);
+            let meshes = drain_fixture_meshes(&mut p, dim);
+            let leaf = meshes
+                .iter()
+                .find(|m| m.level == 0 && m.pos == [0; 3])
+                .unwrap();
+            assert!(leaf.complete && !leaf.is_empty());
+        }
+
+        let dir = fresh_tmp_dir("complete-chunk-reingest");
+        let io = LodIoWorker::spawn();
+        assert!(p.flush_saves(&io, &dir, usize::MAX) > 0);
+        io.flush();
+        drop(io);
+        let (saved, _, complete) = RegionCache::default()
+            .load_octree_section(&dir, dim, pos)
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(complete);
+        assert_eq!(
+            saved.to_dense(),
+            p.stores[dim].section(pos).unwrap().to_dense()
+        );
     }
 
     fn mesh_fixture(pos: OctreeSectionPos) -> OctreeSection {
@@ -1555,13 +1654,14 @@ mod tests {
         ]));
         let mut submitted = Vec::new();
         while !p.dirty[dim].is_empty() {
-            let mut done = Vec::new();
-            p.dispatch_meshes(
-                dim,
-                0,
-                |_, built| submitted.push(built),
-                |job| done.push(job.build()),
+            let dispatched = p.dispatch_meshes(dim, 0);
+            submitted.extend(
+                dispatched
+                    .empty_submissions
+                    .into_iter()
+                    .map(|(_, built)| built),
             );
+            let done = dispatched.jobs.into_iter().map(MeshJob::build).collect();
             p.apply_mesh_completions(Some(dim), done, |_, built| submitted.push(built));
         }
         submitted
@@ -1656,6 +1756,7 @@ mod tests {
             &FixtureChunk {
                 sections: 12,
                 bottom_block: 1,
+                edit_at_origin: None,
             },
             IngestSource::Distant,
             &mut |b| b,
@@ -1727,7 +1828,7 @@ mod tests {
                 assert!(store.adopt_section(mesh_fixture(pos), true));
             }
         }
-        assert_eq!(p.coarse_coverage(dim, target), [[u64::MAX; 16]; 4]);
+        assert_eq!(p.stores[dim].coarse_coverage(target), [[u64::MAX; 16]; 4]);
         p
     }
 
@@ -1743,108 +1844,63 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_requests_invalidated_legacy_cells_without_overwriting_adopted_octree() {
-        use crate::{DistantTarget, gen_worker::GenOutcome, lod::SECTION_CELLS};
-
+    fn scheduler_skips_a_complete_d1_octree_without_a_legacy_row() {
         let dim = "test:invalidated-legacy";
         let target = SectionPos::from_block(1, 384, 0);
         let mut p = adopted_d1_leaf(dim, target);
-        let octree_pos = OctreeSectionPos::new(1, 6, 0, 0);
-        let mut cache = single_distant_target(target);
-        // The state left by invalidate_lod_section: no legacy row or sampled marker and
-        // a rewound cursor, but the adopted octree leaf is still complete.
-        let mut legacy = DimensionLodStore::default();
-        let Some((pos, DistantTarget::Builtin(cells))) = crate::pick_distant_target(
-            &mut cache,
-            &mut legacy,
-            None,
-            |_| false,
-            |pos| p.coarse_coverage(dim, pos),
-        ) else {
-            panic!("expected an invalidated legacy row to be sampled again");
-        };
-        assert_eq!(pos, target);
-        assert_eq!(cells.len(), SECTION_CELLS);
-        for (i, &cell) in cells.iter().enumerate() {
-            assert_eq!(cell, (i % SECTION_SIZE, i / SECTION_SIZE));
-        }
-
-        let before = p.stores[dim].section(octree_pos).unwrap().to_dense();
-        let columns = coarse_job_columns(pos);
-        let samples = cells
-            .iter()
-            .map(|&(cx, cz)| DistantSample::Surface(columns[cx + cz * SECTION_SIZE]));
-        let coverage = p.ingest_coarse_job(dim, pos, samples, (0, 1), |_, b| b);
-        assert_eq!(coverage, DistantCoverage::Complete);
-        assert_eq!(
-            p.stores[dim].section(octree_pos).unwrap().to_dense(),
-            before
+        let legacy = DimensionLodStore::default();
+        let pos = OctreeSectionPos::new(1, 6, 0, 0);
+        let before = p.stores[dim].section(pos).unwrap().to_dense();
+        assert!(
+            crate::pick_distant_target(
+                &mut single_distant_target(target),
+                &legacy,
+                None,
+                &HashSet::new(),
+                p.stores.get(dim),
+            )
+            .is_none()
         );
-        assert_eq!(p.coarse_coverage(dim, target), [[u64::MAX; 16]; 4]);
-        assert!(crate::record_distant_completion(
-            &mut legacy,
-            pos,
-            GenOutcome::Complete,
-            coverage,
-            false,
-        ));
-        assert!(!legacy.sampled_distant_sections.contains(&pos));
+
+        // A job dispatched before disk adoption must not overwrite the now-complete octree.
+        let samples = coarse_job_columns(target)
+            .into_iter()
+            .map(DistantSample::Surface);
+        assert_eq!(
+            p.ingest_coarse_job(dim, target, samples, (0, 1), GenOutcome::Complete, |_, b| b),
+            DistantCoverage::Complete
+        );
+        assert_eq!(p.stores[dim].section(pos).unwrap().to_dense(), before);
+        assert!(legacy.sections.is_empty());
     }
 
     #[test]
     fn scheduler_checks_only_the_legacy_row_for_a_builtin_d5_target() {
+        use crate::DistantTarget;
         use crate::lod::{LodColumn, SECTION_CELLS, SOURCE_DISTANT_SURFACE};
-        use crate::{DistantTarget, gen_worker::GenOutcome};
 
-        let dim = "test:invalidated-d5-legacy";
         let target = SectionPos::from_block(5, 6144, 0);
-        let mut p = Pipeline::default();
-        p.stores
-            .entry(dim.into())
-            .or_default()
-            .set_y_bounds((0, 64));
-        p.ingest_coarse_job(
-            dim,
-            target,
-            coarse_job_columns(target)
-                .into_iter()
-                .map(DistantSample::Surface),
-            (0, 1),
-            |_, b| b,
-        );
-        assert_eq!(p.coarse_coverage(dim, target), [[u64::MAX; 16]; 4]);
-
         let mut legacy = DimensionLodStore::default();
-        let pick = |legacy: &mut DimensionLodStore, p: &Pipeline| {
+        let pick = |legacy: &DimensionLodStore| {
             crate::pick_distant_target(
                 &mut single_distant_target(target),
                 legacy,
                 None,
-                |_| false,
-                |pos| p.coarse_coverage(dim, pos),
+                &HashSet::new(),
+                None,
             )
         };
-        // Invalidation leaves no legacy row or sampled marker, but keeps the octree masks.
-        let Some((pos, DistantTarget::Builtin(cells))) = pick(&mut legacy, &p) else {
-            panic!("expected an invalidated D5 legacy row to be sampled again");
+        let Some((pos, DistantTarget::Builtin(cells))) = pick(&legacy) else {
+            panic!("expected a D5 legacy row to be sampled");
         };
         assert_eq!(pos, target);
         assert_eq!(cells.len(), SECTION_CELLS);
         for (i, &cell) in cells.iter().enumerate() {
             assert_eq!(cell, (i % SECTION_SIZE, i / SECTION_SIZE));
         }
-
-        let empty_octree = Pipeline::default();
-        assert_eq!(empty_octree.coarse_coverage(dim, target), [[0; 16]; 4]);
-        // A successful worker result is terminal at D5 even without octree proof.
-        assert!(!crate::record_distant_completion(
-            &mut legacy,
-            target,
-            GenOutcome::Complete,
-            DistantCoverage::Incomplete,
-            false,
-        ));
-        assert!(legacy.sampled_distant_sections.remove(&target));
+        legacy.legacy_terminal_targets.insert(target);
+        assert!(pick(&legacy).is_none());
+        assert!(legacy.legacy_terminal_targets.remove(&target));
 
         let row = legacy.get_or_create_mut(target);
         let column = LodColumn {
@@ -1856,8 +1912,7 @@ mod tests {
         for (cx, cz) in cells {
             assert!(row.set_cell(cx, cz, column));
         }
-        assert!(pick(&mut legacy, &empty_octree).is_none());
-        assert!(legacy.sampled_distant_sections.contains(&target));
+        assert!(pick(&legacy).is_none());
     }
 
     #[test]
@@ -1890,10 +1945,10 @@ mod tests {
         let mut legacy = DimensionLodStore::default();
         let Some((pos, DistantTarget::Custom(selected))) = crate::pick_distant_target(
             &mut cache,
-            &mut legacy,
+            &legacy,
             custom(),
-            |_| false,
-            |pos| p.coarse_coverage(dim, pos),
+            &HashSet::new(),
+            p.stores.get(dim),
         ) else {
             panic!("octree coverage must not satisfy the registered generator");
         };
@@ -1912,22 +1967,14 @@ mod tests {
                 assert!(row.set_cell(cx, cz, column));
             }
         }
-        let empty_octree = Pipeline::default();
         assert!(
-            crate::pick_distant_target(
-                &mut cache,
-                &mut legacy,
-                custom(),
-                |_| false,
-                |pos| empty_octree.coarse_coverage(dim, pos),
-            )
-            .is_none()
+            crate::pick_distant_target(&mut cache, &legacy, custom(), &HashSet::new(), None,)
+                .is_none()
         );
     }
 
     #[test]
     fn scheduler_completes_mixed_ring_despite_partial_or_full_legacy_row() {
-        use crate::gen_worker::GenOutcome;
         use crate::lod::{LodColumn, SOURCE_DISTANT_SURFACE};
 
         let dim = "test:mixed-ring";
@@ -2002,7 +2049,8 @@ mod tests {
                 [24, 0],
                 &FixtureChunk {
                     sections: 4,
-                    bottom_block: 2
+                    bottom_block: 2,
+                    edit_at_origin: None,
                 },
                 &mut |b| b,
                 &mut |_| 0,
@@ -2021,10 +2069,10 @@ mod tests {
 
             let (pos, crate::DistantTarget::Builtin(cells)) = crate::pick_distant_target(
                 cache,
-                &mut legacy,
+                &legacy,
                 None,
-                |_| false,
-                |pos| p.coarse_coverage(dim, pos),
+                &HashSet::new(),
+                p.stores.get(dim),
             )
             .unwrap() else {
                 panic!("expected a built-in job");
@@ -2044,26 +2092,18 @@ mod tests {
                     DistantSample::Surface(col)
                 }
             });
-            let coverage = p.ingest_coarse_job(dim, pos, samples, (0, 1), |_, b| b);
+            let coverage =
+                p.ingest_coarse_job(dim, pos, samples, (0, 1), GenOutcome::Complete, |_, b| b);
             assert_eq!(coverage, DistantCoverage::Complete);
-            assert!(!crate::record_distant_completion(
-                &mut legacy,
-                pos,
-                GenOutcome::Complete,
-                coverage,
-                true,
-            ));
-            assert!(legacy.sampled_distant_sections.contains(&pos));
-
             let store = &p.stores[dim];
             assert_eq!(store.voxel_at(384, 0, 0).block_id(), 2, "authoritative D0");
             assert_eq!(at_live(store), live_voxel, "authoritative D1 reduction");
             assert_eq!(
                 store.section(overlap).unwrap().get(8, 3, 0).block_id(),
                 1,
-                "legacy cell dispatched"
+                "existing legacy cell did not suppress sampling"
             );
-            assert_eq!(p.coarse_coverage(dim, pos), [[u64::MAX; 16]; 4]);
+            assert_eq!(store.coarse_coverage(pos), [[u64::MAX; 16]; 4]);
             for child in &coarse.children().unwrap()[..4] {
                 assert!(
                     store.is_section_complete(*child),
@@ -2095,8 +2135,6 @@ mod tests {
 
     #[test]
     fn incomplete_coarse_jobs_retry_missing_cells_but_no_surface_is_terminal() {
-        use crate::gen_worker::GenOutcome;
-
         let dim = "test:no-surface";
         let target = SectionPos::from_block(1, 384, 0);
         let overlap = OctreeSectionPos::new(1, 6, 0, 0);
@@ -2114,66 +2152,55 @@ mod tests {
             DhConfig::default(),
         );
         cache.sample_cursor = cache.list.iter().position(|&pos| pos == target).unwrap();
-        let mut legacy = DimensionLodStore::default();
-        let pick =
-            |cache: &mut crate::DesiredCache, legacy: &mut DimensionLodStore, p: &Pipeline| {
-                crate::pick_distant_target(
-                    cache,
-                    legacy,
-                    None,
-                    |_| false,
-                    |pos| p.coarse_coverage(dim, pos),
-                )
-            };
+        let legacy = DimensionLodStore::default();
+        assert!(
+            crate::pick_distant_target(
+                &mut single_distant_target(target),
+                &legacy,
+                None,
+                &HashSet::from([target]),
+                p.stores.get(dim),
+            )
+            .is_none()
+        );
+        let pick = |cache: &mut crate::DesiredCache, p: &Pipeline| {
+            crate::pick_distant_target(cache, &legacy, None, &HashSet::new(), p.stores.get(dim))
+        };
 
-        let (pos, crate::DistantTarget::Builtin(cells)) = pick(cache, &mut legacy, &p).unwrap()
-        else {
+        let (pos, crate::DistantTarget::Builtin(cells)) = pick(cache, &p).unwrap() else {
             panic!("expected a built-in job");
         };
         assert_eq!(pos, target);
         let columns = coarse_job_columns(pos);
         let (x, z) = cells[0];
         let first = columns[x + z * SECTION_SIZE];
-        let coverage =
-            p.ingest_coarse_job(dim, pos, [DistantSample::Surface(first)], (0, 1), |_, b| b);
-        assert_eq!(coverage, DistantCoverage::Incomplete);
-        assert!(!crate::record_distant_completion(
-            &mut legacy,
-            pos,
-            GenOutcome::Cancelled,
-            coverage,
-            false,
-        ));
-        assert!(crate::record_distant_completion(
-            &mut legacy,
-            pos,
-            GenOutcome::Error,
-            coverage,
-            false,
-        ));
-        assert!(crate::record_distant_completion(
-            &mut legacy,
-            pos,
-            GenOutcome::Complete,
-            coverage,
-            true,
-        ));
-        assert!(!legacy.sampled_distant_sections.contains(&pos));
-
-        // As in the worker result adapter, the first surface sample fills both stores.
-        legacy.get_or_create_mut(pos).set_cell(
-            x,
-            z,
-            crate::lod::LodColumn {
-                solid_top_y: first.height as i16,
-                solid_bottom_y: 0,
-                source: crate::lod::SOURCE_DISTANT_SURFACE,
-                ..crate::lod::LodColumn::EMPTY
-            },
+        let missing = columns[8];
+        for outcome in [GenOutcome::Error, GenOutcome::Cancelled] {
+            assert_eq!(
+                p.ingest_coarse_job(
+                    dim,
+                    pos,
+                    [DistantSample::NoSurface(missing.x, missing.z)],
+                    (0, 1),
+                    outcome,
+                    |_, b: u32| b
+                ),
+                DistantCoverage::Unavailable
+            );
+            assert_eq!(p.stores[dim].coarse_cells_needed(pos), cells);
+        }
+        assert_eq!(
+            p.ingest_coarse_job(
+                dim,
+                pos,
+                [DistantSample::Surface(first)],
+                (0, 1),
+                GenOutcome::Error,
+                |_, b| b
+            ),
+            DistantCoverage::Incomplete
         );
-        let (retry, crate::DistantTarget::Builtin(remaining)) =
-            pick(cache, &mut legacy, &p).unwrap()
-        else {
+        let (retry, crate::DistantTarget::Builtin(remaining)) = pick(cache, &p).unwrap() else {
             panic!("expected a built-in retry");
         };
         assert_eq!(retry, target);
@@ -2186,21 +2213,22 @@ mod tests {
                 DistantSample::Surface(col)
             }
         });
-        let coverage = p.ingest_coarse_job(dim, retry, samples, (0, 1), |_, b| b);
+        let coverage =
+            p.ingest_coarse_job(dim, retry, samples, (0, 1), GenOutcome::Complete, |_, b| b);
         assert_eq!(coverage, DistantCoverage::Unavailable);
-        assert!(!crate::record_distant_completion(
-            &mut legacy,
-            retry,
-            GenOutcome::Complete,
-            coverage,
-            true,
-        ));
-        let store = &p.stores[dim];
+        let store = p.stores.get_mut(dim).unwrap();
         assert_eq!(store.section(overlap).unwrap().get(8, 3, 0), cached);
         assert!(!store.is_section_complete(overlap));
-        assert_ne!(
-            pick(cache, &mut legacy, &p).map(|(pos, _)| pos),
-            Some(target)
+        assert!(store.coarse_cells_needed(retry).is_empty());
+        assert!(store.invalidate_coarse_target(retry));
+        assert_eq!(store.coarse_cells_needed(retry), [(8, 0)]);
+        assert_eq!(store.section(overlap).unwrap().get(8, 3, 0), cached);
+        store.mark_coarse_target_unavailable(retry);
+        p.clear_dimension(dim);
+        assert!(!p.stores.contains_key(dim));
+        assert_eq!(
+            pick(&mut single_distant_target(retry), &p).map(|(pos, _)| pos),
+            Some(retry)
         );
     }
 

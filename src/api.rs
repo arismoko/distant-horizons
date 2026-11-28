@@ -21,7 +21,7 @@ use crate::dh_v2::{
 use crate::lod::{
     ExtraSpan, LodColumn, MAX_DETAIL, SECTION_CELLS, SECTION_SIZE, SOURCE_LOADED_CHUNK, SectionPos,
 };
-use crate::render_bridge::runtime;
+use crate::render_bridge::{DhState, runtime};
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -340,19 +340,54 @@ pub trait RemoteLodProvider: Send + Sync + 'static {
     fn close(&self) {}
 }
 
-/// Registers a custom [`LodWorldGenerator`] for `dimension`. Replaces any previously registered
-/// generator with lower or equal priority (calling [`LodWorldGenerator::close`] on the replaced
-/// generator). Returns `true` if installed.
-pub fn register_world_generator(dimension: &str, generator: Arc<dyn LodWorldGenerator>) -> bool {
-    let rt = runtime();
-    let replaced = {
-        let mut st = rt.inner.lock().unwrap();
-        if let Some(existing) = st.world_generators.get(dimension)
+impl DhState {
+    fn rewind_legacy_cursors(&mut self, dimension: &str) {
+        for ((dim, _), cache) in &mut self.desired_cache {
+            if dim == dimension {
+                cache.disk_cursor = 0;
+                cache.sample_cursor = 0;
+            }
+        }
+    }
+
+    fn install_world_generator(
+        &mut self,
+        dimension: &str,
+        generator: &Arc<dyn LodWorldGenerator>,
+    ) -> Result<Option<Arc<dyn LodWorldGenerator>>, ()> {
+        if let Some(existing) = self.world_generators.get(dimension)
             && existing.priority() > generator.priority()
         {
-            return false;
+            return Err(());
         }
-        st.world_generators.insert(dimension.to_owned(), generator)
+        let replaced = self
+            .world_generators
+            .insert(dimension.to_owned(), Arc::clone(generator));
+        self.world_generator_epoch = self.world_generator_epoch.wrapping_add(1);
+        self.rewind_legacy_cursors(dimension);
+        Ok(replaced)
+    }
+
+    fn remove_world_generator(&mut self, dimension: &str) -> Option<Arc<dyn LodWorldGenerator>> {
+        let removed = self.world_generators.remove(dimension)?;
+        self.world_generator_epoch = self.world_generator_epoch.wrapping_add(1);
+        self.rewind_legacy_cursors(dimension);
+        Some(removed)
+    }
+}
+
+/// Registers a custom [`LodWorldGenerator`] for `dimension`. Replaces any previously registered
+/// generator with lower or equal priority (calling [`LodWorldGenerator::close`] on the replaced
+/// generator). Returns `true` if installed. Newly eligible legacy cache rows are reconsidered
+/// without waiting for a player to move.
+pub fn register_world_generator(dimension: &str, generator: Arc<dyn LodWorldGenerator>) -> bool {
+    let Ok(replaced) = runtime()
+        .inner
+        .lock()
+        .unwrap()
+        .install_world_generator(dimension, &generator)
+    else {
+        return false;
     };
     if let Some(old) = replaced {
         old.close();
@@ -360,10 +395,14 @@ pub fn register_world_generator(dimension: &str, generator: Arc<dyn LodWorldGene
     true
 }
 
-/// Removes any registered [`LodWorldGenerator`] for `dimension`, calling `close()` if present.
+/// Removes any registered [`LodWorldGenerator`] for `dimension`, calling `close()` if present
+/// and reconsidering the desired sections for built-in scheduling.
 pub fn unregister_world_generator(dimension: &str) -> bool {
-    let rt = runtime();
-    let removed = rt.inner.lock().unwrap().world_generators.remove(dimension);
+    let removed = runtime()
+        .inner
+        .lock()
+        .unwrap()
+        .remove_world_generator(dimension);
     if let Some(old) = removed {
         old.close();
         true
@@ -541,24 +580,21 @@ pub fn submit_dh_v2_bytes(
     submit_dh_v2_dto(dimension, &dto, level_min_y)
 }
 
-/// Removes a cached section from `dimension` so it can be regenerated or re-requested.
+/// Removes the legacy cached row and clears terminal scheduling for this target.
+/// Octree fallback geometry and its coverage are retained. Returns whether a legacy row was removed.
 pub fn invalidate_lod_section(dimension: &str, pos: LodSectionPos) -> bool {
     let sec_pos = SectionPos::from(pos);
     let rt = runtime();
     rt.gen_pool.invalidate_section(dimension, sec_pos);
     let mut st = rt.inner.lock().unwrap();
+    crate::pipeline::invalidate_coarse_target(dimension, sec_pos);
     let mut removed = false;
     if let Some(store) = st.dimensions.get_mut(dimension) {
         removed |= store.sections.remove(&sec_pos).is_some();
-        store.sampled_distant_sections.remove(&sec_pos);
+        store.legacy_terminal_targets.remove(&sec_pos);
         store.disk_checked.remove(&sec_pos);
     }
-    for ((dim, _), cache) in &mut st.desired_cache {
-        if dim == dimension {
-            cache.disk_cursor = 0;
-            cache.sample_cursor = 0;
-        }
-    }
+    st.rewind_legacy_cursors(dimension);
     if let Some(requested) = st.remote_requested.get_mut(dimension) {
         requested.remove(&sec_pos);
     }
@@ -878,6 +914,183 @@ mod tests {
         assert!(get_column_data(dim, 2, 3).is_some());
         assert!(unregister_world_generator(dim));
         assert!(invalidate_lod_section(dim, LodSectionPos::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn stationary_player_revisits_legacy_d1_disk_row_after_generator_registration() {
+        let dim = "test:late-generator";
+        let key = (dim.to_owned(), 1);
+        let other_key = ("test:other-dimension".to_owned(), 1);
+        let target = SectionPos::from_block(1, 384, 0);
+        let cam = [0.0, 64.0, 0.0];
+        let cfg = crate::config::DhConfig::default();
+        let mut st = DhState::default();
+        for key in [&key, &other_key] {
+            let cache = crate::ensure_desired_cache(&mut st, key.clone(), cam, cfg);
+            cache.list = Arc::from([target]);
+            cache.sample_cursor = 1;
+            cache.octree_disk_cursor = 1;
+        }
+        let list = Arc::clone(&st.desired_cache[&key].list);
+        let mut legacy = crate::lod::DimensionLodStore::default();
+        let cache = st.desired_cache.get_mut(&key).unwrap();
+        assert_eq!(crate::next_legacy_disk_load(cache, &mut legacy, None), None);
+        assert_eq!(cache.disk_cursor, 1);
+        assert!(!legacy.disk_checked.contains(&target));
+        st.desired_cache.get_mut(&other_key).unwrap().disk_cursor = 1;
+
+        let generator: Arc<dyn LodWorldGenerator> = Arc::new(DummyGenerator {
+            calls: AtomicUsize::new(0),
+            priority: 0,
+        });
+        assert!(matches!(
+            st.install_world_generator(dim, &generator),
+            Ok(None)
+        ));
+        let range = st.world_generators[dim].detail_range();
+        let cache = crate::ensure_desired_cache(&mut st, key.clone(), cam, cfg);
+        assert!(Arc::ptr_eq(&cache.list, &list));
+        assert_eq!(
+            (
+                cache.disk_cursor,
+                cache.sample_cursor,
+                cache.octree_disk_cursor
+            ),
+            (0, 0, 1)
+        );
+        assert_eq!(
+            crate::next_legacy_disk_load(cache, &mut legacy, Some(&range)),
+            Some(target)
+        );
+        assert!(legacy.disk_checked.contains(&target));
+        cache.sample_cursor = 1;
+
+        assert!(matches!(
+            st.install_world_generator(dim, &generator),
+            Ok(Some(_))
+        ));
+        let cache = st.desired_cache.get_mut(&key).unwrap();
+        assert_eq!((cache.disk_cursor, cache.sample_cursor), (0, 0));
+        // Rewinding does not duplicate a disk request already made for this row.
+        assert_eq!(
+            crate::next_legacy_disk_load(cache, &mut legacy, Some(&range)),
+            None
+        );
+        assert_eq!(cache.disk_cursor, 1);
+        cache.sample_cursor = 1;
+
+        assert!(st.remove_world_generator(dim).is_some());
+        let cache = &st.desired_cache[&key];
+        assert_eq!(
+            (
+                cache.disk_cursor,
+                cache.sample_cursor,
+                cache.octree_disk_cursor
+            ),
+            (0, 0, 1)
+        );
+        let other = &st.desired_cache[&other_key];
+        assert_eq!((other.disk_cursor, other.sample_cursor), (1, 1));
+    }
+
+    #[test]
+    fn same_arc_reregistration_rejects_stale_range_for_both_cursors() {
+        use crate::octree::{OctreeSection, OctreeSectionPos};
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicU8;
+
+        struct MutableGenerator(AtomicU8);
+        impl LodWorldGenerator for MutableGenerator {
+            fn detail_range(&self) -> RangeInclusive<u8> {
+                self.0.load(Ordering::Relaxed)..=2
+            }
+
+            fn generate(&self, _: &LodGenRequest, _: &mut dyn FnMut(LodGenOutput)) {}
+        }
+
+        let dim = "test:mutable-generator";
+        let key = (dim.to_owned(), 1);
+        let d1 = SectionPos::from_block(1, 384, 0);
+        let cfg = crate::config::DhConfig::default();
+        let mutable = Arc::new(MutableGenerator(AtomicU8::new(2)));
+        let generator: Arc<dyn LodWorldGenerator> = mutable.clone();
+        let mut st = DhState::default();
+        crate::ensure_desired_cache(&mut st, key.clone(), [0.0, 64.0, 0.0], cfg).list =
+            Arc::from([d1]);
+        assert!(matches!(
+            st.install_world_generator(dim, &generator),
+            Ok(None)
+        ));
+        let state = Mutex::new(st);
+
+        let mut octree = crate::octree_ingest::OctreeIngestStore::new();
+        octree.set_y_bounds((0, 64));
+        for dz in 0..2 {
+            for dx in 0..2 {
+                let pos = OctreeSectionPos::new(1, d1.x * 2 + dx, 0, d1.z * 2 + dz);
+                assert!(octree.adopt_section(OctreeSection::new(pos), true));
+            }
+        }
+        let snapshot = || {
+            let (generator, epoch) = {
+                let st = state.lock().unwrap();
+                (
+                    Arc::clone(&st.world_generators[dim]),
+                    st.world_generator_epoch,
+                )
+            };
+            let range = generator.detail_range();
+            (generator, epoch, range)
+        };
+        let mut legacy = crate::lod::DimensionLodStore::default();
+        let mut scan = |generator: &Arc<dyn LodWorldGenerator>,
+                        epoch,
+                        range: RangeInclusive<u8>| {
+            let disk = crate::lock_current_world_generator(&state, epoch).and_then(|mut st| {
+                let cache = st.desired_cache.get_mut(&key).unwrap();
+                crate::next_legacy_disk_load(cache, &mut legacy, Some(&range))
+            });
+            let sample = crate::lock_current_world_generator(&state, epoch).and_then(|mut st| {
+                let cache = st.desired_cache.get_mut(&key).unwrap();
+                crate::pick_distant_target(
+                    cache,
+                    &legacy,
+                    Some((generator, range)),
+                    &HashSet::new(),
+                    Some(&octree),
+                )
+            });
+            (disk, sample)
+        };
+        let cursors = || {
+            let st = state.lock().unwrap();
+            let cache = &st.desired_cache[&key];
+            (cache.disk_cursor, cache.sample_cursor)
+        };
+
+        let (old_generator, old_epoch, old_range) = snapshot();
+        assert_eq!(old_range, 2..=2);
+        let (disk, sample) = scan(&old_generator, old_epoch, old_range.clone());
+        assert!(disk.is_none() && sample.is_none());
+        assert_eq!(cursors(), (1, 1));
+
+        mutable.0.store(1, Ordering::Relaxed);
+        let replaced = state
+            .lock()
+            .unwrap()
+            .install_world_generator(dim, &old_generator)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&replaced, &old_generator));
+        let (disk, sample) = scan(&old_generator, old_epoch, old_range);
+        assert!(disk.is_none() && sample.is_none());
+        assert_eq!(cursors(), (0, 0));
+
+        let (fresh_generator, fresh_epoch, fresh_range) = snapshot();
+        assert_eq!(fresh_range, 1..=2);
+        let (disk, sample) = scan(&fresh_generator, fresh_epoch, fresh_range);
+        assert_eq!(disk, Some(d1));
+        assert!(matches!(sample, Some((pos, crate::DistantTarget::Custom(_))) if pos == d1));
     }
 
     #[test]

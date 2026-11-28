@@ -44,6 +44,7 @@ use crate::lod::{
     SOURCE_LOADED_CHUNK, SectionPos,
 };
 use crate::octree::MAX_OCTREE_DETAIL;
+use crate::octree_ingest::OctreeIngestStore;
 use crate::pipeline::DistantCoverage;
 use crate::render_bridge::{
     DesiredCache, DhState, runtime, stats, sun_brightness_from_day_time_and_weather,
@@ -281,13 +282,6 @@ impl Hooks for DistantHorizonsMod {
             let dim = runtime().inner.lock().unwrap().active_dimension.clone();
             let active_dim = host.level(&dim).is_some().then_some(dim.as_str());
             pipeline::client_tick(host, active_dim);
-            render_bridge::upload_pending(
-                host,
-                gpu_arena::ArenaConfig {
-                    max_sections: gpu_arena::VOXY_MAX_SECTIONS,
-                    geometry_bytes: gpu_arena::VOXY_GEOMETRY_BYTES,
-                },
-            );
         }
         let rt = runtime();
         let cfg = DhConfig::read_from_host(host);
@@ -433,6 +427,12 @@ impl Hooks for DistantHorizonsMod {
     }
 
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+        if let Some((min_y, height)) = host
+            .level(event.dimension)
+            .and_then(|level| level.height(host))
+        {
+            pipeline::set_y_bounds(event.dimension, (min_y, min_y + height));
+        }
         let world_dir = host.world_dir();
         let rt = runtime();
         let mut st = rt.inner.lock().unwrap();
@@ -966,50 +966,42 @@ enum DistantTarget {
     Builtin(Vec<(usize, usize)>),
 }
 
-/// Choose the generator before checking the stores it serves. Only built-in jobs at
-/// supported coarse octree details check both the legacy row and the octree.
+/// Choose the generator before checking the store it serves. Built-in coarse jobs need only
+/// octree coverage, even when a legacy column row happens to share the same key.
 fn pick_distant_target(
     cache: &mut DesiredCache,
-    store: &mut DimensionLodStore,
+    legacy: &DimensionLodStore,
     custom: Option<(&Arc<dyn LodWorldGenerator>, RangeInclusive<u8>)>,
-    is_in_flight: impl Fn(SectionPos) -> bool,
-    coarse_coverage: impl Fn(SectionPos) -> [[u64; 16]; 4],
+    in_flight: &HashSet<SectionPos>,
+    octree: Option<&OctreeIngestStore>,
 ) -> Option<(SectionPos, DistantTarget)> {
-    let start = cache.sample_cursor;
-    for scan in start..cache.list.len() {
+    for scan in cache.sample_cursor..cache.list.len() {
         let pos = cache.list[scan];
-        if !store.sampled_distant_sections.contains(&pos) {
-            if is_in_flight(pos) {
-                continue;
+        if in_flight.contains(&pos) {
+            continue;
+        }
+        let custom = custom
+            .as_ref()
+            .filter(|(_, range)| range.contains(&pos.detail));
+        let cells = (0..SECTION_SIZE).flat_map(|z| (0..SECTION_SIZE).map(move |x| (x, z)));
+        if custom.is_none() && (1..=MAX_OCTREE_DETAIL).contains(&pos.detail) {
+            let missing = match octree {
+                Some(store) => store.coarse_cells_needed(pos),
+                None => cells.collect(),
+            };
+            if !missing.is_empty() {
+                return Some((pos, DistantTarget::Builtin(missing)));
             }
-            let section = store.sections.get(&pos);
-            let legacy_full = section.is_some_and(|s| s.populated as usize == SECTION_CELLS);
-            if let Some((generator, _)) = custom
-                .as_ref()
-                .filter(|(_, range)| range.contains(&pos.detail))
-            {
-                if !legacy_full {
+        } else if !legacy.legacy_terminal_targets.contains(&pos) {
+            let section = legacy.sections.get(&pos);
+            if !section.is_some_and(|s| s.populated as usize == SECTION_CELLS) {
+                if let Some((generator, _)) = custom {
                     return Some((pos, DistantTarget::Custom(Arc::clone(generator))));
                 }
-            } else {
-                let coverage = (1..=MAX_OCTREE_DETAIL)
-                    .contains(&pos.detail)
-                    .then(|| coarse_coverage(pos));
-                if !legacy_full || coverage.is_some_and(|bits| bits != [[u64::MAX; 16]; 4]) {
-                    let missing = (0..SECTION_SIZE)
-                        .flat_map(|z| (0..SECTION_SIZE).map(move |x| (x, z)))
-                        .filter(|&(x, z)| {
-                            (!legacy_full && section.is_none_or(|s| s.get(x, z).is_empty()))
-                                || coverage
-                                    .as_ref()
-                                    .is_some_and(|bits| !pipeline::coarse_cell_covered(bits, x, z))
-                        })
-                        .collect();
-                    return Some((pos, DistantTarget::Builtin(missing)));
-                }
-                if coverage.is_none() {
-                    store.sampled_distant_sections.insert(pos);
-                }
+                let missing = cells
+                    .filter(|&(x, z)| section.is_none_or(|s| s.get(x, z).is_empty()))
+                    .collect();
+                return Some((pos, DistantTarget::Builtin(missing)));
             }
         }
         if scan == cache.sample_cursor {
@@ -1017,6 +1009,33 @@ fn pick_distant_target(
         }
     }
     None
+}
+
+/// Select the next unchecked `.dhreg` row. Built-in D1–D4 uses the separate octree reload path.
+fn next_legacy_disk_load(
+    cache: &mut DesiredCache,
+    store: &mut DimensionLodStore,
+    custom_range: Option<&RangeInclusive<u8>>,
+) -> Option<SectionPos> {
+    while let Some(&pos) = cache.list.get(cache.disk_cursor) {
+        cache.disk_cursor += 1;
+        if (!(1..=MAX_OCTREE_DETAIL).contains(&pos.detail)
+            || custom_range.is_some_and(|range| range.contains(&pos.detail)))
+            && store.disk_checked.insert(pos)
+        {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// A concurrent registration rewinds the cursors; do not advance them with stale eligibility.
+fn lock_current_world_generator(
+    state: &Mutex<DhState>,
+    epoch: u64,
+) -> Option<std::sync::MutexGuard<'_, DhState>> {
+    let st = state.lock().unwrap();
+    (st.world_generator_epoch == epoch).then_some(st)
 }
 
 /// Advances unthrottled column-store load checks and, once this dimension's cooldown has
@@ -1030,8 +1049,19 @@ fn sample_distant_sections(
 ) -> SampleOutcome {
     let rt = runtime();
     let cache_key = (dim.to_owned(), player_key);
+    let (custom_gen, epoch) = {
+        let st = rt.inner.lock().unwrap();
+        (
+            st.world_generators.get(dim).cloned(),
+            st.world_generator_epoch,
+        )
+    };
+    // The detail range is a mod callback; don't invoke it under the runtime lock.
+    let custom = custom_gen.as_ref().map(|g| (g, g.detail_range()));
     {
-        let mut st = rt.inner.lock().unwrap();
+        let Some(mut st) = lock_current_world_generator(&rt.inner, epoch) else {
+            return SampleOutcome::Cooldown;
+        };
         ensure_desired_cache(&mut st, cache_key.clone(), cam, cfg);
         let save_root = st.world_dir.clone();
         let now = std::time::Instant::now();
@@ -1044,16 +1074,13 @@ fn sample_distant_sections(
         let cache = st_ref.desired_cache.get_mut(&cache_key).unwrap();
         let store = st_ref.dimensions.entry(dim.to_owned()).or_default();
 
-        // Trigger background disk loads for up to 8 unseen sections per tick (unthrottled).
         if let Some(ref dir) = save_root {
-            let mut loads = 0;
-            while cache.disk_cursor < cache.list.len() && loads < 8 {
-                let pos = cache.list[cache.disk_cursor];
-                cache.disk_cursor += 1;
-                if store.disk_checked.insert(pos) {
-                    rt.io.request_load(dir.clone(), dim.to_owned(), pos);
-                    loads += 1;
-                }
+            let custom_range = custom.as_ref().map(|(_, range)| range);
+            for _ in 0..8 {
+                let Some(pos) = next_legacy_disk_load(cache, store, custom_range) else {
+                    break;
+                };
+                rt.io.request_load(dir.clone(), dim.to_owned(), pos);
             }
         }
 
@@ -1071,11 +1098,11 @@ fn sample_distant_sections(
             break;
         }
 
-        let custom_gen = rt.inner.lock().unwrap().world_generators.get(dim).cloned();
-        // The detail range is a mod callback; don't invoke it under the runtime lock.
-        let custom = custom_gen.as_ref().map(|g| (g, g.detail_range()));
+        let in_flight = rt.gen_pool.in_flight_sections(dim);
         let (target_section, builtin_disabled) = {
-            let mut st = rt.inner.lock().unwrap();
+            let Some(mut st) = lock_current_world_generator(&rt.inner, epoch) else {
+                break;
+            };
             let builtin_disabled = st.disabled_builtin_gen.contains(dim);
             let st_ref = &mut *st;
             let Some(cache) = st_ref.desired_cache.get_mut(&cache_key) else {
@@ -1083,13 +1110,8 @@ fn sample_distant_sections(
             };
             let store = st_ref.dimensions.entry(dim.to_owned()).or_default();
 
-            let picked = pick_distant_target(
-                cache,
-                store,
-                custom,
-                |pos| rt.gen_pool.is_in_flight(dim, pos),
-                |pos| pipeline::coarse_coverage(dim, pos),
-            );
+            let picked =
+                pipeline::pick_distant_target(dim, cache, store, custom.clone(), &in_flight);
             (picked, builtin_disabled)
         };
 
@@ -1116,7 +1138,7 @@ fn sample_distant_sections(
                 let store = st.dimensions.entry(dim.to_owned()).or_default();
                 // A registered generator owns this request. Its legacy column output is
                 // terminal for scheduling, not octree coverage.
-                store.sampled_distant_sections.insert(pos);
+                store.legacy_terminal_targets.insert(pos);
                 store.generated_columns = store.generated_columns.saturating_add(produced as u64);
                 ran_any = true;
                 if budget_start.elapsed() >= DISTANT_SAMPLE_BUDGET {
@@ -1218,7 +1240,9 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
 
     let coverage: Vec<_> = results
         .iter()
-        .map(|res| pipeline::ingest_distant(host, dim, res.pos, &res.cells, &res.samples))
+        .map(|res| {
+            pipeline::ingest_distant(host, dim, res.pos, &res.cells, &res.samples, res.outcome)
+        })
         .collect();
 
     let mut block_id_cache: HashMap<mod_api::BlockKey, &str> = HashMap::new();
@@ -1228,21 +1252,30 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
         let store = st.dimensions.entry(dim.to_owned()).or_default();
 
         for (res, coverage) in results.into_iter().zip(coverage) {
+            if (1..=MAX_OCTREE_DETAIL).contains(&res.pos.detail) {
+                store.generated_columns = store
+                    .generated_columns
+                    .saturating_add(res.samples.iter().flatten().count() as u64);
+                had_error |= match res.outcome {
+                    GenOutcome::Error => true,
+                    GenOutcome::Complete => coverage == DistantCoverage::Incomplete,
+                    GenOutcome::Cancelled => false,
+                };
+                continue;
+            }
             let step = res.pos.cell_size();
             let skirt = (step * 4).clamp(8, 32);
             let mut updated_any = false;
             let mut non_empty_count = 0u64;
 
-            let legacy_resolved = {
+            {
                 let sec = store.get_or_create_mut(res.pos);
-                let mut no_surface = 0;
                 for (&(cx, cz), sample) in res.cells.iter().zip(res.samples.iter()) {
                     let existing = sec.get(cx, cz);
                     if existing.source == SOURCE_LOADED_CHUNK {
                         continue;
                     }
                     let Some(col) = sample else {
-                        no_surface += usize::from(existing.is_empty());
                         continue;
                     };
                     let block_id = *block_id_cache
@@ -1274,14 +1307,13 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
                     }
                     non_empty_count += 1;
                 }
-                // Check that the coarse job refilled the legacy row. Explicit NoSurface
-                // replies are terminal exceptions, not populated cells or octree proof.
-                sec.populated as usize + no_surface == SECTION_CELLS
-            };
+            }
 
             store.generated_columns = store.generated_columns.saturating_add(non_empty_count);
-            had_error |=
-                record_distant_completion(store, res.pos, res.outcome, coverage, legacy_resolved);
+            if res.outcome == GenOutcome::Complete {
+                store.legacy_terminal_targets.insert(res.pos);
+            }
+            had_error |= res.outcome == GenOutcome::Error;
             if updated_any {
                 dirty_sections.insert(res.pos);
             }
@@ -1292,29 +1324,6 @@ fn drain_gen_results(host: &dyn ServerHost, dim: &str, dirty_sections: &mut Hash
             dim.to_owned(),
             std::time::Instant::now() + DISTANT_SAMPLE_MAX_COOLDOWN,
         );
-    }
-}
-
-/// Records terminal scheduling outcomes and returns whether to apply the existing retry cooldown.
-fn record_distant_completion(
-    store: &mut DimensionLodStore,
-    pos: SectionPos,
-    outcome: GenOutcome,
-    coverage: DistantCoverage,
-    legacy_resolved: bool,
-) -> bool {
-    match outcome {
-        GenOutcome::Complete
-            if !(1..=MAX_OCTREE_DETAIL).contains(&pos.detail)
-                || (legacy_resolved && coverage != DistantCoverage::Incomplete) =>
-        {
-            // Unavailable is terminal for this level session (or until section invalidation).
-            // It proves no octree coverage, and the parent remains usable.
-            store.sampled_distant_sections.insert(pos);
-            false
-        }
-        GenOutcome::Error | GenOutcome::Complete => true,
-        GenOutcome::Cancelled => false,
     }
 }
 
