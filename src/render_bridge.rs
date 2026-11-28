@@ -2,6 +2,10 @@
 //! renderer (`gpu_arena`, GLSL shaders under `assets/distantsunrises/shaders/`).
 //!
 //! No `wgpu` types and no `[native.*]`: everything goes through Sunrise's general render API.
+//!
+//! On the plain classic transparency route, optional `voxy_ssao` samples opaque LOD depth and
+//! `voxy_ssao_apply` composites before translucent LODs. Skip both passes on OIT and under
+//! shader packs, where the plain classic slot and depth ordering do not hold.
 
 use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
@@ -58,6 +62,10 @@ const SUBDIVISION_SIZE: f32 = 64.0;
 
 fn id(text: &str) -> mod_api::Identifier {
     mod_api::Identifier::parse(text).expect("static identifier")
+}
+
+fn plain_ssao_enabled(enabled: bool, improved_transparency: bool, pack_active: bool) -> bool {
+    enabled && !improved_transparency && !pack_active
 }
 
 /// A storage-buffer layout entry (`std430`, set 1). `min_size` is the size of the GLSL block's
@@ -860,6 +868,11 @@ static PREPARED: Mutex<Vec<(mod_api::RenderLevelStage, mod_api::PreparedWorldDra
 
 /// Opaque LOD draw stage, after traversal and indirect command generation.
 pub const OPAQUE_STAGE: mod_api::RenderLevelStage = mod_api::RenderLevelStage::AfterOpaqueFeatures;
+/// With slots running before their stage's mod draws, the `AfterOpaqueFeatures` slot is too
+/// early to see opaque LOD depth. On the classic route, `AfterTranslucentFeatures` comes after
+/// opaque LODs and before vanilla water/glass, `PIPELINE_SSAO_APPLY`, and `PIPELINE_TRANSLUCENT`.
+pub const SSAO_AFTER_STAGE: mod_api::RenderLevelStage =
+    mod_api::RenderLevelStage::AfterTranslucentFeatures;
 /// Stage of the translucent LOD draw.
 pub const TRANSLUCENT_STAGE: mod_api::RenderLevelStage =
     mod_api::RenderLevelStage::AfterTranslucentBlocks;
@@ -873,17 +886,18 @@ pub fn begin_frame(camera: [f64; 3]) {
     PREPARED.lock().unwrap().clear();
 }
 
-/// Records this frame's traversal, command generation and optional SSAO. Called from
-/// `Hooks::frame_graph_setup`.
+/// Records traversal and command generation on both routes, and optional SSAO for plain classic
+/// transparency. Called from `Hooks::frame_graph_setup`.
 pub fn setup_compute(
     host: &dyn mod_api::ClientHost,
     camera: &CameraMatrices,
+    improved_transparency: bool,
     graph: &mut dyn mod_api::FrameGraphContext,
 ) {
     use mod_api::{
         ComputePassDescriptor, DrawBindings, FrameTarget, RenderLevelStage, TextureSource,
     };
-    // Every early return below leaves SSAO unwritten for the next frame's `ssao_apply`.
+    // Early returns and routes without plain SSAO leave this frame unwritten.
     SSAO_WRITTEN.store(false, Ordering::Release);
     COMPUTE_DISPATCHES.store(0, Ordering::Relaxed);
     let Some(frame) = FRAME.lock().unwrap().clone() else {
@@ -1042,16 +1056,19 @@ pub fn setup_compute(
     });
     report("add_compute_pass", added);
 
-    // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
+    // OIT collapses the two ordering anchors into one. A pack can reorder them or export
+    // WorldDepth before opaque LODs, even if it doesn't bind the LOD terrain pipeline.
     // `frame_graph_setup` runs before `prepare_render_buffers` in Dev 2, so compute ensures the
     // `ssao_size` target first and `prepare_draws` ensures the same size before binding it.
     let [sw, sh] = ssao_size([w, h]);
-    if frame.config.ssao_enabled
-        && let (Ok(ssao_pipe), Some(ssao_target)) = (
-            assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
-            ensure_ssao(host, [sw, sh]),
-        )
-    {
+    if plain_ssao_enabled(
+        frame.config.ssao_enabled,
+        improved_transparency,
+        host.shader_pack_active(),
+    ) && let (Ok(ssao_pipe), Some(ssao_target)) = (
+        assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
+        ensure_ssao(host, [sw, sh]),
+    ) {
         let clip_dist = vanilla_clip_dist(&frame);
         let ssao_params = Std140(Vec::with_capacity(32))
             .f32s(&[
@@ -1065,38 +1082,39 @@ pub fn setup_compute(
         let ssao_desc = ComputePassDescriptor::new("distantsunrises:ssao")
             .reads(FrameTarget::MainDepth)
             .writes(FrameTarget::Mod(ssao_target.target))
-            .after_stage(OPAQUE_STAGE)
+            .after_stage(SSAO_AFTER_STAGE)
             .before_stage(TRANSLUCENT_STAGE);
+        let mut ssao_dispatched = false;
         let added_ssao = graph.add_compute_pass(ssao_desc, &mut |ctx| {
             let bindings = DrawBindings::new()
                 .inline_uniform("SsaoParams", &ssao_params)
                 .texture("WorldDepthTex", TextureSource::WorldDepth)
                 .storage_image("SsaoOut", ssao_target.dest());
-            compute_dispatches += u32::from(
-                report(
-                    "ssao dispatch",
-                    ctx.dispatch(
-                        ssao_pipe,
-                        &bindings,
-                        [sw.div_ceil(SSAO_WORKGROUP), sh.div_ceil(SSAO_WORKGROUP), 1],
-                    ),
-                )
-                .is_some(),
-            );
+            ssao_dispatched = report(
+                "ssao dispatch",
+                ctx.dispatch(
+                    ssao_pipe,
+                    &bindings,
+                    [sw.div_ceil(SSAO_WORKGROUP), sh.div_ceil(SSAO_WORKGROUP), 1],
+                ),
+            )
+            .is_some();
         });
-        if report("add_ssao_compute_pass", added_ssao).is_some() {
+        compute_dispatches += u32::from(ssao_dispatched);
+        if report("add_ssao_compute_pass", added_ssao).is_some() && ssao_dispatched {
             SSAO_WRITTEN.store(true, Ordering::Release);
         }
     }
     COMPUTE_DISPATCHES.store(compute_dispatches, Ordering::Relaxed);
 }
 
-/// Prepares this frame's two indirect draws (opaque in [`OPAQUE_STAGE`], translucent in
-/// [`TRANSLUCENT_STAGE`]); a shader pack that compiled `dh_terrain` / `dh_water` draws the
-/// pack-linked pipelines instead. Called from `Hooks::prepare_render_buffers`.
+/// Prepares opaque and translucent indirect draws, using pack-linked pipelines where bound.
+/// On the plain classic route, the optional SSAO composite goes before the translucent LOD draw
+/// in [`TRANSLUCENT_STAGE`]. Called from `Hooks::prepare_render_buffers`.
 pub fn prepare_draws(
     host: &dyn mod_api::ClientHost,
     camera: &CameraMatrices,
+    improved_transparency: bool,
     context: &mut dyn mod_api::PrepareRenderBuffersContext,
 ) {
     use mod_api::{DrawBindings, IndirectDraw, TextureSource};
@@ -1173,7 +1191,11 @@ pub fn prepare_draws(
     let s = arena.slices;
     // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws.
     // Ensure the same `ssao_size` as `setup_compute` so the draw uses its target.
-    if frame.config.ssao_enabled
+    if plain_ssao_enabled(
+        frame.config.ssao_enabled,
+        improved_transparency,
+        host.shader_pack_active(),
+    )
         && let (Some(win_size), Ok(ssao_apply), Ok(_)) = (
             host.window_size(),
             assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
@@ -1912,6 +1934,15 @@ mod tests {
                 "{shader}: unbound GLSL blocks: {blocks:?}"
             );
         }
+    }
+
+    #[test]
+    fn plain_ssao_runs_only_on_the_unpacked_classic_route() {
+        assert!(plain_ssao_enabled(true, false, false));
+        assert!(!plain_ssao_enabled(true, true, false));
+        assert!(!plain_ssao_enabled(true, false, true));
+        assert!(!plain_ssao_enabled(true, true, true));
+        assert!(!plain_ssao_enabled(false, false, false));
     }
 
     #[test]
