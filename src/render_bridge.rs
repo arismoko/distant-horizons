@@ -233,7 +233,7 @@ fn compute_pipelines() -> impl IntoIterator<Item = mod_api::ComputePipeline> {
         ComputePipeline::builder(id("distantsunrises:voxy_cmdgen"), id(SHADER_CMDGEN))
             .bind_group_layout(
                 BindGroupLayout::builder()
-                    .uniform_buffer("CmdgenParams", 16)
+                    .uniform_buffer("CmdgenParams", 32)
                     .entry(storage("SectionBuffer", true, 32))
                     .entry(storage("RenderQueue", true, 20))
                     .entry(storage("OpaqueCommands", false, 20))
@@ -914,6 +914,12 @@ fn opaque_stage(shader_pack_active: bool) -> mod_api::RenderLevelStage {
     }
 }
 
+/// Plain OIT is order-independent and skips the back-to-front translucent radix sort;
+/// classic and shader-pack translucent draws keep it.
+fn sort_translucent_commands(improved_transparency: bool, shader_pack_active: bool) -> bool {
+    !improved_transparency || shader_pack_active
+}
+
 fn translucent_stages(
     improved_transparency: bool,
     pack_water_bound: bool,
@@ -1024,6 +1030,8 @@ pub fn setup_compute(
     // `AfterOpaqueFeatures` without a cycle.
     let desc =
         ComputePassDescriptor::new("distantsunrises:traverse_cmdgen").before_stage(OPAQUE_STAGE);
+    let sort_translucent =
+        sort_translucent_commands(improved_transparency, host.shader_pack_active());
     let slices = arena.slices;
     let section_groups = [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1];
     let mut compute_dispatches = 0u32;
@@ -1059,17 +1067,20 @@ pub fn setup_compute(
             };
             compute_dispatches += u32::from(report("traversal dispatch", dispatched).is_some());
         }
-        let clear_bindings =
-            DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
-        compute_dispatches += u32::from(
-            report(
-                "trans_clear dispatch",
-                ctx.dispatch(trans_clear, &clear_bindings, [1, 1, 1]),
-            )
-            .is_some(),
-        );
-        let params = Std140(Vec::with_capacity(16))
+        if sort_translucent {
+            let clear_bindings =
+                DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
+            compute_dispatches += u32::from(
+                report(
+                    "trans_clear dispatch",
+                    ctx.dispatch(trans_clear, &clear_bindings, [1, 1, 1]),
+                )
+                .is_some(),
+            );
+        }
+        let params = Std140(Vec::with_capacity(32))
             .i32s(&[base[0], base[1], base[2], sections as i32])
+            .u32s(&[u32::from(sort_translucent), 0, 0, 0])
             .0;
         let bindings = DrawBindings::new()
             .inline_uniform("CmdgenParams", &params)
@@ -1086,27 +1097,29 @@ pub fn setup_compute(
             )
             .is_some(),
         );
-        let prefix_bindings =
-            DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
-        compute_dispatches += u32::from(
-            report(
-                "trans_prefix dispatch",
-                ctx.dispatch(trans_prefix, &prefix_bindings, [1, 1, 1]),
-            )
-            .is_some(),
-        );
-        let scatter_bindings = DrawBindings::new()
-            .storage_buffer("SectionBuffer", slices.sections)
-            .storage_buffer("TranslucentCommands", slices.translucent_commands)
-            .storage_buffer("TransSortMeta", slices.trans_sort_meta)
-            .storage_buffer("TransSortEntries", slices.trans_sort_entries);
-        compute_dispatches += u32::from(
-            report(
-                "trans_scatter dispatch",
-                ctx.dispatch(trans_scatter, &scatter_bindings, section_groups),
-            )
-            .is_some(),
-        );
+        if sort_translucent {
+            let prefix_bindings =
+                DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
+            compute_dispatches += u32::from(
+                report(
+                    "trans_prefix dispatch",
+                    ctx.dispatch(trans_prefix, &prefix_bindings, [1, 1, 1]),
+                )
+                .is_some(),
+            );
+            let scatter_bindings = DrawBindings::new()
+                .storage_buffer("SectionBuffer", slices.sections)
+                .storage_buffer("TranslucentCommands", slices.translucent_commands)
+                .storage_buffer("TransSortMeta", slices.trans_sort_meta)
+                .storage_buffer("TransSortEntries", slices.trans_sort_entries);
+            compute_dispatches += u32::from(
+                report(
+                    "trans_scatter dispatch",
+                    ctx.dispatch(trans_scatter, &scatter_bindings, section_groups),
+                )
+                .is_some(),
+            );
+        }
     });
     report("add_compute_pass", added);
 
@@ -2022,6 +2035,14 @@ mod tests {
             opaque_stage(true),
             mod_api::RenderLevelStage::AfterOpaqueFeatures
         );
+    }
+
+    #[test]
+    fn sort_translucent_commands_skips_only_plain_oit() {
+        assert!(!sort_translucent_commands(true, false));
+        assert!(sort_translucent_commands(false, false));
+        assert!(sort_translucent_commands(false, true));
+        assert!(sort_translucent_commands(true, true));
     }
 
     #[test]
