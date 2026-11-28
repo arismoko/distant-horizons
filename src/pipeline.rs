@@ -10,7 +10,7 @@ use crate::bakery::{
 };
 use crate::gpu_arena::{BUCKETS, BuiltSection, MODEL_WORDS, SectionAabb};
 use crate::lod::SectionPos;
-use crate::mesh::{SectionQuads, mesh_octree_section_masked};
+use crate::mesh::{SectionQuads, mesh_octree_section};
 use crate::network::octree_sync::{ClientEvent, MappingEntry, OctreeSectionDto, ServerSource};
 use crate::octree::Voxel;
 use crate::octree::{Face, NeighborBorders, OctreeSection, OctreeSectionPos};
@@ -193,8 +193,8 @@ struct MeshJob {
     pos: OctreeSectionPos,
     epoch: u64,
     section: OctreeSection,
+    complete: bool,
     borders: NeighborBorders,
-    covered: u8,
     metas: Arc<MetaTable>,
 }
 
@@ -226,13 +226,8 @@ impl MeshWorker {
                         }
                         q.pop_front().unwrap()
                     };
-                    let quads = mesh_octree_section_masked(
-                        &job.section,
-                        &job.borders,
-                        &*job.metas,
-                        job.covered,
-                    );
-                    let built = built_section(&quads);
+                    let quads = mesh_octree_section(&job.section, &job.borders, &*job.metas);
+                    let built = built_section(&quads, job.complete);
                     d_bg.lock()
                         .unwrap()
                         .push((job.dim, job.pos, job.epoch, built));
@@ -281,9 +276,9 @@ struct Pipeline {
     /// Monotonic epoch per `(dim, pos)` so stale off-thread mesh results are dropped before upload.
     next_epoch: u64,
     section_epoch: HashMap<(String, OctreeSectionPos), u64>,
-    /// Sections currently uploaded to the GPU arena (strictly leaf sections: never both parent
-    /// and child for the same volume).
-    rendered: HashMap<String, HashSet<OctreeSectionPos>>,
+    /// Sections meshed with border inputs, including empty results. Changes to adjacent
+    /// sections can expose faces and invalidate a previously empty mesh.
+    meshed: HashMap<String, HashSet<OctreeSectionPos>>,
     /// Sections changed since their last save.
     unsaved: HashMap<String, HashSet<OctreeSectionPos>>,
     /// Sections already asked of disk or of the server, per dimension.
@@ -291,58 +286,6 @@ struct Pipeline {
 }
 
 static PIPELINE: LazyLock<Mutex<Pipeline>> = LazyLock::new(Default::default);
-
-/// 8-bit mask of child octants of `pos` that already have a rendered (uploaded to the GPU arena)
-/// finer section or descendant. Used when meshing a parent so an octant is never masked out
-/// before its replacement child is actually drawn (preventing X-ray pop-in holes).
-fn covered_rendered_mask(rendered: &HashSet<OctreeSectionPos>, pos: OctreeSectionPos) -> u8 {
-    let Some(kids) = pos.children() else {
-        return 0;
-    };
-    let mut mask = 0u8;
-    for (ci, child) in kids.into_iter().enumerate() {
-        if rendered.contains(&child)
-            || (child.detail > 0 && covered_rendered_mask(rendered, child) != 0)
-        {
-            mask |= 1u8 << ci;
-        }
-    }
-    mask
-}
-
-/// 8-bit mask of child octants of `pos` (indexed by `child_index(cx, cy, cz)`) that already have
-/// a non-empty finer section or descendant in `store`. Covered octants are masked out when meshing
-/// `pos` so parent and child never overlap, while uncovered octants still draw so LOD ring
-/// boundaries never open sky holes or flat stone ceilings.
-#[cfg(test)]
-pub(crate) fn covered_child_mask(store: &OctreeIngestStore, pos: OctreeSectionPos) -> u8 {
-    let Some(kids) = pos.children() else {
-        return 0;
-    };
-    let mut mask = 0u8;
-    for (ci, child) in kids.into_iter().enumerate() {
-        if store.section(child).is_some_and(|s| !s.is_empty())
-            || (child.detail > 0 && has_non_empty_descendant(store, child))
-        {
-            mask |= 1u8 << ci;
-        }
-    }
-    mask
-}
-
-/// Returns `true` when `pos` exists, is non-empty, and has no finer non-empty descendants.
-#[cfg(test)]
-pub(crate) fn is_render_leaf(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
-    let Some(section) = store.section(pos) else {
-        return false;
-    };
-    !section.is_empty() && covered_child_mask(store, pos) == 0
-}
-
-#[cfg(test)]
-fn has_non_empty_descendant(store: &OctreeIngestStore, pos: OctreeSectionPos) -> bool {
-    covered_child_mask(store, pos) != 0
-}
 
 impl Pipeline {
     fn clear_dimension(&mut self, dim: &str) {
@@ -355,7 +298,7 @@ impl Pipeline {
     fn forget_gpu_residency(&mut self, dim: &str) {
         self.dirty.remove(dim);
         self.queued.remove(dim);
-        self.rendered.remove(dim);
+        self.meshed.remove(dim);
         // Keep next_epoch so a job already popped by the worker cannot match on return.
         self.section_epoch.retain(|(d, _), _| d != dim);
     }
@@ -365,7 +308,7 @@ impl Pipeline {
         self.dirty.clear();
         self.queued.clear();
         self.section_epoch.clear();
-        self.rendered.clear();
+        self.meshed.clear();
         self.unsaved.clear();
         self.requested.clear();
         // Keep next_epoch so a mesh still in flight cannot match a reopened world's section.
@@ -482,7 +425,7 @@ impl Pipeline {
     /// The GPU arena is gone, so nothing counts as uploaded: drop residency and pre-reset worker
     /// epochs (their results are discarded), then mesh every stored section again.
     fn reset_arena_state(&mut self) -> usize {
-        self.rendered.clear();
+        self.meshed.clear();
         self.section_epoch.clear();
         self.dirty.clear();
         self.queued.clear();
@@ -491,7 +434,7 @@ impl Pipeline {
     }
 
     fn queue(&mut self, dim: &str, positions: impl IntoIterator<Item = OctreeSectionPos>) {
-        let rendered = self.rendered.get(dim);
+        let meshed = self.meshed.get(dim);
         let set = self.queued.entry(dim.to_owned()).or_default();
         let queue = self.dirty.entry(dim.to_owned()).or_default();
         let mut push = |pos: OctreeSectionPos| {
@@ -501,16 +444,8 @@ impl Pipeline {
         };
         for pos in positions {
             push(pos);
-            // Evict any currently-rendered ancestor superseded by a finer section, and re-mesh
-            // any currently-rendered same-detail neighbour so touching border walls are culled.
-            if let Some(live) = rendered {
-                let mut anc = pos.parent();
-                while let Some(a) = anc {
-                    if live.contains(&a) {
-                        push(a);
-                    }
-                    anc = a.parent();
-                }
+            // Re-mesh same-detail neighbours so touching border walls are culled or exposed.
+            if let Some(live) = meshed {
                 for face in Face::ALL {
                     let nb = pos.neighbor(face);
                     if live.contains(&nb) {
@@ -527,7 +462,6 @@ impl Pipeline {
         completions: Vec<MeshDone>,
         mut submit: impl FnMut(crate::render_bridge::SectionKey, BuiltSection),
     ) {
-        let mut remesh_ancestors: Vec<(String, OctreeSectionPos)> = Vec::new();
         for (done_dim, pos, epoch, built) in completions {
             if self.section_epoch.get(&(done_dim.clone(), pos)).copied() != Some(epoch) {
                 continue;
@@ -536,45 +470,13 @@ impl Pipeline {
                 self.section_epoch.remove(&(done_dim, pos));
                 continue;
             }
-            let has_quads = !built.is_empty();
+            let empty = built.is_empty();
             let key = (done_dim.clone(), pos.detail, [pos.x, pos.y, pos.z]);
             submit(key, built);
-            if !has_quads {
-                // The matching epoch is the newest job for `pos`: an empty result retires the entry.
+            if empty {
                 self.section_epoch.remove(&(done_dim.clone(), pos));
             }
-            let changed = if has_quads {
-                self.rendered
-                    .entry(done_dim.clone())
-                    .or_default()
-                    .insert(pos)
-            } else {
-                self.rendered
-                    .get_mut(&done_dim)
-                    .is_some_and(|live| live.remove(&pos))
-            };
-            if changed {
-                let mut anc = pos.parent();
-                while let Some(a) = anc {
-                    let should_requeue = if has_quads {
-                        self.rendered
-                            .get(&done_dim)
-                            .is_some_and(|live| live.contains(&a))
-                            || self.section_epoch.contains_key(&(done_dim.clone(), a))
-                    } else {
-                        self.stores
-                            .get(&done_dim)
-                            .is_some_and(|s| s.section(a).is_some_and(|sec| !sec.is_empty()))
-                    };
-                    if should_requeue {
-                        remesh_ancestors.push((done_dim.clone(), a));
-                    }
-                    anc = a.parent();
-                }
-            }
-        }
-        for (anc_dim, anc_pos) in remesh_ancestors {
-            self.queue(&anc_dim, [anc_pos]);
+            self.meshed.entry(done_dim).or_default().insert(pos);
         }
     }
 }
@@ -871,7 +773,7 @@ fn model_words(index: usize, m: &BakedModel, atlas: &mut [u8]) -> [u32; MODEL_WO
 }
 
 /// Buckets a mesh for the arena: bucket 0 translucent, 1 double-sided (unused), `2 + face` opaque.
-fn built_section(quads: &SectionQuads) -> BuiltSection {
+fn built_section(quads: &SectionQuads, complete: bool) -> BuiltSection {
     let mut by_bucket: [Vec<_>; BUCKETS] = Default::default();
     by_bucket[0] = quads.translucent.clone();
     for q in &quads.opaque {
@@ -900,6 +802,7 @@ fn built_section(quads: &SectionQuads) -> BuiltSection {
         },
         quads: all,
         counts,
+        complete,
     }
 }
 
@@ -969,30 +872,18 @@ pub fn client_tick(host: &mut dyn ClientHost, active_dim: Option<&str>) {
             continue;
         };
         let key = (dim.to_owned(), pos.detail, [pos.x, pos.y, pos.z]);
-        let Some(section) = store.section(pos).filter(|s| !s.is_empty()) else {
-            // Removing the entry drops any in-flight mesh result for `pos` (no epoch matches) and
-            // keeps `section_epoch` bounded by the live sections.
+        let Some(section) = store.section(pos) else {
+            // An absent section is unresolved, not known-empty.
             p.section_epoch.remove(&(dim.to_owned(), pos));
-            if p.rendered
-                .get_mut(dim)
-                .is_some_and(|live| live.remove(&pos))
-            {
-                submit_built_section(key, empty_section(pos));
-            }
             continue;
         };
-        let covered = p
-            .rendered
-            .get(dim)
-            .map_or(0, |live| covered_rendered_mask(live, pos));
-        if covered == 0xFF {
+        let complete = store.is_section_complete(pos);
+        if section.is_empty() {
             p.section_epoch.remove(&(dim.to_owned(), pos));
-            if p.rendered
-                .get_mut(dim)
-                .is_some_and(|live| live.remove(&pos))
-            {
-                submit_built_section(key, empty_section(pos));
+            if let Some(live) = p.meshed.get_mut(dim) {
+                live.remove(&pos);
             }
+            submit_built_section(key, empty_section(pos, complete));
             continue;
         }
         let neighbors: [Option<&OctreeSection>; 6] =
@@ -1007,21 +898,22 @@ pub fn client_tick(host: &mut dyn ClientHost, active_dim: Option<&str>) {
             pos,
             epoch,
             section: section_clone,
+            complete,
             borders,
-            covered,
             metas: Arc::clone(&metas),
         });
         pending += 1;
     }
 }
 
-fn empty_section(pos: OctreeSectionPos) -> BuiltSection {
+fn empty_section(pos: OctreeSectionPos, complete: bool) -> BuiltSection {
     BuiltSection {
         level: pos.detail,
         pos: [pos.x, pos.y, pos.z],
         aabb: SectionAabb::FULL,
         quads: Vec::new(),
         counts: [0; BUCKETS],
+        complete,
     }
 }
 
@@ -1417,7 +1309,7 @@ mod tests {
             p.stores.insert(dim.into(), OctreeIngestStore::default());
             p.queue(dim, [pos]);
             p.section_epoch.insert((dim.into(), pos), 7);
-            p.rendered.insert(dim.into(), HashSet::from([pos]));
+            p.meshed.insert(dim.into(), HashSet::from([pos]));
             p.unsaved.insert(dim.into(), HashSet::from([pos]));
             p.requested.insert(dim.into(), HashSet::from([pos]));
         }
@@ -1426,7 +1318,7 @@ mod tests {
         assert!(p.dirty.is_empty());
         assert!(p.queued.is_empty());
         assert!(p.section_epoch.is_empty());
-        assert!(p.rendered.is_empty());
+        assert!(p.meshed.is_empty());
         assert!(p.unsaved.is_empty());
         assert!(p.requested.is_empty());
         assert_eq!((p.next_epoch, p.baked, p.models_dirty), (7, 2, true));
@@ -1461,32 +1353,6 @@ mod tests {
     }
 
     #[test]
-    fn leaf_selection_never_renders_parent_alongside_non_empty_child() {
-        let mut store = OctreeIngestStore::new();
-        let parent_pos = OctreeSectionPos::new(1, 0, 2, 0);
-        let mut parent = OctreeSection::new(parent_pos);
-        parent.set(0, 0, 0, Voxel::new(1, 0, 15, 0));
-        store.adopt_section(parent);
-        assert!(
-            is_render_leaf(&store, parent_pos),
-            "coarse section with no children is a render leaf"
-        );
-
-        let child_pos = parent_pos.children().unwrap()[0];
-        let mut child = OctreeSection::new(child_pos);
-        child.set(0, 0, 0, Voxel::new(1, 0, 15, 0));
-        store.adopt_section(child);
-        assert!(
-            is_render_leaf(&store, child_pos),
-            "finer child becomes the render leaf"
-        );
-        assert!(
-            !is_render_leaf(&store, parent_pos),
-            "parent is no longer rendered once a finer child exists"
-        );
-    }
-
-    #[test]
     fn forget_gpu_residency_and_requeue_dimension_preserve_store_and_requeue() {
         let (overworld, nether) = ("minecraft:overworld", "minecraft:the_nether");
         let parent = OctreeSectionPos::new(1, 0, 2, 0);
@@ -1510,16 +1376,15 @@ mod tests {
             p.unsaved
                 .insert(dim.to_owned(), positions.iter().copied().collect());
             p.requested.insert(dim.to_owned(), HashSet::from([missing]));
-            p.rendered.insert(dim.to_owned(), HashSet::from([live]));
+            p.meshed.insert(dim.to_owned(), HashSet::from([live]));
             p.section_epoch.insert((dim.to_owned(), live), epoch);
         }
-        assert_ne!(covered_rendered_mask(&p.rendered[overworld], parent), 0);
 
         p.forget_gpu_residency(overworld);
 
         assert!(!p.dirty.contains_key(overworld));
         assert!(!p.queued.contains_key(overworld));
-        assert!(!p.rendered.contains_key(overworld));
+        assert!(!p.meshed.contains_key(overworld));
         assert_eq!(
             p.section_epoch,
             HashMap::from([((nether.to_owned(), nether_pos), 10)])
@@ -1545,7 +1410,7 @@ mod tests {
         }
         assert_eq!(p.dirty[nether], VecDeque::from([nether_pos]));
         assert_eq!(p.queued[nether], HashSet::from([nether_pos]));
-        assert_eq!(p.rendered[nether], HashSet::from([nether_pos]));
+        assert_eq!(p.meshed[nether], HashSet::from([nether_pos]));
 
         assert_eq!(p.requeue_dimension(overworld), 2);
         assert_eq!(p.dirty[overworld].len(), 2);
@@ -1554,20 +1419,19 @@ mod tests {
             HashSet::from([child, parent])
         );
         assert_eq!(p.queued[overworld], HashSet::from([child, parent]));
-        let live = p.rendered.entry(overworld.to_owned()).or_default();
-        assert_eq!(covered_rendered_mask(live, parent), 0);
+        assert!(!p.meshed.contains_key(overworld));
         assert_eq!(p.requeue_dimension("minecraft:the_end"), 0);
     }
 
     fn nonempty_mesh_done(dim: &str, pos: OctreeSectionPos, epoch: u64) -> MeshDone {
-        let mut built = empty_section(pos);
+        let mut built = empty_section(pos, false);
         built.quads.push(crate::gpu_arena::PackedQuad::default());
         built.counts[0] = 1;
         (dim.to_owned(), pos, epoch, built)
     }
 
     #[test]
-    fn apply_mesh_completions_requeues_in_flight_parent_after_child_finishes_first() {
+    fn apply_mesh_completions_keeps_parent_and_child_without_requeue() {
         let overworld = "minecraft:overworld";
         let parent = OctreeSectionPos::new(1, 0, 2, 0);
         let child = parent.children().unwrap()[0];
@@ -1575,7 +1439,6 @@ mod tests {
         let voxel = Voxel::new(1, 0, 15, 0);
 
         for separate_ticks in [true, false] {
-            // Both jobs were dispatched before either was rendered, so the parent was unmasked.
             let mut p = Pipeline {
                 next_epoch: 2,
                 section_epoch: HashMap::from([
@@ -1596,9 +1459,9 @@ mod tests {
                     submitted.push(key)
                 });
                 assert_eq!(submitted, [key(child)]);
-                assert_eq!(p.rendered[overworld], HashSet::from([child]));
-                assert_eq!(p.dirty[overworld], VecDeque::from([parent]));
-                assert_eq!(p.queued[overworld], HashSet::from([parent]));
+                assert_eq!(p.meshed[overworld], HashSet::from([child]));
+                assert!(p.dirty.is_empty());
+                assert!(p.queued.is_empty());
 
                 p.apply_mesh_completions(Some(overworld), vec![parent_done], |key, _| {
                     submitted.push(key)
@@ -1611,10 +1474,9 @@ mod tests {
                 );
             }
             assert_eq!(submitted, [key(child), key(parent)]);
-            assert_eq!(p.rendered[overworld], HashSet::from([child, parent]));
-            assert_eq!(p.dirty[overworld], VecDeque::from([parent]));
-            assert_eq!(p.queued[overworld], HashSet::from([parent]));
-            assert_ne!(covered_rendered_mask(&p.rendered[overworld], parent), 0);
+            assert_eq!(p.meshed[overworld], HashSet::from([child, parent]));
+            assert!(p.dirty.is_empty());
+            assert!(p.queued.is_empty());
         }
     }
 
@@ -1654,8 +1516,8 @@ mod tests {
                 [pos_ne.x, pos_ne.y, pos_ne.z]
             )]
         );
-        let rendered = HashMap::from([(nether.to_owned(), HashSet::from([pos_ne]))]);
-        assert_eq!(p.rendered, rendered);
+        let meshed = HashMap::from([(nether.to_owned(), HashSet::from([pos_ne]))]);
+        assert_eq!(p.meshed, meshed);
         assert!(
             !p.section_epoch
                 .contains_key(&(overworld.to_owned(), pos_ow))
@@ -1670,12 +1532,12 @@ mod tests {
             submitted.push(key)
         });
         assert_eq!(submitted.len(), 1);
-        assert_eq!(p.rendered, rendered);
+        assert_eq!(p.meshed, meshed);
         assert!(!p.section_epoch.contains_key(&(end.to_owned(), pos_end)));
     }
 
     #[test]
-    fn arena_reset_clears_rendered_and_epochs_before_requeuing() {
+    fn arena_reset_clears_meshed_and_epochs_before_requeuing() {
         let dim = "minecraft:overworld";
         let parent_pos = OctreeSectionPos::new(1, 0, 2, 0);
         let child_pos = parent_pos.children().unwrap()[0];
@@ -1687,7 +1549,7 @@ mod tests {
         }
         let mut p = Pipeline::default();
         p.stores.insert(dim.to_owned(), store);
-        p.rendered
+        p.meshed
             .entry(dim.to_owned())
             .or_default()
             .insert(child_pos);
@@ -1699,14 +1561,11 @@ mod tests {
 
         assert_eq!(p.reset_arena_state(), 2);
 
-        assert!(p.rendered.is_empty());
+        assert!(p.meshed.is_empty());
         assert!(p.section_epoch.is_empty());
         assert!(p.models_dirty);
         let queued = &p.queued[dim];
         assert!(queued.contains(&child_pos) && queued.contains(&parent_pos));
         assert_eq!(p.dirty[dim].len(), 2);
-        let live = p.rendered.entry(dim.to_owned()).or_default();
-        assert_eq!(covered_rendered_mask(live, parent_pos), 0);
-        assert!(live.insert(child_pos));
     }
 }

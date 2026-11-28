@@ -21,10 +21,11 @@
 //! one fixed slot per `(section id, bucket)`, rewritten every frame by `voxy_cmdgen.csh`, so the
 //! draw count is simply the id high-water mark times the bucket count.
 
+use crate::octree::{MAX_OCTREE_DETAIL, OctreeSectionPos, child_index};
 use mod_api::{
     BufferError, ClientHost, StorageBufferDescriptor, StorageBufferRef, StorageBufferSlice,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Bytes per packed quad (Voxy `BufferArena(geometryCapacity, 8)`).
 pub const QUAD_BYTES: u64 = 8;
@@ -123,6 +124,8 @@ pub struct BuiltSection {
     /// Quads in bucket order; `counts[i]` quads belong to bucket `i`.
     pub quads: Vec<PackedQuad>,
     pub counts: [u16; BUCKETS],
+    /// Whether the source covers this entire section, independent of its quad count.
+    pub complete: bool,
 }
 
 impl BuiltSection {
@@ -412,11 +415,42 @@ impl GpuNode {
 }
 
 type NodeTree = (Vec<GpuNode>, Vec<u32>);
+type LiveSectionMeta = (u8, [i32; 3], SectionAabb, bool);
 
 /// Builds a compact top-down octree node table (`detail = MAX_OCTREE_DETAIL` roots down to
-/// `detail = 0` leaves) with contiguous 8-child blocks for `voxy_traversal.csh`.
-pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) -> NodeTree {
-    use crate::octree::{MAX_OCTREE_DETAIL, child_index};
+/// `detail = 0` leaves) with contiguous 8-child blocks for `voxy_traversal.csh`. Empty octants
+/// count toward resolution but need no GPU node of their own.
+fn build_node_tree(
+    live_meta: &HashMap<u32, LiveSectionMeta>,
+    known_empty: Option<&HashSet<OctreeSectionPos>>,
+) -> NodeTree {
+    let mut resolved_children = HashMap::<OctreeSectionPos, u8>::new();
+    let uploaded = live_meta
+        .values()
+        .filter(|meta| meta.3)
+        .map(|&(level, [x, y, z], _, _)| {
+            OctreeSectionPos::new(level.min(MAX_OCTREE_DETAIL), x, y, z)
+        });
+    for mut pos in uploaded.chain(known_empty.into_iter().flatten().copied()) {
+        while let Some(parent) = pos.parent() {
+            let bit = 1
+                << child_index(
+                    (pos.x & 1) as usize,
+                    (pos.y & 1) as usize,
+                    (pos.z & 1) as usize,
+                );
+            let mask = resolved_children.entry(parent).or_default();
+            if *mask & bit != 0 {
+                break;
+            }
+            *mask |= bit;
+            if *mask != u8::MAX {
+                break;
+            }
+            // Complete coverage also resolves a meshless octant for its own parent.
+            pos = parent;
+        }
+    }
 
     let mut nodes: Vec<GpuNode> = Vec::new();
     let mut root_index: HashMap<[i32; 3], usize> = HashMap::new();
@@ -446,7 +480,7 @@ pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) ->
         idx
     };
 
-    for (&section_id, &(level, pos, aabb)) in live_meta {
+    for (&section_id, &(level, pos, aabb, _)) in live_meta {
         let clamped_level = level.min(MAX_OCTREE_DETAIL);
         // Walk from root down to `clamped_level`, allocating 8-child blocks as needed.
         let shift = MAX_OCTREE_DETAIL - clamped_level;
@@ -489,17 +523,29 @@ pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) ->
                 base
             };
             nodes[cur_idx].child_mask |= 1u32 << oct;
-            // Any internal node with children must keep FULL bounds regardless of HashMap
-            // iteration order so frustum/Hi-Z culling never drops children outside a masked mesh.
-            nodes[cur_idx].aabb = SectionAabb::FULL.pack();
             cur_idx = child_base + oct;
             cur_pos = next_pos;
             cur_level = next_level;
         }
         nodes[cur_idx].section_id = section_id;
-        // Leaf nodes tighten to their exact geometry AABB; internal nodes keep FULL.
-        if nodes[cur_idx].child_mask == 0 {
-            nodes[cur_idx].aabb = aabb.pack();
+        nodes[cur_idx].aabb = aabb.pack();
+    }
+
+    // Publish only after the whole residency snapshot has been linked. Rebuilding from
+    // scratch also withdraws a child block when a retirement leaves an unresolved octant.
+    for node in &mut nodes {
+        if node.child_mask == 0 || node.section_id == GpuNode::NONE {
+            continue;
+        }
+        let (level, [x, y, z]) = unpack_section_pos([node.pos0, node.pos1]);
+        let pos = OctreeSectionPos::new(level, x, y, z);
+        if resolved_children.get(&pos) != Some(&u8::MAX) {
+            // A meshed parent remains the sole drawable for its volume until it can hand off
+            // the entire volume. Keep the tight mesh bounds when that handoff is unavailable.
+            node.child_base = GpuNode::NONE;
+            node.child_mask = 0;
+        } else {
+            node.aabb = SectionAabb::FULL.pack();
         }
     }
 
@@ -507,17 +553,16 @@ pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) ->
 }
 
 fn rebuild_node_tree_if_dirty(
-    nodes_dirty: &mut bool,
-    live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    nodes_dirty: bool,
+    live_meta: &HashMap<u32, LiveSectionMeta>,
+    known_empty: Option<&HashSet<OctreeSectionPos>>,
     max_nodes: u64,
 ) -> Result<Option<NodeTree>, ArenaError> {
-    if !*nodes_dirty {
+    if !nodes_dirty {
         return Ok(None);
     }
-    let (nodes, roots) = build_node_tree(live_meta);
+    let (nodes, roots) = build_node_tree(live_meta, known_empty);
     if (nodes.len() as u64) > max_nodes {
-        // This tree will not fit until section residency changes.
-        *nodes_dirty = false;
         return Err(ArenaError::NodesFull);
     }
     Ok(Some((nodes, roots)))
@@ -576,12 +621,19 @@ pub struct GpuArena {
     /// Whole-buffer slices for set-1 bindings.
     pub slices: ArenaSlices,
     max_sections: u32,
+    residency: ArenaResidency,
+}
+
+/// CPU-side section state, including changes not yet published to the GPU.
+struct ArenaResidency {
     quad_alloc: FreeList,
     ids: IdAllocator,
     /// Quad-arena start (in quads) per live section id.
     live: HashMap<u32, u32>,
-    /// `(level, pos, aabb)` per live section id for building the GPU octree node table.
-    live_meta: HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    /// `(level, pos, aabb, complete)` per live section id for building the GPU octree node table.
+    live_meta: HashMap<u32, LiveSectionMeta>,
+    /// Resolved empty meshes, scoped to the dimension whose geometry is resident.
+    known_empty: HashMap<String, HashSet<OctreeSectionPos>>,
     nodes_dirty: bool,
     root_count: u32,
     dirty: BTreeMap<u32, SectionMeta>,
@@ -701,13 +753,7 @@ impl GpuArena {
             dispatch_a,
             dispatch_b,
             max_sections,
-            quad_alloc: FreeList::new(geometry_bytes / QUAD_BYTES),
-            ids: IdAllocator::new(max_sections),
-            live: HashMap::new(),
-            live_meta: HashMap::new(),
-            nodes_dirty: false,
-            root_count: 0,
-            dirty: BTreeMap::new(),
+            residency: ArenaResidency::new(max_sections, geometry_bytes / QUAD_BYTES),
         })
     }
 
@@ -717,29 +763,29 @@ impl GpuArena {
 
     /// Sections cmdgen must visit (`indirect_lookup`-free: ids are dense up to this mark).
     pub fn section_high_water(&self) -> u32 {
-        self.ids.high_water()
+        self.residency.ids.high_water()
     }
 
     /// `max_count` for the opaque indirect draw.
     pub fn opaque_command_count(&self) -> u32 {
-        self.ids.high_water() * OPAQUE_SLOTS_PER_SECTION as u32
+        self.residency.ids.high_water() * OPAQUE_SLOTS_PER_SECTION as u32
     }
 
     /// `max_count` for the translucent indirect draw.
     pub fn translucent_command_count(&self) -> u32 {
-        self.ids.high_water()
+        self.residency.ids.high_water()
     }
 
     pub fn used_geometry_bytes(&self) -> u64 {
-        self.quad_alloc.used() * QUAD_BYTES
+        self.residency.quad_alloc.used() * QUAD_BYTES
     }
 
     pub fn live_sections(&self) -> usize {
-        self.live.len()
+        self.residency.live.len()
     }
 
     pub fn root_count(&self) -> u32 {
-        self.root_count
+        self.residency.root_count
     }
 
     /// Uploads `section` (replacing `old_id` when given, like `uploadReplaceSection`) and returns
@@ -756,16 +802,17 @@ impl GpuArena {
         // The old section stays live until the new one is fully uploaded, so a failed replace
         // keeps showing the previous mesh instead of leaving a hole.
         if let Some(old) = old_id
-            && !self.live.contains_key(&old)
+            && !self.residency.live.contains_key(&old)
         {
             return Err(ArenaError::UnknownSection(old));
         }
         let start = self
+            .residency
             .quad_alloc
             .alloc(section.quads.len() as u64)
             .ok_or(ArenaError::GeometryFull)?;
-        let Some(id) = self.ids.alloc() else {
-            self.quad_alloc.free(start);
+        let Some(id) = self.residency.ids.alloc() else {
+            self.residency.quad_alloc.free(start);
             return Err(ArenaError::SectionsFull);
         };
         let mut bytes = Vec::with_capacity(section.quads.len() * QUAD_BYTES as usize);
@@ -773,15 +820,18 @@ impl GpuArena {
             bytes.extend_from_slice(&q.to_bytes());
         }
         if let Err(e) = self.quads.write_range(&*host, start * QUAD_BYTES, &bytes) {
-            self.ids.free(id);
-            self.quad_alloc.free(start);
+            self.residency.ids.free(id);
+            self.residency.quad_alloc.free(start);
             return Err(e.into());
         }
-        self.live.insert(id, start as u32);
-        self.live_meta
-            .insert(id, (section.level, section.pos, section.aabb));
-        self.nodes_dirty = true;
-        self.dirty
+        self.residency.live.insert(id, start as u32);
+        self.residency.live_meta.insert(
+            id,
+            (section.level, section.pos, section.aabb, section.complete),
+        );
+        self.residency.nodes_dirty = true;
+        self.residency
+            .dirty
             .insert(id, SectionMeta::new(section, start as u32));
         if let Some(old) = old_id {
             self.remove(old)?;
@@ -789,68 +839,68 @@ impl GpuArena {
         Ok(id)
     }
 
-    /// Frees a section's quads and zeroes its metadata so cmdgen emits `instance_count = 0`.
+    /// Frees a section's quads and queues its metadata slot to be zeroed.
     pub fn remove(&mut self, id: u32) -> Result<(), ArenaError> {
-        let start = self
-            .live
-            .remove(&id)
-            .ok_or(ArenaError::UnknownSection(id))?;
-        self.live_meta.remove(&id);
-        self.nodes_dirty = true;
-        self.quad_alloc.free(start as u64);
-        self.ids.free(id);
-        self.dirty.insert(id, SectionMeta::default());
-        Ok(())
+        self.residency.remove(id)
     }
 
-    /// Writes queued metadata, coalescing consecutive ids into one `write_range`. The queue is
-    /// cleared only once every run is written, so a failed flush is retried whole next call.
-    pub fn flush(&mut self, host: &mut dyn ClientHost) -> Result<(), ArenaError> {
-        let mut run_start = 0u32;
-        let mut run: Vec<u8> = Vec::new();
-        let mut next = 0u32;
-        for (&id, meta) in &self.dirty {
-            if !run.is_empty() && id != next {
-                self.sections.write_range(
-                    &*host,
-                    run_start as u64 * SECTION_METADATA_BYTES,
-                    &run,
-                )?;
-                run.clear();
-            }
-            if run.is_empty() {
-                run_start = id;
-            }
-            run.extend_from_slice(&meta.to_bytes());
-            next = id + 1;
+    /// Record a complete, empty mesh without allocating a section id.
+    pub(crate) fn mark_empty(&mut self, dimension: String, pos: OctreeSectionPos) {
+        self.residency.nodes_dirty |= self
+            .residency
+            .known_empty
+            .entry(dimension)
+            .or_default()
+            .insert(pos);
+    }
+
+    /// Withdraw previous empty resolution when a result no longer proves it.
+    pub(crate) fn forget_empty(&mut self, dimension: &str, pos: OctreeSectionPos) {
+        if let Some(positions) = self.residency.known_empty.get_mut(dimension) {
+            self.residency.nodes_dirty |= positions.remove(&pos);
         }
-        if !run.is_empty() {
-            self.sections
-                .write_range(&*host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
+    }
+
+    pub(crate) fn clear_known_empty(&mut self, dimension: Option<&str>) {
+        if let Some(dim) = dimension {
+            self.residency.nodes_dirty |= self.residency.known_empty.remove(dim).is_some();
+        } else {
+            self.residency.nodes_dirty |= !self.residency.known_empty.is_empty();
+            self.residency.known_empty.clear();
         }
-        self.dirty.clear();
-        if let Some((node_list, root_list)) =
-            rebuild_node_tree_if_dirty(&mut self.nodes_dirty, &self.live_meta, GPU_MAX_NODES)?
-        {
-            if !node_list.is_empty() {
-                let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
-                for n in &node_list {
-                    nbytes.extend_from_slice(&n.to_bytes());
-                }
-                self.nodes.write_range(&*host, 0, &nbytes)?;
-            }
-            let rcount = root_list.len().min(GPU_TRAV_QUEUE_CAP as usize);
-            if rcount > 0 {
-                let mut rbytes = Vec::with_capacity(rcount * 4);
-                for &r in &root_list[..rcount] {
-                    rbytes.extend_from_slice(&r.to_le_bytes());
-                }
-                self.roots.write_range(&*host, 0, &rbytes)?;
-            }
-            self.root_count = rcount as u32;
-            self.nodes_dirty = false;
-        }
-        Ok(())
+    }
+
+    /// Pending quad writes may already reuse retired ranges, and the buffer API queues each
+    /// write separately. Only submit compute and draws after a whole flush succeeds.
+    pub(crate) fn is_published(&self) -> bool {
+        self.residency.is_published()
+    }
+
+    pub fn flush(
+        &mut self,
+        host: &mut dyn ClientHost,
+        dimension: Option<&str>,
+    ) -> Result<(), ArenaError> {
+        let (nodes, roots, sections) = (self.nodes, self.roots, self.sections);
+        self.residency.flush_with(
+            dimension,
+            GPU_MAX_NODES,
+            |bytes| {
+                nodes
+                    .write_range(&*host, 0, bytes)
+                    .map_err(ArenaError::from)
+            },
+            |bytes| {
+                roots
+                    .write_range(&*host, 0, bytes)
+                    .map_err(ArenaError::from)
+            },
+            |offset, bytes| {
+                sections
+                    .write_range(&*host, offset, bytes)
+                    .map_err(ArenaError::from)
+            },
+        )
     }
 
     /// Writes baked model records starting at `first_model` (`words.len()` a multiple of 16).
@@ -899,6 +949,94 @@ impl GpuArena {
         let _ = self.dispatch_b.release(&*host);
         let _ = self.models.release(&*host);
         let _ = self.biome_tints.release(&*host);
+    }
+}
+
+impl ArenaResidency {
+    fn new(max_sections: u32, quad_capacity: u64) -> Self {
+        Self {
+            quad_alloc: FreeList::new(quad_capacity),
+            ids: IdAllocator::new(max_sections),
+            live: HashMap::new(),
+            live_meta: HashMap::new(),
+            known_empty: HashMap::new(),
+            nodes_dirty: false,
+            root_count: 0,
+            dirty: BTreeMap::new(),
+        }
+    }
+
+    fn is_published(&self) -> bool {
+        !self.nodes_dirty && self.dirty.is_empty()
+    }
+
+    /// Frees a section's quads and zeroes its metadata so cmdgen emits `instance_count = 0`.
+    fn remove(&mut self, id: u32) -> Result<(), ArenaError> {
+        let start = self
+            .live
+            .remove(&id)
+            .ok_or(ArenaError::UnknownSection(id))?;
+        self.live_meta.remove(&id);
+        self.nodes_dirty = true;
+        self.quad_alloc.free(start as u64);
+        self.ids.free(id);
+        self.dirty.insert(id, SectionMeta::default());
+        Ok(())
+    }
+
+    /// Publish the replacement tree before retiring metadata. On failure keep the unwritten
+    /// changes pending, so traversal cannot run until a later flush finishes the generation.
+    fn flush_with(
+        &mut self,
+        dimension: Option<&str>,
+        max_nodes: u64,
+        mut write_nodes: impl FnMut(&[u8]) -> Result<(), ArenaError>,
+        mut write_roots: impl FnMut(&[u8]) -> Result<(), ArenaError>,
+        mut write_sections: impl FnMut(u64, &[u8]) -> Result<(), ArenaError>,
+    ) -> Result<(), ArenaError> {
+        let known_empty = dimension.and_then(|dim| self.known_empty.get(dim));
+        if let Some((node_list, root_list)) =
+            rebuild_node_tree_if_dirty(self.nodes_dirty, &self.live_meta, known_empty, max_nodes)?
+        {
+            if !node_list.is_empty() {
+                let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
+                for n in &node_list {
+                    nbytes.extend_from_slice(&n.to_bytes());
+                }
+                write_nodes(&nbytes)?;
+            }
+            let rcount = root_list.len().min(GPU_TRAV_QUEUE_CAP as usize);
+            if rcount > 0 {
+                let mut rbytes = Vec::with_capacity(rcount * 4);
+                for &r in &root_list[..rcount] {
+                    rbytes.extend_from_slice(&r.to_le_bytes());
+                }
+                write_roots(&rbytes)?;
+            }
+            self.root_count = rcount as u32;
+            self.nodes_dirty = false;
+        }
+
+        // Coalesce consecutive metadata slots; retain the whole batch on any failed write.
+        let mut run_start = 0u32;
+        let mut run: Vec<u8> = Vec::new();
+        let mut next = 0u32;
+        for (&id, meta) in &self.dirty {
+            if !run.is_empty() && id != next {
+                write_sections(run_start as u64 * SECTION_METADATA_BYTES, &run)?;
+                run.clear();
+            }
+            if run.is_empty() {
+                run_start = id;
+            }
+            run.extend_from_slice(&meta.to_bytes());
+            next = id + 1;
+        }
+        if !run.is_empty() {
+            write_sections(run_start as u64 * SECTION_METADATA_BYTES, &run)?;
+        }
+        self.dirty.clear();
+        Ok(())
     }
 }
 
@@ -1058,6 +1196,7 @@ mod tests {
             aabb: SectionAabb::FULL,
             quads: vec![PackedQuad::default(); 36],
             counts: [1, 2, 3, 4, 5, 6, 7, 8],
+            complete: false,
         };
         let m = SectionMeta::new(&s, 640);
         assert_eq!(m.a[3], 640);
@@ -1069,12 +1208,11 @@ mod tests {
     #[test]
     fn gpu_node_tree_links_roots_to_leaves() {
         let mut live = HashMap::new();
-        live.insert(10, (0u8, [-3, 2, 5], SectionAabb::FULL));
-        live.insert(20, (4u8, [-1, 0, 0], SectionAabb::FULL));
-        let (nodes, roots) = build_node_tree(&live);
+        live.insert(10, (0u8, [-3, 2, 5], SectionAabb::FULL, false));
+        let (nodes, roots) = build_node_tree(&live, None);
         assert_eq!(roots.len(), 1);
         let root = nodes[roots[0] as usize];
-        assert_eq!(root.section_id, 20);
+        assert_eq!(root.section_id, GpuNode::NONE);
         assert_ne!(root.child_mask, 0);
         // Walk down 4 levels from root to detail-0 leaf section 10.
         let mut cur = root;
@@ -1088,40 +1226,164 @@ mod tests {
     }
 
     #[test]
-    fn nodes_full_clears_dirty_until_residency_changes() {
-        let live = HashMap::from([(
-            1,
-            (crate::octree::MAX_OCTREE_DETAIL, [0; 3], SectionAabb::FULL),
-        )]);
-        let mut nodes_dirty = true;
-        assert!(matches!(
-            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 0),
-            Err(ArenaError::NodesFull)
-        ));
-        assert!(!nodes_dirty);
-        assert!(matches!(
-            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 0),
-            Ok(None)
-        ));
-
-        nodes_dirty = true;
-        assert!(matches!(
-            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 1),
-            Ok(Some(_))
-        ));
-        assert!(nodes_dirty);
-    }
-
-    #[test]
-    fn gpu_node_tree_keeps_parent_aabb_full_regardless_of_insert_order() {
+    fn seven_of_eight_resolved_draws_parent() {
         let tight = SectionAabb {
             offset: [1, 2, 3],
             size: [4, 5, 6],
         };
-        let mut live = HashMap::new();
-        live.insert(1, (4u8, [0, 0, 0], tight));
-        live.insert(2, (0u8, [0, 0, 0], tight));
-        let (nodes, roots) = build_node_tree(&live);
-        assert_eq!(nodes[roots[0] as usize].aabb, SectionAabb::FULL.pack());
+        let level = MAX_OCTREE_DETAIL;
+        let parent = OctreeSectionPos::new(level, 0, 0, 0);
+        let kids = parent.children().unwrap();
+        let live = HashMap::from([
+            (1, (level, [0; 3], tight, true)),
+            (2, (level - 1, [1, 0, 0], tight, true)),
+            (3, (level - 2, [0; 3], tight, true)),
+        ]);
+        // Octant 0 has no mesh, but all eight of its own octants resolved.
+        let grandkids = kids[0].children().unwrap();
+        let mut empty: HashSet<_> = grandkids[1..].iter().chain(&kids[2..7]).copied().collect();
+        let (nodes, roots) = build_node_tree(&live, Some(&empty));
+        let root = nodes[roots[0] as usize];
+        assert_eq!(root.section_id, 1);
+        assert_eq!((root.child_base, root.child_mask), (GpuNode::NONE, 0));
+        assert_eq!(root.aabb, tight.pack());
+
+        empty.insert(kids[7]);
+        let (nodes, roots) = build_node_tree(&live, Some(&empty));
+        let root = nodes[roots[0] as usize];
+        assert_eq!(root.section_id, 1);
+        assert_ne!(root.child_base, GpuNode::NONE);
+        assert_eq!(root.child_mask, 0b11);
+        assert_eq!(root.aabb, SectionAabb::FULL.pack());
+        assert_eq!(nodes[root.child_base as usize + 1].section_id, 2);
+        let branch = nodes[root.child_base as usize];
+        assert_eq!(branch.section_id, GpuNode::NONE);
+        assert_eq!(branch.child_mask, 1);
+        assert_eq!(nodes[branch.child_base as usize].section_id, 3);
+    }
+
+    #[test]
+    fn incomplete_section_does_not_resolve_octant() {
+        let level = MAX_OCTREE_DETAIL;
+        let kids = OctreeSectionPos::new(level, 0, 0, 0).children().unwrap();
+        let mut live = HashMap::from([
+            (1, (level, [0; 3], SectionAabb::FULL, true)),
+            (2, (level - 1, [0; 3], SectionAabb::FULL, false)),
+        ]);
+        let empty = kids[1..].iter().copied().collect();
+        for complete in [false, true] {
+            live.get_mut(&2).unwrap().3 = complete;
+            let (nodes, roots) = build_node_tree(&live, Some(&empty));
+            let root = nodes[roots[0] as usize];
+            assert_eq!(root.section_id, 1);
+            if complete {
+                assert_eq!(root.child_mask, 1);
+                assert_eq!(nodes[root.child_base as usize].section_id, 2);
+            } else {
+                assert_eq!((root.child_base, root.child_mask), (GpuNode::NONE, 0));
+            }
+        }
+        // Without a meshed parent, the same incomplete section is reachable right away.
+        live.remove(&1);
+        live.get_mut(&2).unwrap().3 = false;
+        let (nodes, roots) = build_node_tree(&live, Some(&empty));
+        let root = nodes[roots[0] as usize];
+        assert_eq!(root.child_mask, 1);
+        assert_eq!(nodes[root.child_base as usize].section_id, 2);
+    }
+
+    #[test]
+    fn failed_flush_keeps_retirement_pending_until_parent_is_published() {
+        let level = MAX_OCTREE_DETAIL;
+        let kids = OctreeSectionPos::new(level, 0, 0, 0).children().unwrap();
+        let dim = "test:overworld";
+        let mut arena = ArenaResidency::new(3, 3);
+        for (level, pos) in [(level, [0; 3]), (level - 1, [0; 3]), (level - 1, [1, 0, 0])] {
+            let id = arena.ids.alloc().unwrap();
+            let start = arena.quad_alloc.alloc(1).unwrap() as u32;
+            arena.live.insert(id, start);
+            arena
+                .live_meta
+                .insert(id, (level, pos, SectionAabb::FULL, true));
+        }
+        arena
+            .known_empty
+            .insert(dim.to_owned(), kids[2..].iter().copied().collect());
+        arena.nodes_dirty = true;
+        let child_mask = |bytes: &[u8]| u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        arena
+            .flush_with(
+                Some(dim),
+                GPU_MAX_NODES,
+                |bytes| {
+                    assert_eq!(child_mask(bytes), 0b11);
+                    Ok(())
+                },
+                |_| Ok(()),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert!(arena.is_published());
+
+        arena.remove(1).unwrap();
+        assert!(!arena.is_published());
+        let oversized = arena.flush_with(
+            Some(dim),
+            1,
+            |_| panic!("oversized node tree written"),
+            |_| panic!("roots written for oversized tree"),
+            |_, _| panic!("retired metadata written before tree fit"),
+        );
+        assert!(matches!(oversized, Err(ArenaError::NodesFull)));
+        assert!(arena.nodes_dirty);
+        assert_eq!(arena.root_count, 1);
+        assert_eq!(arena.dirty.get(&1), Some(&SectionMeta::default()));
+        assert!(!arena.is_published());
+
+        let failed_root_write = arena.flush_with(
+            Some(dim),
+            GPU_MAX_NODES,
+            |_| Ok(()),
+            |_| Err(ArenaError::Buffer(BufferError::OutOfRange)),
+            |_, _| panic!("retired metadata written after failed root write"),
+        );
+        assert!(matches!(
+            failed_root_write,
+            Err(ArenaError::Buffer(BufferError::OutOfRange))
+        ));
+        assert!(arena.nodes_dirty);
+        assert_eq!(arena.root_count, 1);
+        assert_eq!(arena.dirty.get(&1), Some(&SectionMeta::default()));
+        assert!(!arena.is_published());
+
+        let write_step = std::cell::Cell::new(0);
+        arena
+            .flush_with(
+                Some(dim),
+                GPU_MAX_NODES,
+                |bytes| {
+                    assert_eq!(write_step.replace(1), 0);
+                    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
+                    assert_eq!(
+                        u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+                        GpuNode::NONE
+                    );
+                    assert_eq!(child_mask(bytes), 0);
+                    Ok(())
+                },
+                |_| {
+                    assert_eq!(write_step.replace(2), 1);
+                    Ok(())
+                },
+                |offset, bytes| {
+                    assert_eq!(write_step.replace(3), 2);
+                    assert_eq!(offset, SECTION_METADATA_BYTES);
+                    assert_eq!(bytes, SectionMeta::default().to_bytes().as_slice());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(write_step.get(), 3);
+        assert!(arena.is_published());
     }
 }

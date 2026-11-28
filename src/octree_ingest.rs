@@ -122,6 +122,9 @@ pub struct DistantColumn<'a, B> {
 pub struct OctreeIngestStore {
     sections: HashMap<OctreeSectionPos, OctreeSection>,
     chunk_sources: HashMap<[i32; 2], IngestSource>,
+    /// Whole chunk ingests, not chunks touched by individual distant column samples.
+    chunks: HashSet<[i32; 2]>,
+    adopted: HashSet<OctreeSectionPos>,
     /// Section Ys holding G4 voxels per block column, so a re-sample can clear its old column.
     distant_column_ys: HashMap<(i32, i32), BTreeSet<i32>>,
     dirty: HashSet<OctreeSectionPos>,
@@ -134,6 +137,24 @@ impl OctreeIngestStore {
 
     pub fn section(&self, pos: OctreeSectionPos) -> Option<&OctreeSection> {
         self.sections.get(&pos)
+    }
+
+    /// Whether every octant of this section has coverage independent of its mesh.
+    pub fn is_section_complete(&self, pos: OctreeSectionPos) -> bool {
+        self.adopted.contains(&pos)
+            || match pos.children() {
+                Some(children) => children
+                    .into_iter()
+                    .all(|child| self.is_section_complete(child)),
+                None => self.has_chunk_coverage(pos.x, pos.z),
+            }
+    }
+
+    fn has_chunk_coverage(&self, x: i32, z: i32) -> bool {
+        let (Some(x), Some(z)) = (x.checked_mul(2), z.checked_mul(2)) else {
+            return false;
+        };
+        (0..2).all(|dx| (0..2).all(|dz| self.chunks.contains(&[x + dx, z + dz])))
     }
 
     /// Every stored section position, for a full re-mesh.
@@ -196,14 +217,17 @@ impl OctreeIngestStore {
         match self.sections.entry(section.pos) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
+                self.adopted.insert(section.pos);
                 slot.insert(section);
                 true
             }
         }
     }
 
-    /// Replace a section with a newer copy from the server. Not marked dirty.
+    /// Replace a section with a newer copy from the server, which carries no coverage proof.
+    /// Not marked dirty: the caller queues it for meshing.
     pub fn replace_section(&mut self, section: OctreeSection) {
+        self.adopted.remove(&section.pos);
         self.sections.insert(section.pos, section);
     }
 
@@ -372,6 +396,7 @@ pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
     let (ox, oz) = (chunk[0] * 16, chunk[1] * 16);
     let (sx, sz) = (ox.div_euclid(edge), oz.div_euclid(edge));
     let (off_x, off_z) = (ox.rem_euclid(edge) as usize, oz.rem_euclid(edge) as usize);
+    let gained_coverage = store.chunks.insert(chunk) && store.has_chunk_coverage(sx, sz);
 
     // Top-down: air above a column's highest block sees the open sky, whatever lighting says (a
     // chunk that is not lit yet reads 0, which draws every face beside it black).
@@ -383,6 +408,10 @@ pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
         }
         let pos = OctreeSectionPos::new(0, sx, y0.div_euclid(edge), sz);
         let off_y = y0.rem_euclid(edge) as usize;
+        // Coverage may change without a voxel revision (e.g. the last chunk is shadowed air).
+        if gained_coverage {
+            store.dirty.insert(pos);
+        }
 
         let uniform = snap.section_uniform_block(index);
         let uniform_id = uniform.map(&mut *block_id);
@@ -702,6 +731,41 @@ mod tests {
         ingest(&mut store, [0, 0], &empty, IngestSource::Loaded);
         assert!(store.voxel_at(1, 50, 1).is_air());
         assert_eq!(empty.block_calls.get(), 0);
+    }
+
+    #[test]
+    fn section_coverage_requires_all_four_chunks_or_adoption() {
+        let mut store = OctreeIngestStore::new();
+        let pos = OctreeSectionPos::new(0, -1, 0, -1);
+        let air = MockChunk::new();
+        assert!(ingest(&mut store, [-2, -2], &air, IngestSource::Loaded));
+        assert!(store.section(pos).unwrap().is_empty());
+        assert!(!store.is_section_complete(pos));
+
+        // One distant column cannot vouch for the rest of its chunk.
+        ingest_distant_columns(
+            &mut store,
+            &[column(-1, -1, 0, None, STONE)],
+            WATER,
+            STONE,
+            &mut |b| b,
+            &mut |_| 0,
+        );
+        for chunk in [[-2, -1], [-1, -2]] {
+            assert!(ingest(&mut store, chunk, &air, IngestSource::Loaded));
+            assert!(!store.is_section_complete(pos));
+        }
+        assert!(ingest(&mut store, [-1, -1], &air, IngestSource::Loaded));
+        assert!(store.is_section_complete(pos));
+        assert!(!store.is_section_complete(pos.parent().unwrap()));
+
+        let parent = pos.parent().unwrap();
+        for child in parent.children().unwrap() {
+            if !store.is_section_complete(child) {
+                assert!(store.adopt_section(OctreeSection::new(child)));
+            }
+        }
+        assert!(store.is_section_complete(parent));
     }
 
     #[test]
