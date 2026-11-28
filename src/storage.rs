@@ -328,12 +328,13 @@ pub fn legacy_section_path(world_dir: &Path, dimension: &str, pos: SectionPos) -
 //
 // ```text
 //  0  magic            "DHLOD003"
-//  8  format_version   u8   = 3             DTO DATA_FORMAT.V3_LATEST (lines 61-66, 131)
+//  8  format_version   u8   = 4             local record version
 //  9  compression      u8                   DTO compressionModeValue (lines 89, 132); MODE values
 // 10  detail           u8   0..=4           `OctreeSectionPos::detail` (DTO packs it in `pos` long, line 765)
 // 11  x, y, z          i32 each             rest of `OctreeSectionPos`
 // 23  revision         u64                  `OctreeSection::revision` (DTO lastModifiedUnixDateTime, line 799)
-// 31  data_len         u32  + data blob     DTO compressedDataByteArray (lines 75, 769-770)
+// 31  flags            u8                   bit 0: complete source coverage (v4 only)
+// 32  data_len         u32  + data blob     DTO compressedDataByteArray (lines 75, 769-770)
 //     mapping_len      u32  + mapping blob  DTO compressedMappingByteArray (lines 86, 789-790)
 //     crc32            u32  over all preceding bytes   DTO dataChecksum (lines 73, 766)
 // ```
@@ -354,12 +355,15 @@ pub fn legacy_section_path(world_dir: &Path, dimension: &str, pos: SectionPos) -
 
 /// Leading magic of a compressed octree record.
 pub const MAGIC_V3: &[u8; 8] = b"DHLOD003";
-/// `DTO` `DATA_FORMAT.V3_LATEST` (`FullDataSourceV2DTO.java` line 65).
-pub const OCTREE_FORMAT_VERSION: u8 = 3;
+// DHLOD003 originally used the upstream DTO version as its version byte.
+const OCTREE_FORMAT_VERSION_LEGACY_V3: u8 = 3;
+pub const OCTREE_FORMAT_VERSION: u8 = 4;
+const OCTREE_FLAG_COMPLETE: u8 = 1;
 /// Default compressor: `Config.java` line 1688 sets `dataCompression` to `Z_STD_BLOCK` (4).
 pub const DEFAULT_OCTREE_COMPRESSION: DhV2CompressionMode = DhV2CompressionMode::ZstdBlock;
 
-const OCTREE_HEADER_BYTES: usize = 8 + 1 + 1 + 1 + 12 + 8;
+const OCTREE_HEADER_BYTES_LEGACY: usize = 8 + 1 + 1 + 1 + 12 + 8;
+const OCTREE_HEADER_BYTES: usize = OCTREE_HEADER_BYTES_LEGACY + 1;
 /// Cap on one decompressed blob. Sunrise-side memory bound: DH has none in the DTO; its widest
 /// per-string field is the `u16` length at `IDMAP` line 293, which this cap does not narrow for
 /// any realistic table (the data blob of a full 32³ section is at most about 0.5 MiB).
@@ -583,13 +587,14 @@ fn decompress_octree_blob(
     Ok(raw)
 }
 
-/// Encode `section` plus its name tables as one `DHLOD003` record using `mode`.
+/// Encode `section`, its name tables and the caller's coverage proof as one `DHLOD003` record.
 ///
 /// Voxels are canonicalised to the `Mapper` field layout (block 20 bits, biome 9 bits, light
 /// byte); bits outside those fields are not stored.
 pub fn encode_octree_section(
     section: &OctreeSection,
     mapping: &OctreeMapping,
+    complete: bool,
     mode: DhV2CompressionMode,
 ) -> Result<Vec<u8>, OctreeCodecError> {
     let rle = section.to_rle();
@@ -644,6 +649,7 @@ pub fn encode_octree_section(
     out.extend_from_slice(&section.pos.y.to_be_bytes());
     out.extend_from_slice(&section.pos.z.to_be_bytes());
     out.extend_from_slice(&section.revision.to_be_bytes());
+    out.push(if complete { OCTREE_FLAG_COMPLETE } else { 0 });
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(&data);
     out.extend_from_slice(&(names.len() as u32).to_be_bytes());
@@ -661,16 +667,17 @@ pub fn octree_record_crc(record: &[u8]) -> Option<u32> {
 
 /// Decode a `DHLOD003` record. The CRC32 is verified before anything is decompressed; every
 /// length, id and run is bounds-checked, and malformed input is an `Err`, never a panic.
+/// Records without a coverage field decode as incomplete.
 pub fn decode_octree_section(
     record: &[u8],
-) -> Result<(OctreeSection, OctreeMapping), OctreeCodecError> {
+) -> Result<(OctreeSection, OctreeMapping, bool), OctreeCodecError> {
     if record.len() < 8 || &record[..8] != MAGIC_V3 {
         return Err(OctreeCodecError::BadMagic);
     }
     if record.len() > MAX_COMPRESSED_RECORD_BYTES {
         return Err(OctreeCodecError::Oversized("record"));
     }
-    if record.len() < OCTREE_HEADER_BYTES + 4 + 4 + 4 {
+    if record.len() < OCTREE_HEADER_BYTES_LEGACY + 4 + 4 + 4 {
         return Err(OctreeCodecError::Truncated);
     }
     let (body, tail) = record.split_at(record.len() - 4);
@@ -681,10 +688,11 @@ pub fn decode_octree_section(
     }
 
     let mut cur = Cursor::new(&body[8..]);
-    let version = cur.u8()?;
-    if version != OCTREE_FORMAT_VERSION {
-        return Err(OctreeCodecError::UnsupportedFormatVersion(version));
-    }
+    let has_coverage_flags = match cur.u8()? {
+        OCTREE_FORMAT_VERSION => true,
+        OCTREE_FORMAT_VERSION_LEGACY_V3 => false,
+        version => return Err(OctreeCodecError::UnsupportedFormatVersion(version)),
+    };
     let mode_byte = cur.u8()?;
     let mode = DhV2CompressionMode::from_byte(mode_byte)
         .map_err(|_| OctreeCodecError::UnknownCompression(mode_byte))?;
@@ -694,6 +702,15 @@ pub fn decode_octree_section(
     }
     let pos = OctreeSectionPos::new(detail, cur.i32()?, cur.i32()?, cur.i32()?);
     let revision = cur.u64()?;
+    let complete = if has_coverage_flags {
+        let flags = cur.u8()?;
+        if flags & !OCTREE_FLAG_COMPLETE != 0 {
+            return Err(OctreeCodecError::Corrupt("unknown coverage flags"));
+        }
+        flags & OCTREE_FLAG_COMPLETE != 0
+    } else {
+        false
+    };
     let data_len = cur.u32()? as usize;
     let data_blob = cur.take(data_len)?;
     let names_len = cur.u32()? as usize;
@@ -804,7 +821,7 @@ pub fn decode_octree_section(
     if !m.finished() {
         return Err(OctreeCodecError::Corrupt("trailing mapping bytes"));
     }
-    Ok((section, mapping))
+    Ok((section, mapping, complete))
 }
 
 /// A stored section of either on-disk generation.
@@ -813,15 +830,15 @@ pub enum StoredSection {
     /// `DHLOD001` / `DHLOD002` column section (`decode_section`).
     Column(LodSection),
     /// `DHLOD003` 32³ octree section.
-    Octree(OctreeSection, OctreeMapping),
+    Octree(OctreeSection, OctreeMapping, bool),
 }
 
 /// Decode a record by its magic: `DHLOD003` octree records, or the older `DHLOD001/2` column
 /// records through [`decode_section`].
 pub fn decode_stored_section(bytes: &[u8]) -> Option<StoredSection> {
     if bytes.starts_with(MAGIC_V3) {
-        let (s, m) = decode_octree_section(bytes).ok()?;
-        Some(StoredSection::Octree(s, m))
+        let (s, m, complete) = decode_octree_section(bytes).ok()?;
+        Some(StoredSection::Octree(s, m, complete))
     } else {
         decode_section(bytes).map(StoredSection::Column)
     }
@@ -1384,9 +1401,10 @@ impl RegionCache {
         dimension: &str,
         section: &OctreeSection,
         mapping: &OctreeMapping,
+        complete: bool,
         mode: DhV2CompressionMode,
     ) -> io::Result<()> {
-        let record = encode_octree_section(section, mapping, mode)
+        let record = encode_octree_section(section, mapping, complete, mode)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crc = octree_record_crc(&record)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record too short"))?;
@@ -1408,7 +1426,7 @@ impl RegionCache {
         world_dir: &Path,
         dimension: &str,
         pos: OctreeSectionPos,
-    ) -> Option<(OctreeSection, OctreeMapping)> {
+    ) -> Option<(OctreeSection, OctreeMapping, bool)> {
         let path = octree_region_path(world_dir, dimension, pos);
         let (_, _, _, slot_idx) = octree_region_slot(pos);
         let Ok(Some(reg)) = self.get_region(&path, false) else {
@@ -1418,8 +1436,8 @@ impl RegionCache {
         if octree_record_crc(&bytes) != Some(slot_crc) {
             return None;
         }
-        let (section, mapping) = decode_octree_section(&bytes).ok()?;
-        (section.pos == pos).then_some((section, mapping))
+        let (section, mapping, complete) = decode_octree_section(&bytes).ok()?;
+        (section.pos == pos).then_some((section, mapping, complete))
     }
 }
 
@@ -1428,6 +1446,8 @@ pub struct OctreeLoaded {
     pub dimension: String,
     pub section: OctreeSection,
     pub mapping: OctreeMapping,
+    /// The record attests that this section's entire in-build-height volume was sampled.
+    pub complete: bool,
 }
 
 pub enum IoResponse {
@@ -1444,6 +1464,7 @@ type OctreeSaveKey = (PathBuf, String, OctreeSectionPos);
 struct OctreeSaveJob {
     section: OctreeSection,
     mapping: OctreeMapping,
+    complete: bool,
     mode: DhV2CompressionMode,
 }
 
@@ -1544,12 +1565,14 @@ impl LodIoWorker {
         dimension: String,
         section: OctreeSection,
         mapping: OctreeMapping,
+        complete: bool,
     ) {
         self.save_octree_section_with(
             world_dir,
             dimension,
             section,
             mapping,
+            complete,
             DEFAULT_OCTREE_COMPRESSION,
         );
     }
@@ -1561,6 +1584,7 @@ impl LodIoWorker {
         dimension: String,
         section: OctreeSection,
         mapping: OctreeMapping,
+        complete: bool,
         mode: DhV2CompressionMode,
     ) {
         let mut st = self.shared.state.lock().unwrap();
@@ -1576,6 +1600,7 @@ impl LodIoWorker {
             OctreeSaveJob {
                 section,
                 mapping,
+                complete,
                 mode,
             },
         );
@@ -1726,6 +1751,7 @@ fn run_io_worker(shared: Arc<IoShared>) {
                     &dimension,
                     &job.section,
                     &job.mapping,
+                    job.complete,
                     job.mode,
                 );
                 if let Err(ref e) = res {
@@ -1741,13 +1767,14 @@ fn run_io_worker(shared: Arc<IoShared>) {
                 let loaded = cache.load_octree_section(&world_dir, &dimension, pos);
                 let mut st = shared.state.lock().unwrap();
                 st.in_flight -= 1;
-                if let Some((section, mapping)) = loaded {
+                if let Some((section, mapping, complete)) = loaded {
                     st.octree_responses.push((
                         session,
                         OctreeLoaded {
                             dimension,
                             section,
                             mapping,
+                            complete,
                         },
                     ));
                 }
@@ -2045,7 +2072,13 @@ mod tests {
         let (octree, mapping) = populated_octree(octree_pos);
         let worker = LodIoWorker::spawn();
         for dim in [reopened, active] {
-            worker.save_octree_section(dir.clone(), dim.into(), octree.clone(), mapping.clone());
+            worker.save_octree_section(
+                dir.clone(),
+                dim.into(),
+                octree.clone(),
+                mapping.clone(),
+                true,
+            );
             worker.request_save(dir.clone(), dim.into(), sample_section(column_pos, 64));
         }
         for dim in [reopened, active] {
@@ -2075,8 +2108,15 @@ mod tests {
         let column_pos = SectionPos::new(0, 1, 2);
         let (mut octree, mapping) = populated_octree(octree_pos);
         let mut seed = RegionCache::default();
-        seed.save_octree_section(&world_a, dim, &octree, &mapping, DEFAULT_OCTREE_COMPRESSION)
-            .unwrap();
+        seed.save_octree_section(
+            &world_a,
+            dim,
+            &octree,
+            &mapping,
+            true,
+            DEFAULT_OCTREE_COMPRESSION,
+        )
+        .unwrap();
         seed.save_section(&world_a, dim, &sample_section(column_pos, 64))
             .unwrap();
         drop(seed);
@@ -2091,7 +2131,7 @@ mod tests {
         };
         octree.set(4, 4, 4, Voxel::new(2, 3, 9, 9));
         let column = sample_section(column_pos, 80);
-        worker.save_octree_section(world_a.clone(), dim.into(), octree.clone(), mapping);
+        worker.save_octree_section(world_a.clone(), dim.into(), octree.clone(), mapping, true);
         worker.request_save(world_a.clone(), dim.into(), column.clone());
         worker.load_octree_section(world_a.clone(), dim.into(), octree_pos);
         worker.request_load(world_a.clone(), dim.into(), column_pos);
@@ -2112,11 +2152,12 @@ mod tests {
         drop(worker);
 
         let mut reader = RegionCache::default();
-        let (saved_octree, _) = reader
+        let (saved_octree, _, complete) = reader
             .load_octree_section(&world_a, dim, octree_pos)
             .unwrap();
         let saved_column = reader.load_section(&world_a, dim, column_pos).unwrap();
         assert_eq!(saved_octree.to_dense(), octree.to_dense());
+        assert!(complete);
         assert_eq!(saved_column.columns, column.columns);
         drop(reader);
         fs::remove_dir_all(world_a).unwrap();
@@ -2142,12 +2183,14 @@ mod tests {
             dim.into(),
             octree_a.clone(),
             mapping.clone(),
+            true,
         );
         worker.save_octree_section(
             world_b.clone(),
             dim.into(),
             octree_b.clone(),
             mapping.clone(),
+            true,
         );
         worker.request_save(world_a.clone(), dim.into(), column_a.clone());
         worker.request_save(world_b.clone(), dim.into(), column_b.clone());
@@ -2185,6 +2228,7 @@ mod tests {
                     dimension: dim.into(),
                     section: octree_a.clone(),
                     mapping: mapping.clone(),
+                    complete: true,
                 },
             ));
             st.responses.push((
@@ -2236,22 +2280,24 @@ mod tests {
             DhV2CompressionMode::Lz4,
             DhV2CompressionMode::ZstdBlock,
         ] {
-            let bytes = encode_octree_section(&sec, &mapping, mode).unwrap();
+            let bytes = encode_octree_section(&sec, &mapping, true, mode).unwrap();
             assert_eq!(&bytes[..8], MAGIC_V3);
+            assert_eq!(bytes[8], 4);
             assert_eq!(bytes[9], mode as u8);
-            let (back, back_map) = decode_octree_section(&bytes).unwrap();
+            let (back, back_map, complete) = decode_octree_section(&bytes).unwrap();
             assert_eq!(back.pos, pos, "{mode:?}");
             assert_eq!(back.revision, sec.revision, "{mode:?}");
             assert_eq!(back.to_dense(), sec.to_dense(), "{mode:?}");
             assert_eq!(back_map, mapping, "{mode:?}");
+            assert!(complete);
             assert!(matches!(
                 decode_stored_section(&bytes),
                 Some(StoredSection::Octree(..))
             ));
         }
         let plain =
-            encode_octree_section(&sec, &mapping, DhV2CompressionMode::Uncompressed).unwrap();
-        let zstd = encode_octree_section(&sec, &mapping, DEFAULT_OCTREE_COMPRESSION).unwrap();
+            encode_octree_section(&sec, &mapping, true, DhV2CompressionMode::Uncompressed).unwrap();
+        let zstd = encode_octree_section(&sec, &mapping, true, DEFAULT_OCTREE_COMPRESSION).unwrap();
         assert!(zstd.len() < plain.len());
         assert_eq!(DEFAULT_OCTREE_COMPRESSION as u8, 4);
         assert_eq!(DhV2CompressionMode::Lz4 as u8, 1);
@@ -2262,7 +2308,7 @@ mod tests {
         let (sec, mapping) = populated_octree(OctreeSectionPos::new(0, 0, 0, 0));
         for mode in [DhV2CompressionMode::ZstdStream, DhV2CompressionMode::Lzma2] {
             assert_eq!(
-                encode_octree_section(&sec, &mapping, mode).unwrap_err(),
+                encode_octree_section(&sec, &mapping, true, mode).unwrap_err(),
                 OctreeCodecError::EncodeUnsupported(mode)
             );
         }
@@ -2285,7 +2331,7 @@ mod tests {
             DhV2CompressionMode::Lz4,
             DhV2CompressionMode::ZstdBlock,
         ] {
-            let bytes = encode_octree_section(&sec, &mapping, mode).unwrap();
+            let bytes = encode_octree_section(&sec, &mapping, true, mode).unwrap();
             // Flip every byte after the magic in turn; no flip may decode.
             for i in 8..bytes.len() {
                 let mut bad = bytes.clone();
@@ -2307,7 +2353,7 @@ mod tests {
             assert!(decode_octree_section(&long).is_err());
         }
         let mut bytes =
-            encode_octree_section(&sec, &mapping, DhV2CompressionMode::Uncompressed).unwrap();
+            encode_octree_section(&sec, &mapping, true, DhV2CompressionMode::Uncompressed).unwrap();
         bytes[0] = b'X';
         assert_eq!(
             decode_octree_section(&bytes).unwrap_err(),
@@ -2319,19 +2365,21 @@ mod tests {
     fn octree_rejects_valid_crc_with_bad_fields() {
         let (sec, mapping) = populated_octree(OctreeSectionPos::new(1, 5, -2, 9));
         let good =
-            encode_octree_section(&sec, &mapping, DhV2CompressionMode::Uncompressed).unwrap();
+            encode_octree_section(&sec, &mapping, true, DhV2CompressionMode::Uncompressed).unwrap();
         let reseal = |mut v: Vec<u8>| {
             let n = v.len() - 4;
             let crc = crc32fast::hash(&v[..n]);
             v[n..].copy_from_slice(&crc.to_be_bytes());
             v
         };
-        let mut v = good.clone();
-        v[8] = 9; // format version
-        assert_eq!(
-            decode_octree_section(&reseal(v)).unwrap_err(),
-            OctreeCodecError::UnsupportedFormatVersion(9)
-        );
+        for version in [0, 1, 2, 5, u8::MAX] {
+            let mut v = good.clone();
+            v[8] = version;
+            assert_eq!(
+                decode_octree_section(&reseal(v)).unwrap_err(),
+                OctreeCodecError::UnsupportedFormatVersion(version)
+            );
+        }
         let mut v = good.clone();
         v[9] = 77; // compression id
         assert_eq!(
@@ -2341,6 +2389,21 @@ mod tests {
         let mut v = good.clone();
         v[10] = MAX_OCTREE_DETAIL + 1;
         assert!(decode_octree_section(&reseal(v)).is_err());
+        let mut v = good.clone();
+        v[OCTREE_HEADER_BYTES_LEGACY] |= 2;
+        assert_eq!(
+            decode_octree_section(&reseal(v)).unwrap_err(),
+            OctreeCodecError::Corrupt("unknown coverage flags")
+        );
+        let mut legacy = good.clone();
+        legacy[8] = 3;
+        legacy.remove(OCTREE_HEADER_BYTES_LEGACY);
+        let (decoded, decoded_mapping, complete) = decode_octree_section(&reseal(legacy)).unwrap();
+        assert_eq!(decoded.pos, sec.pos);
+        assert_eq!(decoded.revision, sec.revision);
+        assert_eq!(decoded.to_dense(), sec.to_dense());
+        assert_eq!(decoded_mapping, mapping);
+        assert!(!complete);
         let mut v = good;
         v[OCTREE_HEADER_BYTES..OCTREE_HEADER_BYTES + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(
@@ -2408,17 +2471,17 @@ mod tests {
 
         let mut cache = RegionCache::default();
         cache
-            .save_octree_section(&dir, dim, &a, &a_map, DhV2CompressionMode::ZstdBlock)
+            .save_octree_section(&dir, dim, &a, &a_map, true, DhV2CompressionMode::ZstdBlock)
             .unwrap();
         cache
-            .save_octree_section(&dir, dim, &b, &b_map, DhV2CompressionMode::Lz4)
+            .save_octree_section(&dir, dim, &b, &b_map, true, DhV2CompressionMode::Lz4)
             .unwrap();
 
         let mut cold = RegionCache::default();
-        let (la, lm) = cold.load_octree_section(&dir, dim, a_pos).unwrap();
+        let (la, lm, _) = cold.load_octree_section(&dir, dim, a_pos).unwrap();
         assert_eq!(la.to_dense(), a.to_dense());
         assert_eq!(lm, a_map);
-        let (lb, _) = cold.load_octree_section(&dir, dim, b_pos).unwrap();
+        let (lb, _, _) = cold.load_octree_section(&dir, dim, b_pos).unwrap();
         assert_eq!(lb.to_dense(), b.to_dense());
         assert!(
             cold.load_octree_section(&dir, dim, OctreeSectionPos::new(0, 3, 0, 3))
@@ -2451,7 +2514,7 @@ mod tests {
         let mut after = RegionCache::default();
         assert!(after.load_octree_section(&dir, dim, a_pos).is_none());
         after
-            .save_octree_section(&dir, dim, &b, &b_map, DEFAULT_OCTREE_COMPRESSION)
+            .save_octree_section(&dir, dim, &b, &b_map, true, DEFAULT_OCTREE_COMPRESSION)
             .unwrap();
         let quarantined = fs::read_dir(path.parent().unwrap())
             .unwrap()
@@ -2482,8 +2545,14 @@ mod tests {
         second.set(4, 4, 4, Voxel::new(2, 3, 9, 9));
 
         let worker = LodIoWorker::spawn();
-        worker.save_octree_section(dir.clone(), dim.into(), first, mapping.clone());
-        worker.save_octree_section(dir.clone(), dim.into(), second.clone(), mapping.clone());
+        worker.save_octree_section(dir.clone(), dim.into(), first, mapping.clone(), false);
+        worker.save_octree_section(
+            dir.clone(),
+            dim.into(),
+            second.clone(),
+            mapping.clone(),
+            true,
+        );
         worker.flush();
         worker.load_octree_section(dir.clone(), dim.into(), pos);
         worker.flush();
@@ -2492,6 +2561,7 @@ mod tests {
         assert_eq!(got[0].dimension, dim);
         assert_eq!(got[0].section.to_dense(), second.to_dense());
         assert_eq!(got[0].mapping, mapping);
+        assert!(got[0].complete);
 
         // A save still queued at drop is written before the worker thread exits.
         let other = OctreeSectionPos::new(1, -2, 0, -1);
@@ -2501,12 +2571,14 @@ mod tests {
             dim.into(),
             extra.clone(),
             extra_map,
+            false,
             DhV2CompressionMode::Uncompressed,
         );
         drop(worker);
         let mut reader = RegionCache::default();
-        let (loaded, _) = reader.load_octree_section(&dir, dim, other).unwrap();
+        let (loaded, _, complete) = reader.load_octree_section(&dir, dim, other).unwrap();
         assert_eq!(loaded.to_dense(), extra.to_dense());
+        assert!(!complete);
 
         let _ = fs::remove_dir_all(&dir);
     }
