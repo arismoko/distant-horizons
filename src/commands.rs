@@ -7,7 +7,7 @@ use crate::config::{
     DhConfig, KEY_DISTANT_GENERATION, KEY_ENABLED, KEY_FOG_ENABLED, KEY_HORIZONTAL_QUALITY,
     KEY_RENDER_DISTANCE, KEY_SSAO_ENABLED, KEY_THREAD_PRESET, MOD_ID, ThreadPreset, setting_key,
 };
-use crate::render_bridge::{runtime, stats};
+use crate::render_bridge::{arena_usage, runtime, stats};
 use mod_api::{
     ClientCommandRegistration, ClientHost, ClientSetupContext, Command, CommandArgumentValue,
     CommandInvocation, KeyConflictContext, KeyRegistration, ModKeyMappingRef, Registrar,
@@ -441,7 +441,8 @@ fn send_status(host: &mut dyn ClientHost) {
     } else {
         "distantsunrises.command.state_off"
     };
-    let _ = host.chat_line(Text::translate(
+    let (arena_sections, arena_bytes) = arena_usage();
+    let status = Text::translate(
         "distantsunrises.command.status_line",
         vec![
             Text::translate(state_key, Vec::new()),
@@ -452,7 +453,11 @@ fn send_status(host: &mut dyn ClientHost) {
             Text::literal(s.rendered_quads.to_string()),
             Text::literal(format!("{:.0}%/{:.0}%", rain * 100.0, thunder * 100.0)),
         ],
-    ));
+    )
+    .append(Text::literal(format!(
+        " arena_sections={arena_sections} arena_bytes={arena_bytes}"
+    )));
+    let _ = host.chat_line(status);
 }
 
 /// Drop cached sections and meshes for the active dimension so they rebuild cleanly.

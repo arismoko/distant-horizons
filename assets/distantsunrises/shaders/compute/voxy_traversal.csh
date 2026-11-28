@@ -123,10 +123,8 @@ void main() {
     bool has_geom = section_id != 0xFFFFFFFFu;
     bool has_children = child_mask != 0u && child_base != 0xFFFFFFFFu;
 
-    // Descend whenever uploaded finer children exist so GPU traversal stays 1:1 consistent
-    // with CPU `covered_rendered_mask` (avoiding masked-octant holes at any window size/FOV).
-    bool subdivide = detail > 0u && has_children;
-    if (subdivide) {
+    // A meshed parent exposes children only after all eight octants are resolved.
+    if (detail > 0u && has_children) {
         for (uint ci = 0u; ci < 8u; ci++) {
             if ((child_mask & (1u << ci)) != 0u) {
                 uint slot = atomicAdd(queue_out.count, 1u);
@@ -135,10 +133,6 @@ void main() {
                     atomicMax(dispatch_out.wg_x, (slot + 64u) >> 6);
                 }
             }
-        }
-        // If this parent still owns uncovered octants (partial child coverage), draw it too.
-        if (has_geom && child_mask != 0xFFu) {
-            visible_flags[section_id] = 1u;
         }
     } else if (has_geom) {
         visible_flags[section_id] = 1u;

@@ -25,7 +25,8 @@
 //! already exists there (a block broken since the last ingest must not leave stale voxels).
 
 use crate::octree::{
-    MAX_OCTREE_DETAIL, OctreeSection, OctreeSectionPos, SECTION_EDGE, Voxel, downsample_2x2x2_onto,
+    MAX_OCTREE_DETAIL, OctreeSection, OctreeSectionPos, SECTION_EDGE, Voxel, child_index,
+    downsample_2x2x2_onto, mip_voxels,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
@@ -117,11 +118,38 @@ pub struct DistantColumn<'a, B> {
     pub biome: &'a str,
 }
 
-/// Detail-0 sections, chunk provenance and the dirty set awaiting mip propagation.
+/// A detached surface query result, including the position when no surface was returned.
+pub(crate) enum DistantSample<'a, B> {
+    Surface(DistantColumn<'a, B>),
+    NoSurface(i32, i32),
+}
+
+/// Whether the entire section lies outside the dimension's half-open block-Y range.
+pub fn is_out_of_build_height(pos: OctreeSectionPos, bounds: (i32, i32)) -> bool {
+    let size = (SECTION_EDGE as i64) << pos.detail;
+    outside_y_bounds(i64::from(pos.y) * size, size, bounds)
+}
+
+fn outside_y_bounds(y0: i64, size: i64, (min_y, max_y): (i32, i32)) -> bool {
+    y0 + size <= i64::from(min_y) || y0 >= i64::from(max_y)
+}
+
+/// Octree sections, chunk provenance and the dirty set awaiting mip propagation.
 #[derive(Default)]
 pub struct OctreeIngestStore {
     sections: HashMap<OctreeSectionPos, OctreeSection>,
     chunk_sources: HashMap<[i32; 2], IngestSource>,
+    /// Sampled 16³ slabs per detail-0 section, in octant order (`child_index`).
+    covered_subchunks: HashMap<OctreeSectionPos, u8>,
+    y_bounds: Option<(i32, i32)>,
+    adopted: HashSet<OctreeSectionPos>,
+    /// Coarse jobs track x-fastest resolved columns, independently of 3D slab coverage.
+    partial_column_stacks: HashMap<(u8, i32, i32), Box<[u64; 16]>>,
+    complete_column_stacks: HashSet<(u8, i32, i32)>,
+    /// Mip bytes rebuilt from a full set of sampled or out-of-height octants.
+    complete_mips: HashSet<OctreeSectionPos>,
+    /// Proven air with no voxel storage, retained so arena recreation can republish it.
+    meshless_air: HashSet<OctreeSectionPos>,
     /// Section Ys holding G4 voxels per block column, so a re-sample can clear its old column.
     distant_column_ys: HashMap<(i32, i32), BTreeSet<i32>>,
     dirty: HashSet<OctreeSectionPos>,
@@ -136,9 +164,60 @@ impl OctreeIngestStore {
         self.sections.get(&pos)
     }
 
-    /// Every stored section position, for a full re-mesh.
+    /// Set the dimension's build height as a half-open range in world blocks.
+    pub fn set_y_bounds(&mut self, bounds: (i32, i32)) {
+        if self.y_bounds.replace(bounds) == Some(bounds) {
+            return;
+        }
+        for &(detail, x, z) in &self.complete_column_stacks {
+            let edge = (SECTION_EDGE as i32) << detail;
+            self.dirty.extend(
+                (bounds.0.div_euclid(edge)..=(bounds.1 - 1).div_euclid(edge))
+                    .map(|y| OctreeSectionPos::new(detail, x, y, z)),
+            );
+        }
+    }
+
+    pub fn y_bounds(&self) -> Option<(i32, i32)> {
+        self.y_bounds
+    }
+
+    /// Whether this section's own bytes are complete, independent of descendant residency.
+    pub fn is_section_complete(&self, pos: OctreeSectionPos) -> bool {
+        self.adopted.contains(&pos)
+            || if pos.detail == 0 {
+                self.covered_subchunks.get(&pos).is_some_and(|&covered| {
+                    covered | self.out_of_build_height_subchunk_mask(pos) == u8::MAX
+                })
+            } else {
+                self.complete_mips.contains(&pos)
+                    || (self
+                        .complete_column_stacks
+                        .contains(&(pos.detail, pos.x, pos.z))
+                        && self.y_bounds.map_or_else(
+                            || self.sections.contains_key(&pos),
+                            |bounds| !is_out_of_build_height(pos, bounds),
+                        ))
+            }
+    }
+
+    fn out_of_build_height_subchunk_mask(&self, pos: OctreeSectionPos) -> u8 {
+        let Some(bounds) = self.y_bounds else {
+            return 0;
+        };
+        let y0 = i64::from(pos.y) * SECTION_EDGE as i64;
+        let size = VANILLA_SECTION as i64;
+        (u8::from(outside_y_bounds(y0, size, bounds)) * 0x0f)
+            | (u8::from(outside_y_bounds(y0 + size, size, bounds)) * 0xf0)
+    }
+
+    /// Stored sections and meshless proven air, for a full re-mesh.
     pub fn section_positions(&self) -> Vec<OctreeSectionPos> {
-        self.sections.keys().copied().collect()
+        self.sections
+            .keys()
+            .chain(&self.meshless_air)
+            .copied()
+            .collect()
     }
 
     pub fn source_of(&self, chunk: [i32; 2]) -> Option<IngestSource> {
@@ -179,6 +258,7 @@ impl OctreeIngestStore {
     }
 
     fn write(&mut self, pos: OctreeSectionPos, f: impl FnOnce(&mut OctreeSection)) {
+        self.meshless_air.remove(&pos);
         let section = self
             .sections
             .entry(pos)
@@ -186,155 +266,350 @@ impl OctreeIngestStore {
         let before = section.revision;
         f(section);
         if section.revision != before {
+            // A cache record proves its own bytes, not a later partial source write.
+            self.adopted.remove(&pos);
+            self.complete_mips.remove(&pos);
             self.dirty.insert(pos);
         }
     }
 
     /// Insert a section loaded from disk or the network when nothing newer holds its position.
     /// Not marked dirty: the caller queues it for meshing.
-    pub fn adopt_section(&mut self, section: OctreeSection) -> bool {
+    pub fn adopt_section(&mut self, section: OctreeSection, complete: bool) -> bool {
+        if self.meshless_air.contains(&section.pos)
+            || self.complete_column_stacks.contains(&(
+                section.pos.detail,
+                section.pos.x,
+                section.pos.z,
+            ))
+        {
+            return false;
+        }
         match self.sections.entry(section.pos) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
+                if complete {
+                    self.adopted.insert(section.pos);
+                }
                 slot.insert(section);
                 true
             }
         }
     }
 
-    /// Replace a section with a newer copy from the server. Not marked dirty.
+    /// Replace a section with a newer copy from the server, which carries no coverage proof.
+    /// Not marked dirty: the caller queues it for meshing.
     pub fn replace_section(&mut self, section: OctreeSection) {
+        let pos = section.pos;
+        self.adopted.remove(&pos);
+        self.complete_mips.remove(&pos);
+        self.covered_subchunks.remove(&pos);
+        let stack = (pos.detail, pos.x, pos.z);
+        self.complete_column_stacks.remove(&stack);
+        self.partial_column_stacks.remove(&stack);
+        self.meshless_air.remove(&pos);
         self.sections.insert(section.pos, section);
     }
 
-    /// G4 at a coarse step: a sample covering `2^level` blocks is exactly one voxel of a level-`level`
-    /// section, so it is written there directly (no detail-0 expansion, no mip propagation: the
-    /// generator supplies every level itself). Columns whose chunk a loaded or saved source owns
-    /// are skipped. Returns the sections written.
-    pub fn ingest_coarse_columns<B: Copy + Eq + Hash>(
+    /// Column coverage of the four horizontal octree stacks under one scheduler leaf,
+    /// in x-fastest order. A full-height set of adopted rows also covers the stack.
+    pub(crate) fn coarse_coverage(&self, pos: crate::lod::SectionPos) -> [[u64; 16]; 4] {
+        let detail = pos.detail;
+        let span = (SECTION_EDGE as i32) << detail;
+        std::array::from_fn(|i| {
+            let x = pos.x * 2 + (i % 2) as i32;
+            let z = pos.z * 2 + (i / 2) as i32;
+            let stack = (detail, x, z);
+            if self.complete_column_stacks.contains(&stack)
+                || self.y_bounds.is_some_and(|(lo, hi)| {
+                    (lo.div_euclid(span)..=(hi - 1).div_euclid(span)).all(|y| {
+                        self.adopted
+                            .contains(&OctreeSectionPos::new(detail, x, y, z))
+                    })
+                })
+            {
+                [u64::MAX; 16]
+            } else {
+                self.partial_column_stacks
+                    .get(&stack)
+                    .map_or([0; 16], |words| **words)
+            }
+        })
+    }
+
+    /// Write each G4 sample as one voxel column at its target detail, without expanding it to
+    /// detail 0. A loaded or saved chunk supplies the columns entirely within its footprint,
+    /// even when the corresponding G4 sample is absent. Returns whether a column cannot
+    /// be sampled from the available sources at this detail.
+    pub(crate) fn ingest_coarse_columns<'a, B>(
         &mut self,
         level: u8,
-        columns: &[DistantColumn<'_, B>],
-        water_block: u32,
-        subsurface_block: u32,
+        columns: impl IntoIterator<Item = DistantSample<'a, B>>,
+        (water_block, subsurface_block): (u32, u32),
         block_id: &mut dyn FnMut(B) -> u32,
         biome_id: &mut dyn FnMut(&str) -> u16,
-    ) -> Vec<OctreeSectionPos> {
+        opacity: &dyn Fn(u32) -> u8,
+    ) -> bool {
+        let mut unavailable = false;
         let edge = SECTION_EDGE as i32;
-        let mut touched = HashSet::new();
-        let mut fill_span = |store: &mut Self, vx: i32, vz: i32, y0: i32, y1: i32, voxel: Voxel| {
-            if y0 >= y1 {
-                return;
+        let bounds = self
+            .y_bounds
+            .map(|(lo, hi)| (lo >> level, (hi - 1) >> level));
+        // Without build height, limit coverage to rows backed by voxel data. Still clear older
+        // terrain in those rows so an updated coarse sample describes the entire column there.
+        let mut observed = HashMap::<(i32, i32), (i32, i32)>::new();
+        if bounds.is_none() {
+            for pos in self.sections.keys().filter(|p| p.detail == level) {
+                let lo = pos.y * edge;
+                let hi = lo + edge - 1;
+                let span = observed.entry((pos.x, pos.z)).or_insert((lo, hi));
+                *span = (span.0.min(lo), span.1.max(hi));
             }
+        }
+        for column in columns {
+            let (bx, bz, sample) = match column {
+                DistantSample::Surface(col) => (col.x, col.z, Some(col)),
+                DistantSample::NoSurface(x, z) => (x, z, None),
+            };
+            let owned = matches!(
+                self.source_of([bx >> 4, bz >> 4]),
+                Some(IngestSource::Loaded | IngestSource::Saved)
+            );
+            let (vx, vz) = (bx >> level, bz >> level);
             let (sx, sz) = (vx.div_euclid(edge), vz.div_euclid(edge));
             let (lx, lz) = (vx.rem_euclid(edge) as usize, vz.rem_euclid(edge) as usize);
-            let sy0 = y0.div_euclid(edge);
-            let sy1 = (y1 - 1).div_euclid(edge);
-            for sy in sy0..=sy1 {
-                let pos = OctreeSectionPos::new(level, sx, sy, sz);
-                let sec_y0 = sy * edge;
-                let ly0 = (y0 - sec_y0).max(0) as usize;
-                let ly1 = (y1 - sec_y0).min(edge) as usize;
-                let section = store
-                    .sections
-                    .entry(pos)
-                    .or_insert_with(|| OctreeSection::new(pos));
-                section.fill_column(lx, lz, ly0, ly1, voxel);
-                touched.insert(pos);
-            }
-        };
-        for col in columns {
-            if self
-                .chunk_sources
-                .get(&[col.x >> 4, col.z >> 4])
-                .is_some_and(|&s| s > IngestSource::Distant)
-            {
-                continue;
-            }
-            let id = block_id(col.block);
-            if id == 0 {
-                continue;
-            }
-            let sub_id = if subsurface_block != 0 {
-                subsurface_block
+            let (lo, hi) = if owned {
+                // At supported details the aligned voxel fits in one chunk. Loaded/saved
+                // snapshots cover its full height. Reuse the same mip rule on its D0 samples:
+                // normal propagation may have retained a cached octant instead of replacing
+                // it from a dirty but incomplete D0 section.
+                if level > MAX_OCTREE_DETAIL {
+                    // The legacy scheduler can request wider footprints than the octree
+                    // supports. A single authoritative chunk cannot supply these columns.
+                    unavailable = true;
+                    continue;
+                }
+                let Some((lo, hi)) = bounds else { continue };
+                let (source_x, source_z) = (bx.div_euclid(edge), bz.div_euclid(edge));
+                let x = bx.rem_euclid(edge) as usize >> level;
+                let z = bz.rem_euclid(edge) as usize >> level;
+                for sy in lo.div_euclid(edge)..=hi.div_euclid(edge) {
+                    let pos = OctreeSectionPos::new(level, sx, sy, sz);
+                    let base = sy * edge;
+                    let first = lo.max(base);
+                    let last = hi.min(base + edge - 1);
+                    let mut voxels = [Voxel::AIR; SECTION_EDGE];
+                    let start = (first - base) as usize;
+                    let end = (last - base) as usize + 1;
+                    for (y, voxel) in (first..=last).zip(&mut voxels[start..end]) {
+                        let by = y << level;
+                        let source =
+                            OctreeSectionPos::new(0, source_x, by.div_euclid(edge), source_z);
+                        if let Some(section) = self.section(source) {
+                            *voxel = Self::mip_voxel(
+                                section,
+                                level,
+                                x,
+                                by.rem_euclid(edge) as usize >> level,
+                                z,
+                                opacity,
+                            );
+                        }
+                    }
+                    if self.sections.contains_key(&pos)
+                        || voxels[start..end].iter().any(|&v| v != Voxel::AIR)
+                    {
+                        self.write(pos, |s| {
+                            for (ly, &voxel) in (start..end).zip(&voxels[start..end]) {
+                                s.set(lx, ly, lz, voxel);
+                            }
+                        });
+                    }
+                }
+                (lo, hi)
             } else {
-                id
+                let Some(col) = sample else {
+                    // Dev 2 also returns None for custom terrain without a noise surface.
+                    // Preserve existing bytes rather than interpreting this as sampled air.
+                    unavailable = true;
+                    continue;
+                };
+                let id = block_id(col.block);
+                if id == 0 {
+                    continue;
+                }
+                let sub_id = if subsurface_block != 0 {
+                    subsurface_block
+                } else {
+                    id
+                };
+                let biome = biome_id(col.biome);
+                let height = col.height >> level;
+                let bottom = height.min(DISTANT_SOLID_FLOOR >> level);
+                let water_top = col.water.map(|w| w >> level).filter(|&w| w > height);
+                let top = water_top.unwrap_or(height);
+                let sky_top = top + edge;
+                let (lo, hi) = bounds.unwrap_or_else(|| {
+                    let lo = bottom.div_euclid(edge) * edge;
+                    let hi = sky_top.div_euclid(edge) * edge + edge - 1;
+                    let span = observed.entry((sx, sz)).or_insert((lo, hi));
+                    *span = (span.0.min(lo), span.1.max(hi));
+                    *span
+                });
+                let mut fill_span = |y0: i32, y1: i32, voxel: Voxel| {
+                    let (y0, y1) = (y0.max(lo), y1.min(hi + 1));
+                    if y0 >= y1 {
+                        return;
+                    }
+                    for sy in y0.div_euclid(edge)..=(y1 - 1).div_euclid(edge) {
+                        let pos = OctreeSectionPos::new(level, sx, sy, sz);
+                        if voxel == Voxel::AIR && !self.sections.contains_key(&pos) {
+                            continue;
+                        }
+                        let sec_y0 = sy * edge;
+                        let ly0 = (y0 - sec_y0).max(0) as usize;
+                        let ly1 = (y1 - sec_y0).min(edge) as usize;
+                        self.write(pos, |s| s.fill_column(lx, lz, ly0, ly1, voxel));
+                    }
+                };
+                fill_span(lo, bottom, Voxel::AIR);
+                fill_span(bottom, height, Voxel::new(sub_id, biome, 15, 0));
+                fill_span(height, height + 1, Voxel::new(id, biome, 15, 0));
+                if let Some(w) = water_top {
+                    for y in (height + 1)..=w {
+                        let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
+                        fill_span(y, y + 1, Voxel::new(water_block, biome, sky, 0));
+                    }
+                }
+                fill_span(top + 1, sky_top + 1, Voxel::air_with_light(15, 0));
+                fill_span(sky_top + 1, hi + 1, Voxel::AIR);
+                (lo, hi)
             };
-            let biome = biome_id(col.biome);
-            let (vx, vz) = (col.x >> level, col.z >> level);
-            let height = col.height >> level;
-            let bottom = height.min(DISTANT_SOLID_FLOOR >> level);
-            let water_top = col.water.map(|w| w >> level).filter(|&w| w > height);
-            let top = water_top.unwrap_or(height);
-            fill_span(
-                self,
-                vx,
-                vz,
-                bottom,
-                height,
-                Voxel::new(sub_id, biome, 15, 0),
-            );
-            fill_span(
-                self,
-                vx,
-                vz,
-                height,
-                height + 1,
-                Voxel::new(id, biome, 15, 0),
-            );
-            if let Some(w) = water_top {
-                for y in (height + 1)..=w {
-                    let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
-                    fill_span(
-                        self,
-                        vx,
-                        vz,
-                        y,
-                        y + 1,
-                        Voxel::new(water_block, biome, sky, 0),
+
+            let stack = (level, sx, sz);
+            if !self.complete_column_stacks.contains(&stack) {
+                let words = self.partial_column_stacks.entry(stack).or_default();
+                let bit = lx + lz * SECTION_EDGE;
+                words[bit / 64] |= 1 << (bit % 64);
+                if words.iter().all(|&word| word == u64::MAX) {
+                    self.partial_column_stacks.remove(&stack);
+                    self.complete_column_stacks.insert(stack);
+                    let sections = &self.sections;
+                    self.dirty.extend(
+                        (lo.div_euclid(edge)..=hi.div_euclid(edge))
+                            .map(|sy| OctreeSectionPos::new(level, sx, sy, sz))
+                            .filter(|pos| bounds.is_some() || sections.contains_key(pos)),
                     );
                 }
             }
-            // Open sky above the surface (see `ingest_distant_columns`).
-            fill_span(
-                self,
-                vx,
-                vz,
-                top + 1,
-                top + edge + 1,
-                Voxel::air_with_light(15, 0),
-            );
         }
-        touched.into_iter().collect()
+        unavailable
     }
 
-    /// Rebuild every ancestor of the dirty detail-0 sections up to `MAX_OCTREE_DETAIL` through
-    /// `downsample_2x2x2` (`FullDataSourceV2.java:605-616`). Returns every touched position, the
-    /// dirty detail-0 sections first. `opacity` is `Mapper.getBlockStateOpacity`.
-    pub fn propagate_dirty(&mut self, opacity: &dyn Fn(u32) -> u8) -> Vec<OctreeSectionPos> {
-        let mut level: BTreeSet<OctreeSectionPos> =
-            std::mem::take(&mut self.dirty).into_iter().collect();
-        let mut touched: Vec<OctreeSectionPos> = level.iter().copied().collect();
-        for _ in 1..=MAX_OCTREE_DETAIL {
-            let parents: BTreeSet<OctreeSectionPos> =
-                level.iter().filter_map(|p| p.parent()).collect();
-            for parent in &parents {
-                let Some(kids) = parent.children() else {
-                    continue;
-                };
-                let merged = {
-                    let refs: [Option<&OctreeSection>; 8] = kids.map(|k| self.sections.get(&k));
-                    downsample_2x2x2_onto(*parent, self.sections.get(parent), &refs, opacity)
-                };
-                if merged.is_empty() && !self.sections.contains_key(parent) {
-                    continue;
-                }
-                self.sections.insert(*parent, merged);
-            }
-            touched.extend(parents.iter().copied());
-            level = parents;
+    /// Reduce an aligned footprint of authoritative D0 voxels with the regular mip rule.
+    fn mip_voxel(
+        section: &OctreeSection,
+        detail: u8,
+        x: usize,
+        y: usize,
+        z: usize,
+        opacity: &dyn Fn(u32) -> u8,
+    ) -> Voxel {
+        if detail == 0 {
+            return section.get(x, y, z);
         }
-        touched
+        mip_voxels(
+            std::array::from_fn(|i| {
+                Self::mip_voxel(
+                    section,
+                    detail - 1,
+                    x * 2 + (i >> 2),
+                    y * 2 + ((i >> 1) & 1),
+                    z * 2 + (i & 1),
+                    opacity,
+                )
+            }),
+            opacity,
+        )
+    }
+
+    /// Rebuild ancestors of dirty detail-0 sections, and return every touched position once.
+    /// Direct coarse samples are already at the target detail: do not create new coarse-only
+    /// fallback meshes above them, which could hide them while unrelated octants are missing.
+    pub fn propagate_dirty(&mut self, opacity: &dyn Fn(u32) -> u8) -> Vec<OctreeSectionPos> {
+        let mut touched: BTreeSet<_> = self.dirty.drain().collect();
+        let mut dirty: BTreeSet<_> = touched.iter().copied().filter(|p| p.detail == 0).collect();
+        for _ in 1..=MAX_OCTREE_DETAIL {
+            if dirty.is_empty() {
+                break;
+            }
+            let parents: BTreeSet<_> = dirty.iter().filter_map(|pos| pos.parent()).collect();
+            let mut updated = BTreeSet::new();
+            for parent in parents {
+                let stack = (parent.detail, parent.x, parent.z);
+                let preserve = self.adopted.contains(&parent)
+                    || self.complete_column_stacks.contains(&stack)
+                    || self.partial_column_stacks.contains_key(&stack);
+                let children = parent.children().unwrap();
+                let outside = children.map(|child| {
+                    self.y_bounds
+                        .is_some_and(|b| is_out_of_build_height(child, b))
+                });
+                let complete: [bool; 8] =
+                    std::array::from_fn(|i| outside[i] || self.is_section_complete(children[i]));
+                let use_child: [bool; 8] = std::array::from_fn(|i| {
+                    !outside[i] && (!preserve || (dirty.contains(&children[i]) && complete[i]))
+                });
+                let rebuild_all = (0..8).all(|i| outside[i] || (use_child[i] && complete[i]));
+                if preserve && !use_child.into_iter().any(|use_it| use_it) {
+                    continue; // No complete dirty child can replace any of the fallback bytes.
+                }
+                let existing = self.sections.get(&parent);
+                let air = existing.map(|_| OctreeSection::new(parent));
+                let refs = std::array::from_fn(|i| {
+                    if use_child[i] {
+                        self.sections.get(&children[i]).or(if complete[i] {
+                            air.as_ref()
+                        } else {
+                            None
+                        })
+                    } else if outside[i] && (!preserve || rebuild_all) {
+                        air.as_ref()
+                    } else {
+                        None
+                    }
+                });
+                if refs.iter().any(Option::is_some) {
+                    let merged = downsample_2x2x2_onto(parent, existing, &refs, opacity);
+                    if !merged.is_empty() || existing.is_some() {
+                        self.sections.insert(parent, merged);
+                    }
+                }
+                // If all children are resolved but none have storage, the rebuilt mip stays
+                // implicit air. Retained fallback octants do not acquire a new mip proof.
+                if rebuild_all && !outside.into_iter().all(|outside| outside) {
+                    self.complete_mips.insert(parent);
+                } else {
+                    self.complete_mips.remove(&parent);
+                }
+                updated.insert(parent);
+            }
+            touched.extend(updated.iter().copied());
+            dirty = updated;
+        }
+        for &pos in &touched {
+            if !self.sections.contains_key(&pos)
+                && self.is_section_complete(pos)
+                && !self
+                    .y_bounds
+                    .is_some_and(|b| is_out_of_build_height(pos, b))
+            {
+                self.meshless_air.insert(pos);
+            } else {
+                self.meshless_air.remove(&pos);
+            }
+        }
+        touched.into_iter().collect()
     }
 }
 
@@ -365,24 +640,39 @@ pub fn ingest_chunk_culled<S: ChunkVoxelSource>(
     block_id: &mut dyn FnMut(S::Block) -> u32,
     biome_id: &mut dyn FnMut(&str) -> u16,
 ) -> bool {
-    if !store.accept(chunk, src) {
+    let count = snap.section_count();
+    if count == 0 || !store.accept(chunk, src) {
         return false;
     }
     let edge = SECTION_EDGE as i32;
     let (ox, oz) = (chunk[0] * 16, chunk[1] * 16);
     let (sx, sz) = (ox.div_euclid(edge), oz.div_euclid(edge));
     let (off_x, off_z) = (ox.rem_euclid(edge) as usize, oz.rem_euclid(edge) as usize);
+    let min_y = snap.min_y();
+    store.set_y_bounds((min_y, min_y + (count * VANILLA_SECTION) as i32));
 
     // Top-down: air above a column's highest block sees the open sky, whatever lighting says (a
     // chunk that is not lit yet reads 0, which draws every face beside it black).
     let mut open = [true; VANILLA_SECTION * VANILLA_SECTION];
-    for index in (0..snap.section_count()).rev() {
-        let y0 = snap.min_y() + (index * VANILLA_SECTION) as i32;
-        if cull_distant_underground && y0 + VANILLA_SECTION as i32 <= DISTANT_SOLID_FLOOR {
+    for index in (0..count).rev() {
+        let y0 = min_y + (index * VANILLA_SECTION) as i32;
+        if src == IngestSource::Distant
+            && cull_distant_underground
+            && y0 + VANILLA_SECTION as i32 <= DISTANT_SOLID_FLOOR
+        {
             continue;
         }
         let pos = OctreeSectionPos::new(0, sx, y0.div_euclid(edge), sz);
         let off_y = y0.rem_euclid(edge) as usize;
+        // Sampled air counts too, even when no voxel write or revision follows.
+        let bit = 1u8 << child_index(off_x >> 4, off_y >> 4, off_z >> 4);
+        let outside = store.out_of_build_height_subchunk_mask(pos);
+        let covered = store.covered_subchunks.entry(pos).or_default();
+        let before = *covered | outside;
+        *covered |= bit;
+        if before != u8::MAX && (*covered | outside) == u8::MAX {
+            store.dirty.insert(pos);
+        }
 
         let uniform = snap.section_uniform_block(index);
         let uniform_id = uniform.map(&mut *block_id);
@@ -569,8 +859,10 @@ mod tests {
     const WATER: u32 = 4;
     const DIRT: u32 = 5;
 
-    /// 4 sections tall chunk (y 0..64) backed by a sparse map.
+    /// A chunk backed by a sparse map (defaults to y 0..64).
     struct MockChunk {
+        min_y: i32,
+        section_count: usize,
         blocks: HashMap<(usize, i32, usize), u32>,
         block_calls: Cell<usize>,
     }
@@ -578,6 +870,8 @@ mod tests {
     impl MockChunk {
         fn new() -> Self {
             Self {
+                min_y: 0,
+                section_count: 4,
                 blocks: HashMap::new(),
                 block_calls: Cell::new(0),
             }
@@ -590,13 +884,14 @@ mod tests {
     impl ChunkVoxelSource for MockChunk {
         type Block = u32;
         fn min_y(&self) -> i32 {
-            0
+            self.min_y
         }
         fn section_count(&self) -> usize {
-            4
+            self.section_count
         }
         fn section_uniform_block(&self, index: usize) -> Option<u32> {
-            let (lo, hi) = (index as i32 * 16, index as i32 * 16 + 16);
+            let lo = self.min_y + index as i32 * 16;
+            let hi = lo + 16;
             let any = self.blocks.keys().any(|&(_, y, _)| y >= lo && y < hi);
             if any { None } else { Some(0) }
         }
@@ -702,6 +997,297 @@ mod tests {
         ingest(&mut store, [0, 0], &empty, IngestSource::Loaded);
         assert!(store.voxel_at(1, 50, 1).is_air());
         assert_eq!(empty.block_calls.get(), 0);
+    }
+
+    #[test]
+    fn section_coverage_requires_all_four_chunks_or_adoption() {
+        let mut store = OctreeIngestStore::new();
+        let pos = OctreeSectionPos::new(0, -1, 0, -1);
+        let air = MockChunk::new();
+        assert!(ingest(&mut store, [-2, -2], &air, IngestSource::Loaded));
+        assert!(store.section(pos).unwrap().is_empty());
+        assert!(!store.is_section_complete(pos));
+
+        // One distant column cannot vouch for the rest of its chunk.
+        ingest_distant_columns(
+            &mut store,
+            &[column(-1, -1, 0, None, STONE)],
+            WATER,
+            STONE,
+            &mut |b| b,
+            &mut |_| 0,
+        );
+        for chunk in [[-2, -1], [-1, -2]] {
+            assert!(ingest(&mut store, chunk, &air, IngestSource::Loaded));
+            assert!(!store.is_section_complete(pos));
+        }
+        assert!(ingest(&mut store, [-1, -1], &air, IngestSource::Loaded));
+        assert!(store.is_section_complete(pos));
+        assert!(!store.is_section_complete(pos.parent().unwrap()));
+
+        let parent = pos.parent().unwrap();
+        for child in parent.children().unwrap() {
+            if !store.is_section_complete(child) {
+                assert!(store.adopt_section(OctreeSection::new(child), true));
+            }
+        }
+        assert!(!store.is_section_complete(parent));
+        assert!(store.propagate_dirty(&|_| 15).contains(&parent));
+        assert!(store.is_section_complete(parent));
+        store.replace_section(OctreeSection::new(parent));
+        assert!(!store.is_section_complete(parent));
+    }
+
+    #[test]
+    fn persisted_coverage_survives_decode_and_adoption() {
+        use crate::storage::{
+            DEFAULT_OCTREE_COMPRESSION, OctreeMapping, decode_octree_section, encode_octree_section,
+        };
+
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let mut snap = MockChunk::new();
+        snap.put(0, 0, 0, STONE);
+        let mut source = OctreeIngestStore::new();
+        for (chunks, expected_complete) in [
+            (&[[0, 0]][..], false),
+            (&[[1, 0], [0, 1], [1, 1]][..], true),
+        ] {
+            for &chunk in chunks {
+                assert!(ingest(&mut source, chunk, &snap, IngestSource::Loaded));
+            }
+            let section = source.section(pos).unwrap();
+            assert!(!section.is_empty());
+            assert_eq!(source.is_section_complete(pos), expected_complete);
+            let record = encode_octree_section(
+                section,
+                &OctreeMapping::default(),
+                source.is_section_complete(pos),
+                DEFAULT_OCTREE_COMPRESSION,
+            )
+            .unwrap();
+            let (decoded, _, complete) = decode_octree_section(&record).unwrap();
+            assert_eq!(decoded.to_dense(), section.to_dense());
+            let mut reopened = OctreeIngestStore::new();
+            assert!(reopened.adopt_section(decoded, complete));
+            assert_eq!(reopened.is_section_complete(pos), expected_complete);
+        }
+    }
+
+    #[test]
+    fn adopted_parent_keeps_cached_octant_until_its_child_is_complete() {
+        use crate::storage::{
+            DEFAULT_OCTREE_COMPRESSION, OctreeMapping, decode_octree_section, encode_octree_section,
+        };
+
+        let parent = OctreeSectionPos::new(1, 0, 0, 0);
+        let child = parent.children().unwrap()[0];
+        let cached = OctreeSection::filled(parent, Voxel::new(STONE, 7, 15, 0));
+        let mapping = OctreeMapping::default();
+        let record =
+            encode_octree_section(&cached, &mapping, true, DEFAULT_OCTREE_COMPRESSION).unwrap();
+        let (section, _, complete) = decode_octree_section(&record).unwrap();
+        let mut store = OctreeIngestStore::new();
+        assert!(store.adopt_section(section, complete));
+
+        let air = MockChunk::new();
+        assert!(ingest(&mut store, [0, 0], &air, IngestSource::Loaded));
+        assert!(!store.is_section_complete(child));
+        assert!(!store.propagate_dirty(&|_| 15).contains(&parent));
+        let kept = store.section(parent).unwrap();
+        assert_eq!(kept.revision, cached.revision);
+        assert_eq!(kept.to_dense(), cached.to_dense());
+        assert!(store.is_section_complete(parent));
+
+        for chunk in [[1, 0], [0, 1]] {
+            assert!(ingest(&mut store, chunk, &air, IngestSource::Loaded));
+        }
+        let mut terrain = MockChunk::new();
+        terrain.put(0, 0, 0, DIRT);
+        assert!(ingest(&mut store, [1, 1], &terrain, IngestSource::Loaded));
+        assert!(store.is_section_complete(child));
+        assert!(store.propagate_dirty(&|_| 15).contains(&parent));
+        let merged = store.section(parent).unwrap();
+        assert!(merged.get(0, 0, 0).is_air());
+        assert_eq!(merged.get(8, 0, 8).block_id(), DIRT);
+        for (x, z) in [(16, 0), (0, 16), (16, 16)] {
+            assert_eq!(merged.get(x, 0, z), cached.get(x, 0, z));
+        }
+        let record = encode_octree_section(
+            merged,
+            &mapping,
+            store.is_section_complete(parent),
+            DEFAULT_OCTREE_COMPRESSION,
+        )
+        .unwrap();
+        let (saved, _, complete) = decode_octree_section(&record).unwrap();
+        assert!(complete);
+        assert_eq!(saved.to_dense(), merged.to_dense());
+    }
+
+    #[test]
+    fn partial_direct_writes_invalidate_the_cached_proof() {
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let cached = OctreeSection::filled(pos, Voxel::new(STONE, 7, 15, 0));
+        let mut store = OctreeIngestStore::new();
+        assert!(store.adopt_section(cached.clone(), true));
+        assert!(ingest(
+            &mut store,
+            [0, 0],
+            &MockChunk::new(),
+            IngestSource::Loaded
+        ));
+        assert!(!store.is_section_complete(pos));
+
+        let mut store = OctreeIngestStore::new();
+        assert!(store.adopt_section(cached, true));
+        let columns = [column(0, 0, 5, None, DIRT)];
+        assert_eq!(
+            ingest_distant_columns(&mut store, &columns, WATER, STONE, &mut |b| b, &mut |_| 7),
+            1
+        );
+        assert!(!store.is_section_complete(pos));
+
+        let coarse = pos.parent().unwrap();
+        assert!(store.adopt_section(
+            OctreeSection::filled(coarse, Voxel::new(STONE, 7, 15, 0)),
+            true
+        ));
+        store.ingest_coarse_columns(
+            1,
+            columns.map(DistantSample::Surface),
+            (WATER, STONE),
+            &mut |b| b,
+            &mut |_| 7,
+            &|_| 15,
+        );
+        assert!(!store.is_section_complete(coarse));
+    }
+
+    #[test]
+    fn coarse_column_uses_saved_snapshot_under_a_retained_octant() {
+        let mut store = OctreeIngestStore::new();
+        let pos = OctreeSectionPos::new(1, 0, 0, 0);
+        assert!(store.adopt_section(
+            OctreeSection::filled(pos, Voxel::new(STONE, 0, 15, 0)),
+            true,
+        ));
+        let mut saved = MockChunk::new();
+        saved.put(0, 0, 0, LOG);
+        assert!(ingest(&mut store, [0, 0], &saved, IngestSource::Saved));
+        assert!(!store.propagate_dirty(&|_| 15).contains(&pos));
+        assert_eq!(store.section(pos).unwrap().get(0, 0, 0).block_id(), STONE);
+
+        store.ingest_coarse_columns(
+            1,
+            [DistantSample::Surface(column(0, 0, 8, None, DIRT))],
+            (WATER, STONE),
+            &mut |_| panic!("G4 must not replace the saved column"),
+            &mut |_| 0,
+            &|_| 15,
+        );
+        let merged = store.section(pos).unwrap();
+        assert_eq!(merged.get(0, 0, 0).block_id(), LOG);
+        assert!(merged.get(0, 1, 0).is_air());
+        assert_eq!(merged.get(1, 0, 0).block_id(), STONE);
+        assert!(!store.is_section_complete(pos));
+    }
+
+    #[test]
+    fn adopted_coarse_stack_only_covers_cells_when_every_in_bounds_row_is_proven() {
+        let mut store = OctreeIngestStore::new();
+        let leaf = crate::lod::SectionPos::new(1, -1, 0);
+        store.set_y_bounds((-64, 64));
+        for (y, expected) in [(-1, [0; 16]), (0, [u64::MAX; 16])] {
+            let pos = OctreeSectionPos::new(1, -2, y, 0);
+            assert!(store.adopt_section(OctreeSection::new(pos), true));
+            assert_eq!(
+                store.coarse_coverage(leaf),
+                [expected, [0; 16], [0; 16], [0; 16]]
+            );
+        }
+    }
+
+    #[test]
+    fn coarse_stack_counts_distinct_columns_and_uses_actual_build_height() {
+        let pos = OctreeSectionPos::new(1, -1, 0, -1);
+        let upper_air = OctreeSectionPos::new(1, -1, 4, -1);
+        let stack = (pos.detail, pos.x, pos.z);
+        let cols: Vec<_> = (-32..0)
+            .flat_map(|z| (-32..0).map(move |x| column(x * 2, z * 2, 4, None, STONE)))
+            .collect();
+        let mut store = OctreeIngestStore::new();
+        let ingest_coarse = |store: &mut OctreeIngestStore, cols: &[DistantColumn<'_, u32>]| {
+            store.ingest_coarse_columns(
+                1,
+                cols.iter().copied().map(DistantSample::Surface),
+                (WATER, STONE),
+                &mut |b| b,
+                &mut |_| 0,
+                &|_| 15,
+            );
+        };
+        ingest_coarse(&mut store, &cols[..1023]);
+        ingest_coarse(&mut store, &cols[..1]);
+        assert!(store.partial_column_stacks.contains_key(&stack));
+        assert!(!store.is_section_complete(pos));
+        ingest_coarse(&mut store, &cols[1023..]);
+        assert!(!store.partial_column_stacks.contains_key(&stack));
+        assert!(store.is_section_complete(pos));
+        assert!(!store.is_section_complete(upper_air));
+        assert!(!store.propagate_dirty(&|_| 15).contains(&upper_air));
+
+        store.set_y_bounds((-64, 320));
+        assert!(store.is_section_complete(upper_air));
+        assert!(store.section(upper_air).is_none());
+        assert!(store.propagate_dirty(&|_| 15).contains(&upper_air));
+        assert!(store.section_positions().contains(&upper_air));
+    }
+
+    #[test]
+    fn skipped_g4_slabs_do_not_complete_underground_sections() {
+        let mut snap = MockChunk::new();
+        snap.min_y = -64;
+        snap.section_count = 24;
+        snap.put(0, -32, 0, STONE);
+        let pos = OctreeSectionPos::new(0, 0, -1, 0);
+        let mut store = OctreeIngestStore::new();
+        assert!(ingest(&mut store, [0, 0], &snap, IngestSource::Loaded));
+        let neighbors = [[1, 0], [0, 1], [1, 1]];
+        for chunk in neighbors {
+            assert!(ingest_chunk_culled(
+                &mut store,
+                chunk,
+                &snap,
+                IngestSource::Distant,
+                true,
+                &mut |b| b,
+                &mut |_| 0,
+            ));
+        }
+        assert_eq!(store.y_bounds(), Some((-64, 320)));
+        assert!(store.is_section_complete(OctreeSectionPos::new(0, 0, 0, 0)));
+        assert!(!store.is_section_complete(pos));
+        for chunk in neighbors {
+            assert!(ingest(&mut store, chunk, &snap, IngestSource::Loaded));
+        }
+        assert!(store.is_section_complete(pos));
+    }
+
+    #[test]
+    fn sampled_air_without_voxel_writes_completes_a_boundary_leaf() {
+        let mut snap = MockChunk::new();
+        snap.min_y = 16;
+        snap.section_count = 2;
+        snap.put(0, 32, 0, STONE); // air in the lower slab takes the no-write path
+        let pos = OctreeSectionPos::new(0, 0, 0, 0);
+        let mut store = OctreeIngestStore::new();
+        for chunk in [[0, 0], [1, 0], [0, 1], [1, 1]] {
+            assert!(ingest(&mut store, chunk, &snap, IngestSource::Loaded));
+        }
+        assert!(store.section(pos).is_none());
+        assert!(store.is_section_complete(pos));
+        assert!(store.propagate_dirty(&|_| 15).contains(&pos));
+        assert!(store.section_positions().contains(&pos));
     }
 
     #[test]
