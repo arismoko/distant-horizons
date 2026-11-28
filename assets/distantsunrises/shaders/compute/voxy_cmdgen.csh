@@ -20,6 +20,7 @@ struct DrawCommand {
 
 layout(std140) uniform CmdgenParams {
     ivec4 base_section; // xyz = camera block >> 5, w = section ID high-water
+    uvec4 flags;        // x = sort_translucent (1 = classic/pack radix sort, 0 = direct OIT emit)
 };
 
 layout(std430) readonly buffer SectionBuffer { SectionMeta sections[]; };
@@ -108,11 +109,15 @@ void main() {
     uint s_east = s_west + c_west;
 
     if (c_trans != 0u) {
-        uint dist = min((uint(abs(rel.x) + abs(rel.y) + abs(rel.z)) << detail), 255u);
-        uint bucket = 255u - dist;
-        uint slot = atomicAdd(visible_count, 1u);
-        atomicAdd(bucket_counts[bucket], 1u);
-        trans_entries[slot] = uvec2(sid, bucket);
+        if (flags.x != 0u) {
+            uint dist = min((uint(abs(rel.x) + abs(rel.y) + abs(rel.z)) << detail), 255u);
+            uint bucket = 255u - dist;
+            uint slot = atomicAdd(visible_count, 1u);
+            atomicAdd(bucket_counts[bucket], 1u);
+            trans_entries[slot] = uvec2(sid, bucket);
+        } else {
+            translucent_cmds[gid] = make(s_trans, c_trans, sid, true);
+        }
     }
     opaque_cmds[o + 0u] = make(s_dbl, c_dbl, sid, c_dbl != 0u);
     opaque_cmds[o + 1u] = make(s_down, c_down, sid, c_down != 0u && rel.y > -1);
