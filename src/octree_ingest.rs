@@ -481,7 +481,7 @@ impl OctreeIngestStore {
                 let biome = biome_id(col.biome);
                 let height = col.height >> level;
                 let bottom = height.min(DISTANT_SOLID_FLOOR >> level);
-                let water_top = col.water.map(|w| w >> level).filter(|&w| w > height);
+                let water_top = col.water.filter(|&w| w > col.height).map(|w| w >> level);
                 let top = water_top.unwrap_or(height);
                 let sky_top = top + edge;
                 let (lo, hi) = bounds.unwrap_or_else(|| {
@@ -509,7 +509,13 @@ impl OctreeIngestStore {
                 };
                 fill_span(lo, bottom, Voxel::AIR);
                 fill_span(bottom, height, Voxel::new(sub_id, biome, 15, 0));
-                fill_span(height, height + 1, Voxel::new(id, biome, 15, 0));
+                // If the floor and water surface share a voxel, show water instead of floor.
+                let surface_id = if water_top == Some(height) {
+                    water_block
+                } else {
+                    id
+                };
+                fill_span(height, height + 1, Voxel::new(surface_id, biome, 15, 0));
                 if let Some(w) = water_top {
                     for y in (height + 1)..=w {
                         let sky = 15u8.saturating_sub((w - y).clamp(0, 15) as u8);
@@ -1227,6 +1233,26 @@ mod tests {
             &|_| 15,
         );
         assert!(!store.is_section_complete(coarse));
+    }
+
+    #[test]
+    fn coarse_column_keeps_water_when_floor_and_surface_share_a_voxel() {
+        let mut store = OctreeIngestStore::new();
+        let level = 4;
+        assert!(!store.ingest_coarse_columns(
+            level,
+            [DistantSample::Surface(column(0, 0, 52, Some(62), DIRT))],
+            (WATER, STONE),
+            &mut |b| b,
+            &mut |_| 7,
+            &|_| 15,
+        ));
+        let section = store
+            .section(OctreeSectionPos::new(level, 0, 0, 0))
+            .unwrap();
+        assert_eq!(section.get(0, 2, 0), Voxel::new(STONE, 7, 15, 0));
+        assert_eq!(section.get(0, 3, 0), Voxel::new(WATER, 7, 15, 0));
+        assert_eq!(section.get(0, 4, 0), Voxel::air_with_light(15, 0));
     }
 
     #[test]

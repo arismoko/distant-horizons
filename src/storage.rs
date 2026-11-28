@@ -328,12 +328,12 @@ pub fn legacy_section_path(world_dir: &Path, dimension: &str, pos: SectionPos) -
 //
 // ```text
 //  0  magic            "DHLOD003"
-//  8  format_version   u8   = 4             local record version
+//  8  format_version   u8   = 5             local record version
 //  9  compression      u8                   DTO compressionModeValue (lines 89, 132); MODE values
 // 10  detail           u8   0..=4           `OctreeSectionPos::detail` (DTO packs it in `pos` long, line 765)
 // 11  x, y, z          i32 each             rest of `OctreeSectionPos`
 // 23  revision         u64                  `OctreeSection::revision` (DTO lastModifiedUnixDateTime, line 799)
-// 31  flags            u8                   bit 0: complete source coverage (v4 only)
+// 31  flags            u8                   bit 0: complete source coverage
 // 32  data_len         u32  + data blob     DTO compressedDataByteArray (lines 75, 769-770)
 //     mapping_len      u32  + mapping blob  DTO compressedMappingByteArray (lines 86, 789-790)
 //     crc32            u32  over all preceding bytes   DTO dataChecksum (lines 73, 766)
@@ -355,15 +355,13 @@ pub fn legacy_section_path(world_dir: &Path, dimension: &str, pos: SectionPos) -
 
 /// Leading magic of a compressed octree record.
 pub const MAGIC_V3: &[u8; 8] = b"DHLOD003";
-// DHLOD003 originally used the upstream DTO version as its version byte.
-const OCTREE_FORMAT_VERSION_LEGACY_V3: u8 = 3;
-pub const OCTREE_FORMAT_VERSION: u8 = 4;
+// Reject v3 and v4 records so cached coarse terrain rebuilds with the surface water rules.
+pub const OCTREE_FORMAT_VERSION: u8 = 5;
 const OCTREE_FLAG_COMPLETE: u8 = 1;
 /// Default compressor: `Config.java` line 1688 sets `dataCompression` to `Z_STD_BLOCK` (4).
 pub const DEFAULT_OCTREE_COMPRESSION: DhV2CompressionMode = DhV2CompressionMode::ZstdBlock;
 
-const OCTREE_HEADER_BYTES_LEGACY: usize = 8 + 1 + 1 + 1 + 12 + 8;
-const OCTREE_HEADER_BYTES: usize = OCTREE_HEADER_BYTES_LEGACY + 1;
+const OCTREE_HEADER_BYTES: usize = 8 + 1 + 1 + 1 + 12 + 8 + 1;
 /// Cap on one decompressed blob. Sunrise-side memory bound: DH has none in the DTO; its widest
 /// per-string field is the `u16` length at `IDMAP` line 293, which this cap does not narrow for
 /// any realistic table (the data blob of a full 32³ section is at most about 0.5 MiB).
@@ -667,7 +665,7 @@ pub fn octree_record_crc(record: &[u8]) -> Option<u32> {
 
 /// Decode a `DHLOD003` record. The CRC32 is verified before anything is decompressed; every
 /// length, id and run is bounds-checked, and malformed input is an `Err`, never a panic.
-/// Records without a coverage field decode as incomplete.
+/// Only the current format version is supported.
 pub fn decode_octree_section(
     record: &[u8],
 ) -> Result<(OctreeSection, OctreeMapping, bool), OctreeCodecError> {
@@ -677,7 +675,7 @@ pub fn decode_octree_section(
     if record.len() > MAX_COMPRESSED_RECORD_BYTES {
         return Err(OctreeCodecError::Oversized("record"));
     }
-    if record.len() < OCTREE_HEADER_BYTES_LEGACY + 4 + 4 + 4 {
+    if record.len() < OCTREE_HEADER_BYTES + 4 + 4 + 4 {
         return Err(OctreeCodecError::Truncated);
     }
     let (body, tail) = record.split_at(record.len() - 4);
@@ -688,11 +686,10 @@ pub fn decode_octree_section(
     }
 
     let mut cur = Cursor::new(&body[8..]);
-    let has_coverage_flags = match cur.u8()? {
-        OCTREE_FORMAT_VERSION => true,
-        OCTREE_FORMAT_VERSION_LEGACY_V3 => false,
-        version => return Err(OctreeCodecError::UnsupportedFormatVersion(version)),
-    };
+    let version = cur.u8()?;
+    if version != OCTREE_FORMAT_VERSION {
+        return Err(OctreeCodecError::UnsupportedFormatVersion(version));
+    }
     let mode_byte = cur.u8()?;
     let mode = DhV2CompressionMode::from_byte(mode_byte)
         .map_err(|_| OctreeCodecError::UnknownCompression(mode_byte))?;
@@ -702,15 +699,11 @@ pub fn decode_octree_section(
     }
     let pos = OctreeSectionPos::new(detail, cur.i32()?, cur.i32()?, cur.i32()?);
     let revision = cur.u64()?;
-    let complete = if has_coverage_flags {
-        let flags = cur.u8()?;
-        if flags & !OCTREE_FLAG_COMPLETE != 0 {
-            return Err(OctreeCodecError::Corrupt("unknown coverage flags"));
-        }
-        flags & OCTREE_FLAG_COMPLETE != 0
-    } else {
-        false
-    };
+    let flags = cur.u8()?;
+    if flags & !OCTREE_FLAG_COMPLETE != 0 {
+        return Err(OctreeCodecError::Corrupt("unknown coverage flags"));
+    }
+    let complete = flags & OCTREE_FLAG_COMPLETE != 0;
     let data_len = cur.u32()? as usize;
     let data_blob = cur.take(data_len)?;
     let names_len = cur.u32()? as usize;
@@ -1420,7 +1413,7 @@ impl RegionCache {
         res
     }
 
-    /// Load one octree section; a missing, torn or corrupt slot reads as `None`.
+    /// Load one octree section; a missing, torn, corrupt or unsupported record reads as `None`.
     pub fn load_octree_section(
         &mut self,
         world_dir: &Path,
@@ -2282,7 +2275,7 @@ mod tests {
         ] {
             let bytes = encode_octree_section(&sec, &mapping, true, mode).unwrap();
             assert_eq!(&bytes[..8], MAGIC_V3);
-            assert_eq!(bytes[8], 4);
+            assert_eq!(bytes[8], 5);
             assert_eq!(bytes[9], mode as u8);
             let (back, back_map, complete) = decode_octree_section(&bytes).unwrap();
             assert_eq!(back.pos, pos, "{mode:?}");
@@ -2372,9 +2365,13 @@ mod tests {
             v[n..].copy_from_slice(&crc.to_be_bytes());
             v
         };
-        for version in [0, 1, 2, 5, u8::MAX] {
+        for version in [0, 1, 2, 3, 4, u8::MAX] {
             let mut v = good.clone();
             v[8] = version;
+            if version == 3 {
+                // Version 3 did not have a coverage flags byte.
+                v.remove(OCTREE_HEADER_BYTES - 1);
+            }
             assert_eq!(
                 decode_octree_section(&reseal(v)).unwrap_err(),
                 OctreeCodecError::UnsupportedFormatVersion(version)
@@ -2390,20 +2387,11 @@ mod tests {
         v[10] = MAX_OCTREE_DETAIL + 1;
         assert!(decode_octree_section(&reseal(v)).is_err());
         let mut v = good.clone();
-        v[OCTREE_HEADER_BYTES_LEGACY] |= 2;
+        v[OCTREE_HEADER_BYTES - 1] |= 2;
         assert_eq!(
             decode_octree_section(&reseal(v)).unwrap_err(),
             OctreeCodecError::Corrupt("unknown coverage flags")
         );
-        let mut legacy = good.clone();
-        legacy[8] = 3;
-        legacy.remove(OCTREE_HEADER_BYTES_LEGACY);
-        let (decoded, decoded_mapping, complete) = decode_octree_section(&reseal(legacy)).unwrap();
-        assert_eq!(decoded.pos, sec.pos);
-        assert_eq!(decoded.revision, sec.revision);
-        assert_eq!(decoded.to_dense(), sec.to_dense());
-        assert_eq!(decoded_mapping, mapping);
-        assert!(!complete);
         let mut v = good;
         v[OCTREE_HEADER_BYTES..OCTREE_HEADER_BYTES + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(
