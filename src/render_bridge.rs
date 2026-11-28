@@ -892,16 +892,27 @@ static FRAME: Mutex<Option<RenderFrameParams>> = Mutex::new(None);
 static PREPARED: Mutex<Vec<(mod_api::RenderLevelStage, mod_api::PreparedWorldDraw)>> =
     Mutex::new(Vec::new());
 
-/// Opaque LOD draw stage, after traversal and indirect command generation.
-pub const OPAQUE_STAGE: mod_api::RenderLevelStage = mod_api::RenderLevelStage::AfterOpaqueFeatures;
-/// With slots running before their stage's mod draws, the `AfterOpaqueFeatures` slot is too
-/// early to see opaque LOD depth. On the classic route, `AfterTranslucentFeatures` comes after
-/// opaque LODs and before vanilla water/glass, `PIPELINE_SSAO_APPLY`, and `PIPELINE_TRANSLUCENT`.
+/// Stage the plain opaque LOD draw runs in (before entities so mobs and block entities sort
+/// against far terrain on both classic and OIT routes).
+pub const OPAQUE_STAGE: mod_api::RenderLevelStage = mod_api::RenderLevelStage::AfterOpaqueBlocks;
+/// Stage after which the Dev 2 classic SSAO compute pass runs: after opaque entities and before
+/// classic translucent terrain, `PIPELINE_SSAO_APPLY`, and `PIPELINE_TRANSLUCENT`.
 pub const SSAO_AFTER_STAGE: mod_api::RenderLevelStage =
     mod_api::RenderLevelStage::AfterTranslucentFeatures;
 /// Stage of the classic or pack-bound translucent LOD draw.
 pub const TRANSLUCENT_STAGE: mod_api::RenderLevelStage =
     mod_api::RenderLevelStage::AfterTranslucentBlocks;
+
+/// Opaque LOD draw stage: `AfterOpaqueBlocks` without a shader pack (so entities sort in front),
+/// or `AfterOpaqueFeatures` under a shader pack on Dev 2 so terrain-owning packs with
+/// unblendable `colortex0` and no feature programs still reach the engine callback.
+fn opaque_stage(shader_pack_active: bool) -> mod_api::RenderLevelStage {
+    if shader_pack_active {
+        mod_api::RenderLevelStage::AfterOpaqueFeatures
+    } else {
+        OPAQUE_STAGE
+    }
+}
 
 fn translucent_stages(
     improved_transparency: bool,
@@ -936,9 +947,7 @@ pub fn setup_compute(
     improved_transparency: bool,
     graph: &mut dyn mod_api::FrameGraphContext,
 ) {
-    use mod_api::{
-        ComputePassDescriptor, DrawBindings, FrameTarget, RenderLevelStage, TextureSource,
-    };
+    use mod_api::{ComputePassDescriptor, DrawBindings, FrameTarget, TextureSource};
     // Early returns and routes without plain SSAO leave this frame unwritten.
     SSAO_WRITTEN.store(false, Ordering::Release);
     COMPUTE_DISPATCHES.store(0, Ordering::Relaxed);
@@ -1009,9 +1018,12 @@ pub fn setup_compute(
     let (base, sub) = camera_split(camera.position);
     let min_sss = SUBDIVISION_SIZE.powi(2) / (w as f32 * h as f32);
     let render_distance = frame.config.render_distance_blocks();
-    let desc = ComputePassDescriptor::new("distantsunrises:traverse_cmdgen")
-        .after_stage(RenderLevelStage::AfterOpaqueBlocks)
-        .before_stage(OPAQUE_STAGE);
+    // Traversal and command generation do not read WorldDepth, so `.before_stage(OPAQUE_STAGE)`
+    // alone places them in unconditional `BeforeWorld` (works in skyless dimensions such as the
+    // Nether) and feeds same-frame indirect draws to both `AfterOpaqueBlocks` and
+    // `AfterOpaqueFeatures` without a cycle.
+    let desc =
+        ComputePassDescriptor::new("distantsunrises:traverse_cmdgen").before_stage(OPAQUE_STAGE);
     let slices = arena.slices;
     let section_groups = [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1];
     let mut compute_dispatches = 0u32;
@@ -1268,9 +1280,10 @@ pub fn prepare_draws(
             PREPARED.lock().unwrap().push((TRANSLUCENT_STAGE, batch));
         }
     }
+    let opaque_draw_stage = opaque_stage(host.shader_pack_active());
     for (stage, plain, pack, cmds, count) in [
         (
-            OPAQUE_STAGE,
+            opaque_draw_stage,
             PIPELINE_OPAQUE,
             PIPELINE_PACK_TERRAIN,
             arena.opaque_commands,
@@ -1367,7 +1380,7 @@ pub fn prepare_draws(
             &bindings,
         )
         .with_mesh(quad_mesh);
-        let drawn = context.draw_indirect(OPAQUE_STAGE, &draw);
+        let drawn = context.draw_indirect(opaque_draw_stage, &draw);
         // Stale after proxy reconfiguration (`raw_ingress.rs:518`, sunrise-org/sunrise#6622).
         if let Err(e) = &drawn
             && is_mesh_stale(e)
@@ -1375,7 +1388,7 @@ pub fn prepare_draws(
             state.quad_mesh = None;
         }
         if let Some(batch) = report("shadow draw_indirect", drawn) {
-            PREPARED.lock().unwrap().push((OPAQUE_STAGE, batch));
+            PREPARED.lock().unwrap().push((opaque_draw_stage, batch));
         }
     }
     let counts = prepared_frame_counts(prepared_terrain_draws, sections, arena.live_sections());
@@ -1997,6 +2010,18 @@ mod tests {
         assert!(!plain_ssao_enabled(true, false, true));
         assert!(!plain_ssao_enabled(true, true, true));
         assert!(!plain_ssao_enabled(false, false, false));
+    }
+
+    #[test]
+    fn opaque_stage_draws_before_entities_without_shader_pack() {
+        assert_eq!(
+            opaque_stage(false),
+            mod_api::RenderLevelStage::AfterOpaqueBlocks
+        );
+        assert_eq!(
+            opaque_stage(true),
+            mod_api::RenderLevelStage::AfterOpaqueFeatures
+        );
     }
 
     #[test]
