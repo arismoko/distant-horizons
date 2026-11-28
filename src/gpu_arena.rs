@@ -386,7 +386,8 @@ const QUEUE_META_BYTES: u64 = 16;
 /// Count and three pad words before the render queue's section IDs.
 pub const RENDER_QUEUE_HEADER_BYTES: usize = 16;
 
-/// One 32-byte node in `NodeBuffer` for `voxy_traversal.csh`.
+/// Serialized as one 32-byte node in `NodeBuffer` for `voxy_traversal.csh`:
+/// `a = {pos0, pos1, section_id, child_base}`, `b = {child_mask, 0, 0, 0}` (`b.yzw` is unused padding).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuNode {
     pub pos0: u32,
@@ -394,24 +395,23 @@ pub struct GpuNode {
     pub section_id: u32,
     pub child_base: u32,
     pub child_mask: u32,
-    pub aabb: u32,
 }
 
 impl GpuNode {
     pub const NONE: u32 = u32::MAX;
 
-    pub fn to_bytes(self) -> [u8; 32] {
-        let words = [
+    pub fn to_bytes(self) -> [u8; GPU_NODE_BYTES as usize] {
+        let words: [u32; 8] = [
             self.pos0,
             self.pos1,
             self.section_id,
             self.child_base,
             self.child_mask,
-            self.aabb,
+            0,
             0,
             0,
         ];
-        let mut out = [0u8; 32];
+        let mut out = [0u8; GPU_NODE_BYTES as usize];
         for (i, w) in words.into_iter().enumerate() {
             out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
         }
@@ -420,7 +420,7 @@ impl GpuNode {
 }
 
 type NodeTree = (Vec<GpuNode>, Vec<u32>);
-type LiveSectionMeta = (u8, [i32; 3], SectionAabb, bool);
+type LiveSectionMeta = (u8, [i32; 3], bool);
 
 fn out_of_build_height_child_mask(parent: OctreeSectionPos, y_bounds: Option<(i32, i32)>) -> u8 {
     let (Some(bounds), Some(children)) = (y_bounds, parent.children()) else {
@@ -451,10 +451,8 @@ fn build_node_tree(
     let mut resolved_children = HashMap::<OctreeSectionPos, u8>::new();
     let uploaded = live_meta
         .values()
-        .filter(|meta| meta.3)
-        .map(|&(level, [x, y, z], _, _)| {
-            OctreeSectionPos::new(level.min(MAX_OCTREE_DETAIL), x, y, z)
-        });
+        .filter(|meta| meta.2)
+        .map(|&(level, [x, y, z], _)| OctreeSectionPos::new(level.min(MAX_OCTREE_DETAIL), x, y, z));
     for mut pos in uploaded.chain(known_empty.into_iter().flatten().copied()) {
         while let Some(parent) = pos.parent() {
             let bit = 1
@@ -497,14 +495,13 @@ fn build_node_tree(
             section_id: GpuNode::NONE,
             child_base: GpuNode::NONE,
             child_mask: 0,
-            aabb: SectionAabb::FULL.pack(),
         });
         root_index.insert(pos, idx);
         roots.push(idx as u32);
         idx
     };
 
-    for (&section_id, &(level, pos, aabb, _)) in live_meta {
+    for (&section_id, &(level, pos, _)) in live_meta {
         let clamped_level = level.min(MAX_OCTREE_DETAIL);
         // Walk from root down to `clamped_level`, allocating 8-child blocks as needed.
         let shift = MAX_OCTREE_DETAIL - clamped_level;
@@ -541,7 +538,6 @@ fn build_node_tree(
                         section_id: GpuNode::NONE,
                         child_base: GpuNode::NONE,
                         child_mask: 0,
-                        aabb: SectionAabb::FULL.pack(),
                     });
                 }
                 base
@@ -552,7 +548,6 @@ fn build_node_tree(
             cur_level = next_level;
         }
         nodes[cur_idx].section_id = section_id;
-        nodes[cur_idx].aabb = aabb.pack();
     }
 
     // Publish only after the whole residency snapshot has been linked. Rebuilding from
@@ -567,11 +562,9 @@ fn build_node_tree(
             | out_of_build_height_child_mask(pos, y_bounds);
         if resolved != u8::MAX {
             // A meshed parent remains the sole drawable for its volume until it can hand off
-            // the entire volume. Keep the tight mesh bounds when that handoff is unavailable.
+            // the entire volume.
             node.child_base = GpuNode::NONE;
             node.child_mask = 0;
-        } else {
-            node.aabb = SectionAabb::FULL.pack();
         }
     }
 
@@ -588,10 +581,7 @@ pub(crate) fn test_node_tree(
     let mut empty = HashSet::new();
     for (id, section) in sections.iter().enumerate() {
         if !section.is_empty() {
-            live.insert(
-                id as u32,
-                (section.level, section.pos, section.aabb, section.complete),
-            );
+            live.insert(id as u32, (section.level, section.pos, section.complete));
         } else if section.complete {
             let [x, y, z] = section.pos;
             empty.insert(OctreeSectionPos::new(section.level, x, y, z));
@@ -658,7 +648,7 @@ struct ArenaResidency {
     ids: IdAllocator,
     /// Quad-arena start (in quads) per live section id.
     live: HashMap<u32, u32>,
-    /// `(level, pos, aabb, complete)` per live section id for building the GPU octree node table.
+    /// `(level, pos, complete)` per live section id for building the GPU octree node table.
     live_meta: HashMap<u32, LiveSectionMeta>,
     /// Resolved empty meshes, scoped to the dimension whose geometry is resident.
     known_empty: HashMap<String, HashSet<OctreeSectionPos>>,
@@ -855,10 +845,9 @@ impl GpuArena {
             return Err(e.into());
         }
         self.residency.live.insert(id, start as u32);
-        self.residency.live_meta.insert(
-            id,
-            (section.level, section.pos, section.aabb, section.complete),
-        );
+        self.residency
+            .live_meta
+            .insert(id, (section.level, section.pos, section.complete));
         self.residency.nodes_dirty = true;
         self.residency
             .dirty
@@ -1247,7 +1236,7 @@ mod tests {
     #[test]
     fn gpu_node_tree_links_roots_to_leaves() {
         let mut live = HashMap::new();
-        live.insert(10, (0u8, [-3, 2, 5], SectionAabb::FULL, false));
+        live.insert(10, (0u8, [-3, 2, 5], false));
         let (nodes, roots) = build_node_tree(&live, None, None);
         assert_eq!(roots.len(), 1);
         let root = nodes[roots[0] as usize];
@@ -1270,17 +1259,13 @@ mod tests {
 
     #[test]
     fn seven_of_eight_resolved_draws_parent() {
-        let tight = SectionAabb {
-            offset: [1, 2, 3],
-            size: [4, 5, 6],
-        };
         let level = MAX_OCTREE_DETAIL;
         let parent = OctreeSectionPos::new(level, 0, 0, 0);
         let kids = parent.children().unwrap();
         let live = HashMap::from([
-            (1, (level, [0; 3], tight, true)),
-            (2, (level - 1, [1, 0, 0], tight, true)),
-            (3, (level - 2, [0; 3], tight, true)),
+            (1, (level, [0; 3], true)),
+            (2, (level - 1, [1, 0, 0], true)),
+            (3, (level - 2, [0; 3], true)),
         ]);
         // Octant 0 has no mesh, but all eight of its own octants resolved.
         let grandkids = kids[0].children().unwrap();
@@ -1289,7 +1274,6 @@ mod tests {
         let root = nodes[roots[0] as usize];
         assert_eq!(root.section_id, 1);
         assert_eq!((root.child_base, root.child_mask), (GpuNode::NONE, 0));
-        assert_eq!(root.aabb, tight.pack());
 
         empty.insert(kids[7]);
         let (nodes, roots) = build_node_tree(&live, Some(&empty), None);
@@ -1297,7 +1281,6 @@ mod tests {
         assert_eq!(root.section_id, 1);
         assert_ne!(root.child_base, GpuNode::NONE);
         assert_eq!(root.child_mask, 0b11);
-        assert_eq!(root.aabb, SectionAabb::FULL.pack());
         assert_eq!(nodes[root.child_base as usize + 1].section_id, 2);
         let branch = nodes[root.child_base as usize];
         assert_eq!(branch.section_id, GpuNode::NONE);
@@ -1309,13 +1292,10 @@ mod tests {
     fn incomplete_section_does_not_resolve_octant() {
         let level = MAX_OCTREE_DETAIL;
         let kids = OctreeSectionPos::new(level, 0, 0, 0).children().unwrap();
-        let mut live = HashMap::from([
-            (1, (level, [0; 3], SectionAabb::FULL, true)),
-            (2, (level - 1, [0; 3], SectionAabb::FULL, false)),
-        ]);
+        let mut live = HashMap::from([(1, (level, [0; 3], true)), (2, (level - 1, [0; 3], false))]);
         let empty = kids[1..].iter().copied().collect();
         for complete in [false, true] {
-            live.get_mut(&2).unwrap().3 = complete;
+            live.get_mut(&2).unwrap().2 = complete;
             let (nodes, roots) = build_node_tree(&live, Some(&empty), None);
             let root = nodes[roots[0] as usize];
             assert_eq!(root.section_id, 1);
@@ -1328,7 +1308,7 @@ mod tests {
         }
         // Without a meshed parent, the same incomplete section is reachable right away.
         live.remove(&1);
-        live.get_mut(&2).unwrap().3 = false;
+        live.get_mut(&2).unwrap().2 = false;
         let (nodes, roots) = build_node_tree(&live, Some(&empty), None);
         let root = nodes[roots[0] as usize];
         assert_eq!(root.child_mask, 1);
@@ -1344,7 +1324,7 @@ mod tests {
             ((-64, 320), -1, -1..0, 0xf0),
         ] {
             let parent = OctreeSectionPos::new(4, 0, root_y, 0);
-            let mut live = HashMap::from([(0, (4, [0, root_y, 0], SectionAabb::FULL, false))]);
+            let mut live = HashMap::from([(0, (4, [0, root_y, 0], false))]);
             let mut empty = HashSet::new();
             let mut section_id = 1;
             for child in parent.children().unwrap() {
@@ -1356,10 +1336,7 @@ mod tests {
                 // Keep one terrain mesh per in-range branch; the remaining in-range siblings
                 // completed as empty. No residency entry at all for out-of-build-height space.
                 if let Some(pos) = in_range.next() {
-                    live.insert(
-                        section_id,
-                        (pos.detail, [pos.x, pos.y, pos.z], SectionAabb::FULL, true),
-                    );
+                    live.insert(section_id, (pos.detail, [pos.x, pos.y, pos.z], true));
                     section_id += 1;
                     empty.extend(in_range);
                 }
@@ -1398,9 +1375,7 @@ mod tests {
             let id = arena.ids.alloc().unwrap();
             let start = arena.quad_alloc.alloc(1).unwrap() as u32;
             arena.live.insert(id, start);
-            arena
-                .live_meta
-                .insert(id, (level, pos, SectionAabb::FULL, true));
+            arena.live_meta.insert(id, (level, pos, true));
         }
         arena
             .known_empty
@@ -1411,6 +1386,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&initial.nodes_bytes[16..20], &0b11u32.to_le_bytes());
+        assert_eq!(&initial.nodes_bytes[20..32], &[0; 12]);
         assert_eq!(initial.root_count, 1);
         arena.commit_flush(initial.root_count);
         assert!(arena.is_published());

@@ -6,7 +6,7 @@ layout(local_size_x = 64) in;
 
 struct GpuNode {
     uvec4 a; // pos0, pos1, section_id, child_base (0xFFFFFFFF = absent id/base)
-    uvec4 b; // child_mask (bits 0..7), packed aabb, padding
+    uvec4 b; // child_mask (bits 0..7), unused padding (yzw = 0)
 };
 
 layout(std140) uniform TraversalParams {

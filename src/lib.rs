@@ -9,8 +9,10 @@
 //!   per-block models and 4x4 face atlas (`bakery`) and hands them to the GPU arena.
 //! - `network::octree_sync` streams sections to remote clients over one raw play channel.
 //! - The client tracks camera, day-time lighting, settings (`Options > Mods`), fog colors
-//!   (`render_fog`) and F3 telemetry. `gpu_arena` + GLSL compute (Hi-Z, command generation) and
-//!   GPU indirect draws render the LODs; shader packs draw them through pack-linked pipelines.
+//!   (`render_fog`) and F3 telemetry. Five GLSL octree traversal dispatches cull and select LOD
+//!   sections into a compact `RenderQueue`. Command generation consumes it without reculling
+//!   sections, and GPU indirect draws render the quads from `gpu_arena`; shader packs use
+//!   pack-linked pipelines.
 
 pub mod api;
 pub mod bakery;
