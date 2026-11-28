@@ -455,7 +455,8 @@ fn send_status(host: &mut dyn ClientHost) {
         ],
     )
     .append(Text::literal(format!(
-        " arena_sections={arena_sections} arena_bytes={arena_bytes}"
+        " arena_sections={arena_sections} arena_bytes={arena_bytes} compute_dispatches={}",
+        s.compute_dispatches
     )));
     let _ = host.chat_line(status);
 }
