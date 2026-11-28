@@ -21,10 +21,11 @@
 //! one fixed slot per `(section id, bucket)`, rewritten every frame by `voxy_cmdgen.csh`, so the
 //! draw count is simply the id high-water mark times the bucket count.
 
+use crate::octree::{MAX_OCTREE_DETAIL, OctreeSectionPos, child_index};
 use mod_api::{
     BufferError, ClientHost, StorageBufferDescriptor, StorageBufferRef, StorageBufferSlice,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Bytes per packed quad (Voxy `BufferArena(geometryCapacity, 8)`).
 pub const QUAD_BYTES: u64 = 8;
@@ -414,9 +415,36 @@ impl GpuNode {
 type NodeTree = (Vec<GpuNode>, Vec<u32>);
 
 /// Builds a compact top-down octree node table (`detail = MAX_OCTREE_DETAIL` roots down to
-/// `detail = 0` leaves) with contiguous 8-child blocks for `voxy_traversal.csh`.
-pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) -> NodeTree {
-    use crate::octree::{MAX_OCTREE_DETAIL, child_index};
+/// `detail = 0` leaves) with contiguous 8-child blocks for `voxy_traversal.csh`. Empty octants
+/// count toward resolution but need no GPU node of their own.
+fn build_node_tree(
+    live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    known_empty: Option<&HashSet<OctreeSectionPos>>,
+) -> NodeTree {
+    let mut resolved_children = HashMap::<OctreeSectionPos, u8>::new();
+    let uploaded = live_meta
+        .values()
+        .map(|&(level, [x, y, z], _)| OctreeSectionPos::new(level.min(MAX_OCTREE_DETAIL), x, y, z));
+    for mut pos in uploaded.chain(known_empty.into_iter().flatten().copied()) {
+        while let Some(parent) = pos.parent() {
+            let bit = 1
+                << child_index(
+                    (pos.x & 1) as usize,
+                    (pos.y & 1) as usize,
+                    (pos.z & 1) as usize,
+                );
+            let mask = resolved_children.entry(parent).or_default();
+            if *mask & bit != 0 {
+                break;
+            }
+            *mask |= bit;
+            if *mask != u8::MAX {
+                break;
+            }
+            // Complete coverage also resolves a meshless octant for its own parent.
+            pos = parent;
+        }
+    }
 
     let mut nodes: Vec<GpuNode> = Vec::new();
     let mut root_index: HashMap<[i32; 3], usize> = HashMap::new();
@@ -489,17 +517,29 @@ pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) ->
                 base
             };
             nodes[cur_idx].child_mask |= 1u32 << oct;
-            // Any internal node with children must keep FULL bounds regardless of HashMap
-            // iteration order so frustum/Hi-Z culling never drops children outside a masked mesh.
-            nodes[cur_idx].aabb = SectionAabb::FULL.pack();
             cur_idx = child_base + oct;
             cur_pos = next_pos;
             cur_level = next_level;
         }
         nodes[cur_idx].section_id = section_id;
-        // Leaf nodes tighten to their exact geometry AABB; internal nodes keep FULL.
-        if nodes[cur_idx].child_mask == 0 {
-            nodes[cur_idx].aabb = aabb.pack();
+        nodes[cur_idx].aabb = aabb.pack();
+    }
+
+    // Publish only after the whole residency snapshot has been linked. Rebuilding from
+    // scratch also withdraws a child block when a retirement leaves an unresolved octant.
+    for node in &mut nodes {
+        if node.child_mask == 0 || node.section_id == GpuNode::NONE {
+            continue;
+        }
+        let (level, [x, y, z]) = unpack_section_pos([node.pos0, node.pos1]);
+        let pos = OctreeSectionPos::new(level, x, y, z);
+        if resolved_children.get(&pos) != Some(&u8::MAX) {
+            // A meshed parent remains the sole drawable for its volume until it can hand off
+            // the entire volume. Keep the tight mesh bounds when that handoff is unavailable.
+            node.child_base = GpuNode::NONE;
+            node.child_mask = 0;
+        } else {
+            node.aabb = SectionAabb::FULL.pack();
         }
     }
 
@@ -509,12 +549,13 @@ pub fn build_node_tree(live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>) ->
 fn rebuild_node_tree_if_dirty(
     nodes_dirty: &mut bool,
     live_meta: &HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    known_empty: Option<&HashSet<OctreeSectionPos>>,
     max_nodes: u64,
 ) -> Result<Option<NodeTree>, ArenaError> {
     if !*nodes_dirty {
         return Ok(None);
     }
-    let (nodes, roots) = build_node_tree(live_meta);
+    let (nodes, roots) = build_node_tree(live_meta, known_empty);
     if (nodes.len() as u64) > max_nodes {
         // This tree will not fit until section residency changes.
         *nodes_dirty = false;
@@ -582,6 +623,8 @@ pub struct GpuArena {
     live: HashMap<u32, u32>,
     /// `(level, pos, aabb)` per live section id for building the GPU octree node table.
     live_meta: HashMap<u32, (u8, [i32; 3], SectionAabb)>,
+    /// Resolved empty meshes, scoped to the dimension whose geometry is resident.
+    known_empty: HashMap<String, HashSet<OctreeSectionPos>>,
     nodes_dirty: bool,
     root_count: u32,
     dirty: BTreeMap<u32, SectionMeta>,
@@ -705,6 +748,7 @@ impl GpuArena {
             ids: IdAllocator::new(max_sections),
             live: HashMap::new(),
             live_meta: HashMap::new(),
+            known_empty: HashMap::new(),
             nodes_dirty: false,
             root_count: 0,
             dirty: BTreeMap::new(),
@@ -803,9 +847,34 @@ impl GpuArena {
         Ok(())
     }
 
+    /// Record a finished, empty mesh without allocating a section id.
+    pub(crate) fn mark_empty(&mut self, dimension: String, pos: OctreeSectionPos) {
+        self.nodes_dirty |= self.known_empty.entry(dimension).or_default().insert(pos);
+    }
+
+    /// A non-empty result replaces any previous empty resolution even if the upload fails.
+    pub(crate) fn forget_empty(&mut self, dimension: &str, pos: OctreeSectionPos) {
+        if let Some(positions) = self.known_empty.get_mut(dimension) {
+            self.nodes_dirty |= positions.remove(&pos);
+        }
+    }
+
+    pub(crate) fn clear_known_empty(&mut self, dimension: Option<&str>) {
+        if let Some(dim) = dimension {
+            self.nodes_dirty |= self.known_empty.remove(dim).is_some();
+        } else {
+            self.nodes_dirty |= !self.known_empty.is_empty();
+            self.known_empty.clear();
+        }
+    }
+
     /// Writes queued metadata, coalescing consecutive ids into one `write_range`. The queue is
     /// cleared only once every run is written, so a failed flush is retried whole next call.
-    pub fn flush(&mut self, host: &mut dyn ClientHost) -> Result<(), ArenaError> {
+    pub fn flush(
+        &mut self,
+        host: &mut dyn ClientHost,
+        dimension: Option<&str>,
+    ) -> Result<(), ArenaError> {
         let mut run_start = 0u32;
         let mut run: Vec<u8> = Vec::new();
         let mut next = 0u32;
@@ -829,9 +898,13 @@ impl GpuArena {
                 .write_range(&*host, run_start as u64 * SECTION_METADATA_BYTES, &run)?;
         }
         self.dirty.clear();
-        if let Some((node_list, root_list)) =
-            rebuild_node_tree_if_dirty(&mut self.nodes_dirty, &self.live_meta, GPU_MAX_NODES)?
-        {
+        let known_empty = dimension.and_then(|dim| self.known_empty.get(dim));
+        if let Some((node_list, root_list)) = rebuild_node_tree_if_dirty(
+            &mut self.nodes_dirty,
+            &self.live_meta,
+            known_empty,
+            GPU_MAX_NODES,
+        )? {
             if !node_list.is_empty() {
                 let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
                 for n in &node_list {
@@ -1070,11 +1143,10 @@ mod tests {
     fn gpu_node_tree_links_roots_to_leaves() {
         let mut live = HashMap::new();
         live.insert(10, (0u8, [-3, 2, 5], SectionAabb::FULL));
-        live.insert(20, (4u8, [-1, 0, 0], SectionAabb::FULL));
-        let (nodes, roots) = build_node_tree(&live);
+        let (nodes, roots) = build_node_tree(&live, None);
         assert_eq!(roots.len(), 1);
         let root = nodes[roots[0] as usize];
-        assert_eq!(root.section_id, 20);
+        assert_eq!(root.section_id, GpuNode::NONE);
         assert_ne!(root.child_mask, 0);
         // Walk down 4 levels from root to detail-0 leaf section 10.
         let mut cur = root;
@@ -1095,33 +1167,83 @@ mod tests {
         )]);
         let mut nodes_dirty = true;
         assert!(matches!(
-            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 0),
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, None, 0),
             Err(ArenaError::NodesFull)
         ));
         assert!(!nodes_dirty);
         assert!(matches!(
-            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 0),
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, None, 0),
             Ok(None)
         ));
 
         nodes_dirty = true;
         assert!(matches!(
-            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, 1),
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, None, 1),
             Ok(Some(_))
         ));
         assert!(nodes_dirty);
     }
 
     #[test]
-    fn gpu_node_tree_keeps_parent_aabb_full_regardless_of_insert_order() {
+    fn seven_of_eight_resolved_draws_parent() {
         let tight = SectionAabb {
             offset: [1, 2, 3],
             size: [4, 5, 6],
         };
-        let mut live = HashMap::new();
-        live.insert(1, (4u8, [0, 0, 0], tight));
-        live.insert(2, (0u8, [0, 0, 0], tight));
-        let (nodes, roots) = build_node_tree(&live);
-        assert_eq!(nodes[roots[0] as usize].aabb, SectionAabb::FULL.pack());
+        let level = MAX_OCTREE_DETAIL;
+        let parent = OctreeSectionPos::new(level, 0, 0, 0);
+        let kids = parent.children().unwrap();
+        let live = HashMap::from([
+            (1, (level, [0; 3], tight)),
+            (2, (level - 1, [1, 0, 0], tight)),
+            (3, (level - 2, [0; 3], tight)),
+        ]);
+        // Octant 0 has no mesh, but all eight of its own octants resolved.
+        let grandkids = kids[0].children().unwrap();
+        let mut empty: HashSet<_> = grandkids[1..].iter().chain(&kids[2..7]).copied().collect();
+        let (nodes, roots) = build_node_tree(&live, Some(&empty));
+        let root = nodes[roots[0] as usize];
+        assert_eq!(root.section_id, 1);
+        assert_eq!((root.child_base, root.child_mask), (GpuNode::NONE, 0));
+        assert_eq!(root.aabb, tight.pack());
+
+        empty.insert(kids[7]);
+        let (nodes, roots) = build_node_tree(&live, Some(&empty));
+        let root = nodes[roots[0] as usize];
+        assert_eq!(root.section_id, 1);
+        assert_ne!(root.child_base, GpuNode::NONE);
+        assert_eq!(root.child_mask, 0b11);
+        assert_eq!(root.aabb, SectionAabb::FULL.pack());
+        assert_eq!(nodes[root.child_base as usize + 1].section_id, 2);
+        let branch = nodes[root.child_base as usize];
+        assert_eq!(branch.section_id, GpuNode::NONE);
+        assert_eq!(branch.child_mask, 1);
+        assert_eq!(nodes[branch.child_base as usize].section_id, 3);
+    }
+
+    #[test]
+    fn child_retired_returns_to_parent() {
+        let level = MAX_OCTREE_DETAIL;
+        let kids = OctreeSectionPos::new(level, 0, 0, 0).children().unwrap();
+        let mut live = HashMap::from([
+            (1, (level, [0; 3], SectionAabb::FULL)),
+            (2, (level - 1, [0; 3], SectionAabb::FULL)),
+            (3, (level - 1, [1, 0, 0], SectionAabb::FULL)),
+        ]);
+        let empty = kids[2..].iter().copied().collect();
+        let (nodes, roots) = build_node_tree(&live, Some(&empty));
+        let root = nodes[roots[0] as usize];
+        assert_ne!(root.child_base, GpuNode::NONE);
+        assert_eq!(root.child_mask, 0b11);
+
+        live.remove(&2);
+        let mut nodes_dirty = true;
+        let (nodes, roots) =
+            rebuild_node_tree_if_dirty(&mut nodes_dirty, &live, Some(&empty), GPU_MAX_NODES)
+                .unwrap()
+                .unwrap();
+        let root = nodes[roots[0] as usize];
+        assert_eq!(root.section_id, 1);
+        assert_eq!((root.child_base, root.child_mask), (GpuNode::NONE, 0));
     }
 }

@@ -203,21 +203,8 @@ pub fn mesh_octree_section(
     borders: &crate::octree::NeighborBorders,
     models: &dyn crate::bakery::ModelLookup,
 ) -> SectionQuads {
-    mesh_octree_section_masked(section, borders, models, 0)
-}
-
-/// Like [`mesh_octree_section`], but skips emitting faces for voxels in any octant whose bit
-/// (`1 << child_index(x >> 4, y >> 4, z >> 4)`) is set in `covered_octants` (already rendered by a
-/// finer octree child). Neighbour occlusion still reads the full section so no fake seam walls are
-/// emitted between masked and unmasked octants.
-pub fn mesh_octree_section_masked(
-    section: &crate::octree::OctreeSection,
-    borders: &crate::octree::NeighborBorders,
-    models: &dyn crate::bakery::ModelLookup,
-    covered_octants: u8,
-) -> SectionQuads {
     use crate::bakery::ModelMeta;
-    use crate::octree::{Face, SECTION_EDGE, Voxel, child_index, voxel_index};
+    use crate::octree::{Face, SECTION_EDGE, Voxel, voxel_index};
     use std::collections::HashMap;
 
     const N: usize = SECTION_EDGE;
@@ -226,9 +213,6 @@ pub fn mesh_octree_section_masked(
         revision: section.revision,
         ..Default::default()
     };
-    if covered_octants == 0xFF {
-        return out;
-    }
     let dense = section.to_dense();
     let mut metas: HashMap<u32, ModelMeta> = HashMap::new();
     let mut meta_of = |v: Voxel| -> ModelMeta {
@@ -254,11 +238,6 @@ pub fn mesh_octree_section_masked(
             for b in 0..N {
                 for a in 0..N {
                     let [x, y, z] = slice_voxel(face, s, a, b);
-                    if covered_octants != 0
-                        && (covered_octants & (1u8 << child_index(x >> 4, y >> 4, z >> 4))) != 0
-                    {
-                        continue;
-                    }
                     let v = dense[voxel_index(x, y, z)];
                     let meta = meta_of(v);
                     if meta.is_empty() || !meta.has_face(face) {
@@ -757,29 +736,15 @@ mod octree_mesh_tests {
     }
 
     #[test]
-    fn masked_octant_skips_covered_half_without_emitting_seam_wall() {
+    fn coarse_mesh_covers_both_octants_without_emitting_seam_walls() {
         let mut s = OctreeSection::new(OctreeSectionPos::new(1, 0, 0, 0));
         // Solid bridge across the x=15 | x=16 octant boundary.
         s.set(15, 2, 2, Voxel::new(STONE, 0, 15, 0));
         s.set(16, 2, 2, Voxel::new(STONE, 0, 15, 0));
-        let oct0 = 1u8 << crate::octree::child_index(0, 0, 0);
-        let m = mesh_octree_section_masked(&s, &NeighborBorders::none(), &models, oct0);
-        assert!(
-            !m.opaque.iter().any(|q| q.x() == 15),
-            "covered octant (x=15) emits no quads"
-        );
-        assert!(
-            m.opaque
-                .iter()
-                .any(|q| q.x() == 16 && q.face() == Face::PosY.id()),
-            "uncovered octant (x=16) still emits its top face"
-        );
-        assert!(
-            !m.opaque
-                .iter()
-                .any(|q| q.x() == 16 && q.face() == Face::NegX.id()),
-            "solid neighbour in covered octant still culls the internal seam wall"
-        );
+        let m = mesh_octree_section(&s, &NeighborBorders::none(), &models);
+        assert_eq!(area(&m.opaque, Face::PosY, |q| q.y(), 2), 2);
+        assert_eq!(area(&m.opaque, Face::PosX, |q| q.x(), 15), 0);
+        assert_eq!(area(&m.opaque, Face::NegX, |q| q.x(), 16), 0);
     }
 
     #[test]

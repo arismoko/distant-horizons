@@ -7,6 +7,7 @@ use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
 use crate::gen_worker::GenWorkerPool;
 use crate::lod::{DimensionLodStore, SectionPos};
+use crate::octree::OctreeSectionPos;
 use crate::stage3_camera::CameraMatrices;
 use crate::storage::{IoResponse, LodIoWorker};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -606,7 +607,7 @@ pub fn queue_model_tables(model_words: Vec<u32>, biome_tint_words: Vec<u32>, atl
     *PENDING_TABLES.lock().unwrap() = Some((model_words, biome_tint_words, atlas));
 }
 
-/// Called by the pipeline's mesher for each finished section (empty = remove).
+/// Queues a resolved mesh. An empty mesh retires any old geometry but still resolves its octant.
 pub fn submit_built_section(key: SectionKey, section: BuiltSection) {
     PENDING_SECTIONS.lock().unwrap().push((key, section));
 }
@@ -879,14 +880,19 @@ fn try_upload_pending(
     // handled on its own, logged through `report`, and the metadata flush still runs.
     for (key, section) in std::mem::take(&mut *PENDING_SECTIONS.lock().unwrap()) {
         let old = state.ids.get(&key).copied();
+        let [x, y, z] = section.pos;
+        let pos = OctreeSectionPos::new(section.level, x, y, z);
         if section.is_empty() {
-            if let Some(old) = old
-                && report_arena("remove section", state.arena.remove(old)).is_some()
-            {
+            if let Some(old) = old {
+                if report_arena("remove section", state.arena.remove(old)).is_none() {
+                    continue;
+                }
                 state.ids.remove(&key);
             }
+            state.arena.mark_empty(key.0, pos);
             continue;
         }
+        state.arena.forget_empty(&key.0, pos);
         // `upload_replace` keeps the old section live when the new one cannot be stored.
         if let Some(new) = report_arena(
             "upload section",
@@ -895,7 +901,9 @@ fn try_upload_pending(
             state.ids.insert(key, new);
         }
     }
-    let flushed = state.arena.flush(host);
+    // Only the active dimension owns arena section slots.
+    let dimension = state.ids.keys().next().map(|key| key.0.as_str());
+    let flushed = state.arena.flush(host, dimension);
     drop(guard);
     if created {
         crate::pipeline::mark_models_dirty();
@@ -914,6 +922,7 @@ pub fn clear_dimension(dimension: &str) -> Result<(), crate::gpu_arena::ArenaErr
         clear_frame_stats();
         return Ok(());
     };
+    state.arena.clear_known_empty(Some(dimension));
     let doomed: Vec<_> = state
         .ids
         .keys()
@@ -955,6 +964,7 @@ pub fn clear_all_sections() -> Result<(), crate::gpu_arena::ArenaError> {
     let mut pending = PENDING_SECTIONS.lock().unwrap();
     let result = match guard.as_mut() {
         Some(state) => {
+            state.arena.clear_known_empty(None);
             clear_all_pending_and_ids(&mut pending, &mut state.ids, |id| state.arena.remove(id))
         }
         None => {
@@ -1721,6 +1731,16 @@ pub fn clear_frame_stats() {
     let rt = runtime();
     rt.rendered_sections.store(0, Ordering::Relaxed);
     rt.rendered_quads.store(0, Ordering::Relaxed);
+}
+
+/// Current arena occupancy, independent of whether the last frame prepared a draw.
+pub(crate) fn arena_usage() -> (usize, u64) {
+    ARENA.lock().unwrap().as_ref().map_or((0, 0), |state| {
+        (
+            state.arena.live_sections(),
+            state.arena.used_geometry_bytes(),
+        )
+    })
 }
 
 /// Snapshot stats for the F3 debug screen.
