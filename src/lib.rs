@@ -159,6 +159,7 @@ impl Hooks for DistantHorizonsMod {
     ) {
         let _ = render_bridge::clear_all_sections();
         render_bridge::drop_quad_mesh(host);
+        render_bridge::drop_ssao(host);
         network::octree_sync::client_reset();
         let is_remote = is_remote_client(host);
         if is_remote {

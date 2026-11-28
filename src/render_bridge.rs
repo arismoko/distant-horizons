@@ -372,6 +372,7 @@ fn ssao_size(viewport: [u32; 2]) -> [u32; 2] {
 }
 
 /// Mod-owned half-resolution `R32Float` SSAO output target, resized with the viewport.
+#[derive(Clone, Copy)]
 struct SsaoTarget {
     target: mod_api::RenderTargetRef,
     size: [u32; 2],
@@ -379,9 +380,8 @@ struct SsaoTarget {
 
 static SSAO: Mutex<Option<SsaoTarget>> = Mutex::new(None);
 
-/// Whether the SSAO compute pass has been added to the frame graph for the current target. False
-/// after (re)allocating the target and at the start of every `setup_compute`, so `ssao_apply`
-/// never multiplies the screen by an uninitialised or stale AO image.
+/// Whether the frame graph accepted the SSAO pass and dispatch for the current target. Reset at
+/// the start of compute setup and on invalidation so the composite never samples old AO.
 static SSAO_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 impl SsaoTarget {
@@ -397,24 +397,49 @@ impl SsaoTarget {
     }
 }
 
-fn ensure_ssao(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<SsaoTarget> {
+fn ensure_ssao(
+    host: &dyn mod_api::ClientHost,
+    size: [u32; 2],
+    slot: &Mutex<Option<SsaoTarget>>,
+    written: &AtomicBool,
+) -> Option<SsaoTarget> {
     use mod_api::{RenderTargetDescriptor, RenderTargetFormat, StorageImageAccess};
-    let mut slot = SSAO.lock().unwrap();
-    if let Some(s) = slot.as_ref().filter(|s| s.size == size) {
-        return Some(SsaoTarget { ..*s });
+    let mut slot = slot.lock().unwrap();
+    if let Some(s) = slot.filter(|s| s.size == size) {
+        return Some(s);
     }
-    if let Some(old) = slot.take() {
-        let _ = old.target.release(host);
-    }
-    SSAO_WRITTEN.store(false, Ordering::Release);
+    release_ssao(host, &mut slot, written);
     let desc = RenderTargetDescriptor::new(size)
         .color_target(RenderTargetFormat::R32Float)
         .mip_levels(1)
         .storage(StorageImageAccess::WriteOnly);
     let target = host.create_render_target(&desc).ok()?;
     let made = SsaoTarget { target, size };
-    *slot = Some(SsaoTarget { ..made });
+    *slot = Some(made);
     Some(made)
+}
+
+fn release_ssao(
+    host: &dyn mod_api::ClientHost,
+    slot: &mut Option<SsaoTarget>,
+    written: &AtomicBool,
+) {
+    if let Some(old) = slot.take() {
+        let _ = old.target.release(host);
+    }
+    written.store(false, Ordering::Release);
+}
+
+/// Releases the SSAO target on logout or when the frame graph refuses it as stale.
+pub fn drop_ssao(host: &dyn mod_api::ClientHost) {
+    release_ssao(host, &mut SSAO.lock().unwrap(), &SSAO_WRITTEN);
+}
+
+fn is_ssao_target_stale(err: &mod_api::FrameGraphError) -> bool {
+    matches!(
+        err,
+        mod_api::FrameGraphError::InvalidTarget(mod_api::RenderTargetError::Stale)
+    )
 }
 
 /// Consistent circular vanilla clip distance shared between opaque LODs and compute SSAO.
@@ -1058,8 +1083,7 @@ pub fn setup_compute(
 
     // OIT collapses the two ordering anchors into one. A pack can reorder them or export
     // WorldDepth before opaque LODs, even if it doesn't bind the LOD terrain pipeline.
-    // `frame_graph_setup` runs before `prepare_render_buffers` in Dev 2, so compute ensures the
-    // `ssao_size` target first and `prepare_draws` ensures the same size before binding it.
+    // Compute setup owns allocation; the later composite only uses this frame's matching target.
     let [sw, sh] = ssao_size([w, h]);
     if plain_ssao_enabled(
         frame.config.ssao_enabled,
@@ -1067,7 +1091,7 @@ pub fn setup_compute(
         host.shader_pack_active(),
     ) && let (Ok(ssao_pipe), Some(ssao_target)) = (
         assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
-        ensure_ssao(host, [sw, sh]),
+        ensure_ssao(host, [sw, sh], &SSAO, &SSAO_WRITTEN),
     ) {
         let clip_dist = vanilla_clip_dist(&frame);
         let ssao_params = Std140(Vec::with_capacity(32))
@@ -1101,6 +1125,11 @@ pub fn setup_compute(
             .is_some();
         });
         compute_dispatches += u32::from(ssao_dispatched);
+        if let Err(e) = &added_ssao
+            && is_ssao_target_stale(e)
+        {
+            drop_ssao(host);
+        }
         if report("add_ssao_compute_pass", added_ssao).is_some() && ssao_dispatched {
             SSAO_WRITTEN.store(true, Ordering::Release);
         }
@@ -1190,20 +1219,17 @@ pub fn prepare_draws(
     };
     let s = arena.slices;
     // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws.
-    // Ensure the same `ssao_size` as `setup_compute` so the draw uses its target.
     if plain_ssao_enabled(
         frame.config.ssao_enabled,
         improved_transparency,
         host.shader_pack_active(),
-    )
-        && let (Some(win_size), Ok(ssao_apply), Ok(_)) = (
+    ) && SSAO_WRITTEN.load(Ordering::Acquire)
+        && let (Some(win_size), Ok(ssao_apply)) = (
             host.window_size(),
             assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
-            assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
         )
-        && let Some(ssao_target) = ensure_ssao(host, ssao_size(win_size))
-        // Checked after `ensure_ssao`, which clears the flag when it reallocates the target.
-        && SSAO_WRITTEN.load(Ordering::Acquire)
+        && let Some(ssao_target) =
+            { *SSAO.lock().unwrap() }.filter(|s| s.size == ssao_size(win_size))
     {
         let bindings = DrawBindings::new().texture("SsaoTex", ssao_target.source());
         let drawn = context.draw_mesh(
@@ -1943,6 +1969,65 @@ mod tests {
         assert!(!plain_ssao_enabled(true, false, true));
         assert!(!plain_ssao_enabled(true, true, true));
         assert!(!plain_ssao_enabled(false, false, false));
+    }
+
+    #[test]
+    fn is_ssao_target_stale_matches_only_stale_target_refusals() {
+        use mod_api::{FrameGraphError, RenderTargetError};
+
+        assert!(is_ssao_target_stale(&FrameGraphError::InvalidTarget(
+            RenderTargetError::Stale,
+        )));
+        for other in [
+            FrameGraphError::InvalidTarget(RenderTargetError::NotOwned),
+            FrameGraphError::InvalidTarget(RenderTargetError::Unavailable),
+            FrameGraphError::Unavailable,
+        ] {
+            assert!(!is_ssao_target_stale(&other));
+        }
+    }
+
+    #[test]
+    fn clearing_ssao_requires_a_new_target_at_the_same_size() {
+        use mod_api::{RenderTargetDescriptor, RenderTargetError, RenderTargetRef};
+
+        #[derive(Default)]
+        struct AllocationHost(Cell<u32>);
+        impl mod_api::Host for AllocationHost {}
+        mod_api::impl_host_areas!(AllocationHost);
+        impl mod_api::ClientHost for AllocationHost {}
+        mod_api::impl_client_host_areas!(AllocationHost, except(client_render));
+        impl mod_api::prelude::ClientRenderClientHost for AllocationHost {
+            fn create_render_target(
+                &self,
+                _: &RenderTargetDescriptor,
+            ) -> Result<RenderTargetRef, RenderTargetError> {
+                let slot = self.0.get();
+                self.0.set(slot + 1);
+                Ok(mod_api::__private::built::render_target_ref(1, slot))
+            }
+        }
+
+        let host = AllocationHost::default();
+        let slot = Mutex::new(None);
+        let written = AtomicBool::new(false);
+        let size = [960, 540];
+        let first = ensure_ssao(&host, size, &slot, &written).unwrap().target;
+        written.store(true, Ordering::Release);
+        assert_eq!(
+            ensure_ssao(&host, size, &slot, &written).unwrap().target,
+            first
+        );
+
+        // Even if the host cannot release the handle, it must not survive in the slot.
+        release_ssao(&host, &mut slot.lock().unwrap(), &written);
+        assert!(slot.lock().unwrap().is_none());
+        assert!(!written.load(Ordering::Acquire));
+        assert_ne!(
+            ensure_ssao(&host, size, &slot, &written).unwrap().target,
+            first
+        );
+        assert_eq!(host.0.get(), 2);
     }
 
     #[test]
