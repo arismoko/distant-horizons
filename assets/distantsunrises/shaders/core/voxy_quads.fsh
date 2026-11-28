@@ -1,6 +1,6 @@
 #version 450
 // Baked-texture shading for GPU-pulled quads (behaviour: Voxy lod/gl46/quads.frag).
-// Outputs linear HDR: sRGB albedo is decoded before lighting when is_hdr is set.
+// Lighting and fog are applied in the same gamma space as vanilla terrain.
 // Define TRANSLUCENT for the translucent pass (alpha kept, only alpha == 0 discarded);
 // the opaque pass forces alpha = 1 and discards cutout texels with alpha <= 0.1 (Voxy).
 
@@ -20,13 +20,9 @@ uniform sampler2D BlockAtlas;
 layout(location = 0) in flat uvec4 inter;
 layout(location = 1) in vec2 uv;
 layout(location = 2) in vec3 rel_pos;
-layout(location = 3) in flat float face_shade;
+layout(location = 4) in flat vec3 lit_shade;
 
 layout(location = 0) out vec4 out_color;
-
-vec3 srgb_to_linear(vec3 c) {
-    return pow(max(c, vec3(0.0)), vec3(2.2));
-}
 
 vec4 unpack_rgba(uint c) {
     return vec4(float(c & 0xFFu), float((c >> 8) & 0xFFu), float((c >> 16) & 0xFFu), float(c >> 24)) / 255.0;
@@ -154,19 +150,7 @@ void main() {
     albedo.a = 1.0;
 #endif
 
-    bool hdr = flags.x != 0u;
-    vec3 rgb = hdr ? srgb_to_linear(albedo.rgb) : albedo.rgb;
-
-    // Vanilla-style lightmap curve (block<<4 | sky) with non-linear sky/block response and
-    // gamma-appropriate ambient floor so shadowed faces read naturally instead of jet black.
-    float block = float((inter.z >> 4) & 15u) / 15.0;
-    float sky = float(inter.z & 15u) / 15.0;
-    float sky_curve = pow(sky * depth_and_light.w, 1.35);
-    float block_curve = pow(block, 1.35);
-    float min_light = hdr ? 0.08 : 0.34;
-    float light = clamp(max(sky_curve, block_curve) * (1.0 - min_light) + min_light, min_light, 1.0);
-    float shade = flags.y != 0u ? face_shade : 1.0;
-    rgb *= light * shade;
+    vec3 rgb = albedo.rgb * lit_shade;
 
     // Atmospheric aerial-perspective haze + smooth far-horizon fade (Voxy
     // `blit_texture_depth_cutout.frag`: keeps foreground/midground crisp, adds soft pale-blue
@@ -178,8 +162,7 @@ void main() {
     float fade_start = fog.y * 0.85;
     float horizon_fade = smoothstep(fade_start, fog.y, d);
     float f = clamp(max(haze, horizon_fade), 0.0, 1.0);
-    vec3 fc = hdr ? srgb_to_linear(fog_color.rgb) : fog_color.rgb;
-    rgb = mix(rgb, fc, f);
+    rgb = mix(rgb, fog_color.rgb, f);
 
     out_color = vec4(max(rgb, vec3(0.0)), albedo.a);
 }

@@ -82,6 +82,11 @@ pub fn quad_layout() -> mod_api::BindGroupLayout {
         .entry(storage("ModelBuffer", true, 64))
         .entry(storage("BiomeTintBuffer", true, 4))
         .sampler(
+            "Lightmap",
+            SamplerFilter::Linear,
+            SamplerAddress::ClampToEdge,
+        )
+        .sampler(
             "BlockAtlas",
             SamplerFilter::Linear,
             SamplerAddress::ClampToEdge,
@@ -1251,6 +1256,7 @@ pub fn prepare_draws(
                 .storage_buffer("SectionBuffer", s.sections)
                 .storage_buffer("ModelBuffer", s.models)
                 .storage_buffer("BiomeTintBuffer", s.biome_tints)
+                .texture("Lightmap", TextureSource::Lightmap)
                 .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
         };
         let draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(quad_mesh);
@@ -1730,6 +1736,27 @@ mod tests {
     use mod_api::{BindingKind, BufferError};
     use std::cell::Cell;
     use std::path::Path;
+
+    #[test]
+    fn quad_layout_declares_lightmap_before_block_atlas() {
+        use mod_api::{SamplerAddress, SamplerFilter};
+
+        let layout = quad_layout();
+        let [.., biome_tint, lightmap, block_atlas] = layout.entries() else {
+            panic!("missing quad layout entries");
+        };
+        assert_eq!(biome_tint.name, "BiomeTintBuffer");
+        for (entry, name) in [(lightmap, "Lightmap"), (block_atlas, "BlockAtlas")] {
+            assert_eq!(entry.name, name);
+            assert_eq!(
+                entry.kind,
+                BindingKind::CombinedImageSampler {
+                    filter: SamplerFilter::Linear,
+                    address: SamplerAddress::ClampToEdge,
+                }
+            );
+        }
+    }
 
     /// Returns `(size, alignment)` for a GLSL struct or interface block. This handles the
     /// declaration subset used by the compute shaders; unsupported member syntax fails loudly.
