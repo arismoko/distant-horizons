@@ -1,4 +1,8 @@
 #version 450
+#ifdef TRANSLUCENT
+#include <minecraft:oit.glsl>
+#endif
+
 // Baked-texture shading for GPU-pulled quads (behaviour: Voxy lod/gl46/quads.frag).
 // Lighting and fog are applied in the same gamma space as vanilla terrain.
 // Define TRANSLUCENT for the translucent pass (alpha kept, only alpha == 0 discarded);
@@ -22,7 +26,9 @@ layout(location = 1) in vec2 uv;
 layout(location = 2) in vec3 rel_pos;
 layout(location = 4) in flat vec3 lit_shade;
 
+#ifndef OIT_ALPHA_ONLY
 layout(location = 0) out vec4 out_color;
+#endif
 
 vec4 unpack_rgba(uint c) {
     return vec4(float(c & 0xFFu), float((c >> 8) & 0xFFu), float((c >> 16) & 0xFFu), float(c >> 24)) / 255.0;
@@ -150,6 +156,10 @@ void main() {
     albedo.a = 1.0;
 #endif
 
+#ifdef OIT_ALPHA_ONLY
+    executeAlphaOnlyPhase(gl_FragCoord.z, albedo.a);
+    return;
+#else
     vec3 rgb = albedo.rgb * lit_shade;
 
     // Atmospheric aerial-perspective haze + smooth far-horizon fade (Voxy
@@ -164,5 +174,10 @@ void main() {
     float f = clamp(max(haze, horizon_fade), 0.0, 1.0);
     rgb = mix(rgb, fog_color, f);
 
-    out_color = vec4(max(rgb, vec3(0.0)), albedo.a);
+    vec4 color = vec4(max(rgb, vec3(0.0)), albedo.a);
+#ifdef OIT_ACCUMULATE
+    color = sampleColorForAccumulation(color);
+#endif
+    out_color = color;
+#endif
 }

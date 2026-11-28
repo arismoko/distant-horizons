@@ -130,10 +130,10 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
 /// Registers render and compute pipelines. Called from `Hooks::register_render_pipelines`.
 pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
     use mod_api::{PipelineBlend, PrimitiveTopology, RenderPipeline, WorldDepth};
-    // Opaque: depth-tested, culled by the index order of the quad mesh; translucent: depth-tested
-    // and depth-writing (matching Voxy `MDICSectionRenderer.renderTranslucent` and vanilla
-    // `RenderType.translucent`) so closer water surfaces reject farther/back water faces instead
-    // of double-blending.
+    // Opaque: depth-tested, culled by the index order of the quad mesh. Classic translucent:
+    // depth-tested and depth-writing (matching Voxy `MDICSectionRenderer.renderTranslucent` and
+    // vanilla `RenderType.translucent`) so closer water surfaces reject farther/back water faces
+    // instead of double-blending.
     event.register(
         RenderPipeline::new(
             id(PIPELINE_OPAQUE),
@@ -155,6 +155,7 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
             WorldDepth::Tested,
         )
         .define("TRANSLUCENT")
+        .order_independent()
         .depth_write(true)
         .topology(PrimitiveTopology::Triangles)
         .cull(false)
@@ -898,9 +899,25 @@ pub const OPAQUE_STAGE: mod_api::RenderLevelStage = mod_api::RenderLevelStage::A
 /// opaque LODs and before vanilla water/glass, `PIPELINE_SSAO_APPLY`, and `PIPELINE_TRANSLUCENT`.
 pub const SSAO_AFTER_STAGE: mod_api::RenderLevelStage =
     mod_api::RenderLevelStage::AfterTranslucentFeatures;
-/// Stage of the translucent LOD draw.
+/// Stage of the classic or pack-bound translucent LOD draw.
 pub const TRANSLUCENT_STAGE: mod_api::RenderLevelStage =
     mod_api::RenderLevelStage::AfterTranslucentBlocks;
+
+fn translucent_stages(
+    improved_transparency: bool,
+    pack_water_bound: bool,
+) -> &'static [mod_api::RenderLevelStage] {
+    use mod_api::{OitStage, RenderLevelStage::OitTranslucent};
+    if improved_transparency && !pack_water_bound {
+        &[
+            OitTranslucent(OitStage::DepthBounds),
+            OitTranslucent(OitStage::Transmittance),
+            OitTranslucent(OitStage::Accumulate),
+        ]
+    } else {
+        &[TRANSLUCENT_STAGE]
+    }
+}
 
 /// Starts the frame: drains workers, stores the frame parameters and drops last frame's prepared
 /// draws. Called first from `Hooks::prepare_render_buffers`.
@@ -1297,16 +1314,23 @@ pub fn prepare_draws(
                 .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
         };
         let draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(quad_mesh);
-        let drawn = context.draw_indirect(stage, &draw);
-        // Stale after proxy reconfiguration (`raw_ingress.rs:518`, sunrise-org/sunrise#6622).
-        if let Err(e) = &drawn
-            && is_mesh_stale(e)
-        {
-            state.quad_mesh = None;
-        }
-        if let Some(batch) = report("draw_indirect", drawn) {
-            PREPARED.lock().unwrap().push((stage, batch));
-            prepared_terrain_draws += 1;
+        let stages = if stage == TRANSLUCENT_STAGE {
+            translucent_stages(improved_transparency, packed.is_some())
+        } else {
+            std::slice::from_ref(&stage)
+        };
+        for &stage in stages {
+            let drawn = context.draw_indirect(stage, &draw);
+            // Stale after proxy reconfiguration (`raw_ingress.rs:518`, sunrise-org/sunrise#6622).
+            if let Err(e) = &drawn
+                && is_mesh_stale(e)
+            {
+                state.quad_mesh = None;
+            }
+            if let Some(batch) = report("draw_indirect", drawn) {
+                PREPARED.lock().unwrap().push((stage, batch));
+                prepared_terrain_draws += 1;
+            }
         }
     }
     // The shadow pass takes the pack-linked shadow pipeline through the same world stage when the
@@ -1367,12 +1391,16 @@ pub fn draw_stage(
     stage: mod_api::RenderLevelStage,
     context: &mut dyn mod_api::RenderLevelStageContext,
 ) {
-    let Some(pass) = context.world_pass() else {
-        return;
-    };
-    for (s, batch) in PREPARED.lock().unwrap().iter() {
-        if *s == stage {
-            report("pass.draw", pass.draw(*batch));
+    use mod_api::StagePass;
+    let mut pass = context.pass();
+    for &(s, batch) in PREPARED.lock().unwrap().iter() {
+        if s == stage {
+            let drawn = match &mut pass {
+                StagePass::World(pass) => pass.draw(batch),
+                StagePass::Oit(_, pass) => pass.draw(batch),
+                StagePass::None => return,
+            };
+            report("pass.draw", drawn);
         }
     }
 }
@@ -1969,6 +1997,28 @@ mod tests {
         assert!(!plain_ssao_enabled(true, false, true));
         assert!(!plain_ssao_enabled(true, true, true));
         assert!(!plain_ssao_enabled(false, false, false));
+    }
+
+    #[test]
+    fn translucent_stages_route_only_plain_improved_transparency_to_oit() {
+        use mod_api::{OitStage, RenderLevelStage};
+
+        assert_eq!(
+            translucent_stages(true, false),
+            &[
+                RenderLevelStage::OitTranslucent(OitStage::DepthBounds),
+                RenderLevelStage::OitTranslucent(OitStage::Transmittance),
+                RenderLevelStage::OitTranslucent(OitStage::Accumulate),
+            ],
+        );
+        for (improved_transparency, pack_water_bound) in
+            [(false, false), (false, true), (true, true)]
+        {
+            assert_eq!(
+                translucent_stages(improved_transparency, pack_water_bound),
+                &[RenderLevelStage::AfterTranslucentBlocks],
+            );
+        }
     }
 
     #[test]
