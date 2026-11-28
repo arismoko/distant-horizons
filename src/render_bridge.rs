@@ -12,30 +12,28 @@ use crate::stage3_camera::CameraMatrices;
 use crate::storage::{IoResponse, LodIoWorker};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------------------------
 // GPU-driven Voxy-style renderer on Sunrise's general mod API (zero `[native.*]`).
 //
-// Frame (all at `RenderLevelStage::AfterOpaqueBlocks`, ruling 16: world-stage callbacks):
-//   1. `voxy_hiz.csh` builds an R32Float depth pyramid from vanilla `WorldDepth` (sunrise#5590/#5591),
-//   2. `voxy_cmdgen.csh` frustum + Hi-Z culls every section and rewrites its indirect slots
-//      (`instance_count = 0` when culled, ruling 18),
-//   3. one `draw_indirect` for the opaque slots and one for the translucent slots (sunrise#5592)
-//      pull 8-byte quads from the arena (`voxy_quads.vsh/fsh`),
-//   4. a shader pack that compiled `dh_terrain` / `dh_water` / `dh_shadow` draws through the
-//      pack-linked pipelines (`voxy_pack_*.vsh`) instead of `voxy_quads`.
+// Frame:
+//   1. `voxy_traversal.csh` culls and subdivides the octree into a compact render queue,
+//   2. `voxy_cmdgen.csh` generates indirect commands and the translucent sort places them
+//      back-to-front. Unused slots have `instance_count = 0` (ruling 18),
+//   3. one indirect draw per terrain stage pulls 8-byte quads (`voxy_quads.vsh/fsh`),
+//      or uses a shader pack's linked pipeline (`voxy_pack_*.vsh`).
 // ---------------------------------------------------------------------------------------------
 
-use crate::gpu_arena::{ArenaConfig, ArenaError, BuiltSection, GpuArena};
+use crate::gpu_arena::{
+    ArenaConfig, ArenaError, BuiltSection, GPU_TRAV_QUEUE_CAP, GpuArena, RENDER_QUEUE_HEADER_BYTES,
+    TRAVERSAL_ITERATIONS,
+};
 
 /// Shader ids (`assets/distantsunrises/shaders/{core,compute}/<path>`).
 pub const SHADER_QUADS: &str = "distantsunrises:core/voxy_quads";
-pub const SHADER_HIZ: &str = "distantsunrises:voxy_hiz";
-pub const SHADER_TRAV_INIT: &str = "distantsunrises:voxy_trav_init";
-pub const SHADER_TRAV_CLEAR: &str = "distantsunrises:voxy_trav_clear";
 pub const SHADER_TRAVERSAL: &str = "distantsunrises:voxy_traversal";
 pub const SHADER_CMDGEN: &str = "distantsunrises:voxy_cmdgen";
 pub const SHADER_TRANS_CLEAR: &str = "distantsunrises:voxy_trans_clear";
@@ -54,7 +52,9 @@ pub const PIPELINE_PACK_SHADOW: &str = "distantsunrises:voxy_pack_shadow";
 /// Compute workgroup sizes; must match `local_size_*` in the `.csh` files.
 pub const CMDGEN_WORKGROUP: u32 = 128;
 pub const TRAV_WORKGROUP: u32 = 64;
-pub const HIZ_WORKGROUP: u32 = 8;
+const SSAO_WORKGROUP: u32 = 8;
+/// Voxy's default `subDivisionSize` (`VoxyConfig.java:35`).
+const SUBDIVISION_SIZE: f32 = 64.0;
 
 fn id(text: &str) -> mod_api::Identifier {
     mod_api::Identifier::parse(text).expect("static identifier")
@@ -112,8 +112,7 @@ pub fn pack_layout() -> mod_api::BindGroupLayout {
         .expect("static pack layout")
 }
 
-/// Registers the render pipelines. Called from `Hooks::register_render_pipelines`. The compute
-/// pipelines (Hi-Z, command generation) are added with the compute primitives.
+/// Registers render and compute pipelines. Called from `Hooks::register_render_pipelines`.
 pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
     use mod_api::{PipelineBlend, PrimitiveTopology, RenderPipeline, WorldDepth};
     // Opaque: depth-tested, culled by the index order of the quad mesh; translucent: depth-tested
@@ -184,85 +183,26 @@ pub fn register_pipelines(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>)
     register_compute(event);
 }
 
-/// Hi-Z copy / reduce and command generation (`assets/distantsunrises/shaders/compute`).
-fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
+/// Traversal, indirect command generation, translucent sorting, and SSAO.
+fn compute_pipelines() -> impl IntoIterator<Item = mod_api::ComputePipeline> {
     use mod_api::{
         BindGroupLayout, ComputePipeline, SamplerAddress, SamplerFilter, StorageImageAccess,
     };
-    let hiz_layout = || {
-        BindGroupLayout::builder()
-            .uniform_buffer("HizParams", 16)
-            .sampler(
-                "HizSource",
-                SamplerFilter::Nearest,
-                SamplerAddress::ClampToEdge,
-            )
-            .entry(mod_api::BindEntry::new(
-                "HizDest",
-                mod_api::BindingKind::StorageImage {
-                    access: StorageImageAccess::WriteOnly,
-                },
-            ))
-            .build()
-            .expect("static hiz layout")
-    };
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_hiz_copy"), id(SHADER_HIZ))
-            .bind_group_layout(hiz_layout())
-            .define("HIZ_FROM_WORLD_DEPTH")
-            .build(),
-    );
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_hiz_reduce"), id(SHADER_HIZ))
-            .bind_group_layout(hiz_layout())
-            .build(),
-    );
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_trav_init"), id(SHADER_TRAV_INIT))
-            .bind_group_layout(
-                BindGroupLayout::builder()
-                    .uniform_buffer("TravInitParams", 16)
-                    .entry(storage("RootBuffer", true, 4))
-                    .entry(storage("VisibilityBuffer", false, 4))
-                    .entry(storage("QueueA", false, 20))
-                    .entry(storage("DispatchA", false, 16))
-                    .build()
-                    .expect("static trav_init layout"),
-            )
-            .build(),
-    );
-    event.compute_pipeline(
-        ComputePipeline::builder(id("distantsunrises:voxy_trav_clear"), id(SHADER_TRAV_CLEAR))
-            .bind_group_layout(
-                BindGroupLayout::builder()
-                    .entry(storage("QueueOut", false, 20))
-                    .entry(storage("DispatchOut", false, 16))
-                    .build()
-                    .expect("static trav_clear layout"),
-            )
-            .build(),
-    );
-    event.compute_pipeline(
+    [
         ComputePipeline::builder(id("distantsunrises:voxy_traversal"), id(SHADER_TRAVERSAL))
             .bind_group_layout(
                 BindGroupLayout::builder()
-                    .uniform_buffer("TraversalParams", 128)
+                    .uniform_buffer("TraversalParams", 112)
                     .entry(storage("NodeBuffer", true, 32))
-                    .entry(storage("QueueIn", true, 20))
-                    .entry(storage("QueueOut", false, 20))
-                    .entry(storage("DispatchOut", false, 16))
-                    .entry(storage("VisibilityBuffer", false, 4))
-                    .sampler(
-                        "HizPyramid",
-                        SamplerFilter::Nearest,
-                        SamplerAddress::ClampToEdge,
-                    )
+                    .entry(storage("QueueIn", true, 4))
+                    .entry(storage("QueueOut", false, 4))
+                    .entry(storage("QueueMetaIn", true, 16))
+                    .entry(storage("QueueMetaOut", false, 16))
+                    .entry(storage("RenderQueue", false, 20))
                     .build()
                     .expect("static traversal layout"),
             )
             .build(),
-    );
-    event.compute_pipeline(
         ComputePipeline::builder(
             id("distantsunrises:voxy_trans_clear"),
             id(SHADER_TRANS_CLEAR),
@@ -274,29 +214,20 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                 .expect("static trans_clear layout"),
         )
         .build(),
-    );
-    event.compute_pipeline(
         ComputePipeline::builder(id("distantsunrises:voxy_cmdgen"), id(SHADER_CMDGEN))
             .bind_group_layout(
                 BindGroupLayout::builder()
-                    .uniform_buffer("CmdgenParams", 112)
+                    .uniform_buffer("CmdgenParams", 16)
                     .entry(storage("SectionBuffer", true, 32))
-                    .entry(storage("VisibilityBuffer", true, 4))
+                    .entry(storage("RenderQueue", true, 20))
                     .entry(storage("OpaqueCommands", false, 20))
                     .entry(storage("TranslucentCommands", false, 20))
                     .entry(storage("TransSortMeta", false, 2056))
                     .entry(storage("TransSortEntries", false, 8))
-                    .sampler(
-                        "HizPyramid",
-                        SamplerFilter::Nearest,
-                        SamplerAddress::ClampToEdge,
-                    )
                     .build()
                     .expect("static cmdgen layout"),
             )
             .build(),
-    );
-    event.compute_pipeline(
         ComputePipeline::builder(
             id("distantsunrises:voxy_trans_prefix"),
             id(SHADER_TRANS_PREFIX),
@@ -308,8 +239,6 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                 .expect("static trans_prefix layout"),
         )
         .build(),
-    );
-    event.compute_pipeline(
         ComputePipeline::builder(
             id("distantsunrises:voxy_trans_scatter"),
             id(SHADER_TRANS_SCATTER),
@@ -324,8 +253,6 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                 .expect("static trans_scatter layout"),
         )
         .build(),
-    );
-    event.compute_pipeline(
         ComputePipeline::builder(id("distantsunrises:voxy_ssao"), id(SHADER_SSAO))
             .bind_group_layout(
                 BindGroupLayout::builder()
@@ -345,7 +272,14 @@ fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
                     .expect("static ssao layout"),
             )
             .build(),
-    );
+    ]
+}
+
+fn register_compute(event: &mut mod_api::RegisterRenderPipelinesEvent<'_>) {
+    use mod_api::{BindGroupLayout, SamplerAddress, SamplerFilter};
+    for pipeline in compute_pipelines() {
+        event.compute_pipeline(pipeline);
+    }
     event.register(
         mod_api::RenderPipeline::new(
             id(PIPELINE_SSAO_APPLY),
@@ -418,95 +352,12 @@ pub fn quad_params_bytes(
         .0
 }
 
-/// `CmdgenParams` (112 bytes).
-pub fn cmdgen_params_bytes(
-    view_proj: [f32; 16],
-    camera: [f64; 3],
-    section_count: u32,
-    hiz_size: [u32; 2],
-    hiz_mips: u32,
-    hiz_enabled: bool,
-) -> Vec<u8> {
-    let (base, sub) = camera_split(camera);
-    Std140(Vec::with_capacity(112))
-        .f32s(&view_proj)
-        .i32s(&[base[0], base[1], base[2], section_count as i32])
-        .f32s(&[sub[0], sub[1], sub[2], 0.0])
-        .i32s(&[
-            hiz_size[0] as i32,
-            hiz_size[1] as i32,
-            hiz_mips as i32,
-            i32::from(hiz_enabled),
-        ])
-        .0
-}
-
 /// Camera block position split into its 32-block section (`>> 5`) and the sub-section remainder,
 /// so shader math stays in f32 near the camera (Voxy `baseSectionPos` / `cameraSubPos`).
 pub fn camera_split(camera: [f64; 3]) -> ([i32; 3], [f32; 3]) {
     let base = camera.map(|c| (c.floor() as i64 >> 5) as i32);
     let sub = std::array::from_fn(|i| (camera[i] - f64::from(base[i] << 5)) as f32);
     (base, sub)
-}
-
-/// Mip count of the Hi-Z pyramid: `32 - leading_zeros(max(w, h))` (sunrise#5590 rule).
-pub fn hiz_mip_levels(width: u32, height: u32) -> u32 {
-    32 - width.max(height).leading_zeros()
-}
-
-/// The mod-owned Hi-Z pyramid (sunrise#5590): an `R32Float` target with a full mip chain,
-/// created for `WriteOnly` storage images and sampled by cmdgen. Resized with the viewport.
-struct HizTarget {
-    target: mod_api::RenderTargetRef,
-    size: [u32; 2],
-    mips: u32,
-}
-
-static HIZ: Mutex<Option<HizTarget>> = Mutex::new(None);
-
-impl HizTarget {
-    /// Mip views: level `l` as a storage-image destination and as a sampled source.
-    fn dest(&self, level: u32) -> mod_api::StorageImageBinding {
-        mod_api::StorageImageBinding::new(self.target, 0, level)
-    }
-    fn source(&self, level: u32) -> mod_api::TextureSource<'static> {
-        mod_api::TextureSource::RenderTargetColorMip(mod_api::RenderTargetMipView::single(
-            self.target,
-            0,
-            level,
-        ))
-    }
-    /// All mips, for cmdgen's `HizPyramid` sampler.
-    fn all_mips(&self) -> mod_api::TextureSource<'static> {
-        mod_api::TextureSource::RenderTargetColorMip(mod_api::RenderTargetMipView::new(
-            self.target,
-            0,
-            0,
-            self.mips,
-        ))
-    }
-}
-
-/// The Hi-Z pyramid for a `size` viewport, created or resized on demand. `None` when the
-/// adapter refuses the target; the caller then skips Hi-Z culling (`hiz_enabled = false`).
-fn ensure_hiz(host: &dyn mod_api::ClientHost, size: [u32; 2]) -> Option<HizTarget> {
-    use mod_api::{RenderTargetDescriptor, RenderTargetFormat, StorageImageAccess};
-    let mut slot = HIZ.lock().unwrap();
-    if let Some(h) = slot.as_ref().filter(|h| h.size == size) {
-        return Some(HizTarget { ..*h });
-    }
-    if let Some(old) = slot.take() {
-        let _ = old.target.release(host);
-    }
-    let mips = hiz_mip_levels(size[0], size[1]);
-    let desc = RenderTargetDescriptor::new(size)
-        .color_target(RenderTargetFormat::R32Float)
-        .mip_levels(mips)
-        .storage(StorageImageAccess::WriteOnly);
-    let target = host.create_render_target(&desc).ok()?;
-    let made = HizTarget { target, size, mips };
-    *slot = Some(HizTarget { ..made });
-    Some(made)
 }
 
 /// Half-resolution SSAO target size, rounded up.
@@ -998,7 +849,9 @@ pub fn clear_all_sections() -> Result<(), crate::gpu_arena::ArenaError> {
     result
 }
 
-static FRAME_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FRAME_ID: AtomicU32 = AtomicU32::new(0);
+/// Dispatches accepted by the frame graph during the latest compute setup.
+static COMPUTE_DISPATCHES: AtomicU32 = AtomicU32::new(0);
 
 /// The frame's parameters, set by [`begin_frame`] in `prepare_render_buffers`.
 static FRAME: Mutex<Option<RenderFrameParams>> = Mutex::new(None);
@@ -1007,8 +860,7 @@ static FRAME: Mutex<Option<RenderFrameParams>> = Mutex::new(None);
 static PREPARED: Mutex<Vec<(mod_api::RenderLevelStage, mod_api::PreparedWorldDraw)>> =
     Mutex::new(Vec::new());
 
-/// Stage the opaque LOD draw runs in; the Hi-Z/cmdgen compute node runs just before it, after
-/// the vanilla opaque blocks are in the depth buffer.
+/// Opaque LOD draw stage, after traversal and indirect command generation.
 pub const OPAQUE_STAGE: mod_api::RenderLevelStage = mod_api::RenderLevelStage::AfterOpaqueFeatures;
 /// Stage of the translucent LOD draw.
 pub const TRANSLUCENT_STAGE: mod_api::RenderLevelStage =
@@ -1023,7 +875,7 @@ pub fn begin_frame(camera: [f64; 3]) {
     PREPARED.lock().unwrap().clear();
 }
 
-/// Registers the Hi-Z + cmdgen compute node of this frame in the frame graph. Called from
+/// Records this frame's traversal, command generation and optional SSAO. Called from
 /// `Hooks::frame_graph_setup`.
 pub fn setup_compute(
     host: &dyn mod_api::ClientHost,
@@ -1035,6 +887,7 @@ pub fn setup_compute(
     };
     // Every early return below leaves SSAO unwritten for the next frame's `ssao_apply`.
     SSAO_WRITTEN.store(false, Ordering::Release);
+    COMPUTE_DISPATCHES.store(0, Ordering::Relaxed);
     let Some(frame) = FRAME.lock().unwrap().clone() else {
         return;
     };
@@ -1045,15 +898,11 @@ pub fn setup_compute(
     if !frame.enabled || sections == 0 || !arena.is_published() {
         return;
     }
-    let Some([w, h]) = host.window_size() else {
+    let Some([w, h]) = host.window_size().filter(|&[w, h]| w != 0 && h != 0) else {
         return;
     };
     let assets = host.render_assets();
-    let ids = [
-        "voxy_hiz_copy",
-        "voxy_hiz_reduce",
-        "voxy_trav_init",
-        "voxy_trav_clear",
+    let pipelines = [
         "voxy_traversal",
         "voxy_trans_clear",
         "voxy_cmdgen",
@@ -1062,180 +911,135 @@ pub fn setup_compute(
     ]
     .map(|n| assets.compute_pipeline(&id(&format!("distantsunrises:{n}"))));
     let [
-        Ok(copy),
-        Ok(reduce),
-        Ok(trav_init),
-        Ok(trav_clear),
         Ok(traversal),
         Ok(trans_clear),
         Ok(cmdgen),
         Ok(trans_prefix),
         Ok(trans_scatter),
-    ] = ids
+    ] = pipelines
     else {
         return;
     };
+
     let root_count = arena.root_count();
-    let dispatch_a_ref = arena.dispatch_a;
-    let dispatch_b_ref = arena.dispatch_b;
-    let focal_px = (h as f32 * 0.5 * camera.projection[5].abs()).max(1.0);
-    let lod_threshold = 2.0f32;
-    let Some(hiz) = ensure_hiz(host, [w, h]) else {
+    let root_groups = root_count.div_ceil(TRAV_WORKGROUP);
+    // The engine applies these writes in order before the graph runs. Each dispatch reads
+    // one metadata buffer (also its indirect args after iter 0) and writes a distinct one.
+    for (iter, meta) in arena.queue_meta.iter().enumerate() {
+        let words = if iter == 0 {
+            [root_groups, 1, 1, root_count]
+        } else {
+            [0, 1, 1, 0]
+        };
+        if report(
+            "queue meta reset",
+            meta.write_range(host, 0, bytemuck::cast_slice(&words.map(u32::to_le))),
+        )
+        .is_none()
+        {
+            return;
+        }
+    }
+    if report(
+        "render queue reset",
+        arena
+            .render_queue
+            .write_range(host, 0, &[0; RENDER_QUEUE_HEADER_BYTES]),
+    )
+    .is_none()
+    {
         return;
-    };
-    let mips = hiz.mips;
+    }
+
     let view_proj = camera.view_projection();
-    let desc = ComputePassDescriptor::new("distantsunrises:hiz_cmdgen")
-        .reads(FrameTarget::MainDepth)
-        .writes(FrameTarget::Mod(hiz.target))
+    let (base, sub) = camera_split(camera.position);
+    let min_sss = SUBDIVISION_SIZE.powi(2) / (w as f32 * h as f32);
+    let render_distance = frame.config.render_distance_blocks();
+    let desc = ComputePassDescriptor::new("distantsunrises:traverse_cmdgen")
         .after_stage(RenderLevelStage::AfterOpaqueBlocks)
         .before_stage(OPAQUE_STAGE);
     let slices = arena.slices;
+    let section_groups = [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1];
+    let mut compute_dispatches = 0u32;
     let added = graph.add_compute_pass(desc, &mut |ctx| {
-        let groups = |n: u32| n.div_ceil(HIZ_WORKGROUP);
-        let (mut sw, mut sh) = (w, h);
-        for level in 0..mips {
-            let (dw, dh) = if level == 0 {
-                (w, h)
-            } else {
-                ((sw / 2).max(1), (sh / 2).max(1))
+        // Detail-4 roots guarantee detail-0 leaves in iteration 4. Bind a distinct (unused)
+        // output metadata buffer on that last dispatch; the shader never enqueues from it.
+        for iter in 0..TRAVERSAL_ITERATIONS {
+            let (q_in, q_out) = match iter {
+                0 => (slices.roots, slices.queue_b),
+                i if i % 2 == 0 => (slices.queue_a, slices.queue_b),
+                _ => (slices.queue_b, slices.queue_a),
             };
-            let params = Std140(Vec::new())
-                .i32s(&[sw as i32, sh as i32, dw as i32, dh as i32])
+            let next = (iter + 1) % TRAVERSAL_ITERATIONS;
+            let trav_params = Std140(Vec::with_capacity(112))
+                .f32s(&view_proj)
+                .i32s(&[base[0], base[1], base[2], GPU_TRAV_QUEUE_CAP as i32])
+                .f32s(&[sub[0], sub[1], sub[2], 0.0])
+                .f32s(&[min_sss, render_distance])
+                .u32s(&[u32::from(next == 0), arena.max_sections()])
                 .0;
-            let source = if level == 0 {
-                TextureSource::WorldDepth
-            } else {
-                hiz.source(level - 1)
-            };
             let bindings = DrawBindings::new()
-                .inline_uniform("HizParams", &params)
-                .texture("HizSource", source)
-                .storage_image("HizDest", hiz.dest(level));
-            report(
-                "hiz dispatch",
-                ctx.dispatch(
-                    if level == 0 { copy } else { reduce },
-                    &bindings,
-                    [groups(dw), groups(dh), 1],
-                ),
-            );
-            (sw, sh) = (dw, dh);
-        }
-        let init_threads = sections.max(root_count).max(1);
-        let init_params = Std140(Vec::with_capacity(16))
-            .u32s(&[
-                sections,
-                root_count,
-                crate::gpu_arena::GPU_TRAV_QUEUE_CAP,
-                0,
-            ])
-            .0;
-        let init_bindings = DrawBindings::new()
-            .inline_uniform("TravInitParams", &init_params)
-            .storage_buffer("RootBuffer", slices.roots)
-            .storage_buffer("VisibilityBuffer", slices.visibility)
-            .storage_buffer("QueueA", slices.queue_a)
-            .storage_buffer("DispatchA", slices.dispatch_a);
-        report(
-            "trav_init dispatch",
-            ctx.dispatch(
-                trav_init,
-                &init_bindings,
-                [init_threads.div_ceil(TRAV_WORKGROUP), 1, 1],
-            ),
-        );
-        let (base, sub) = camera_split(camera.position);
-        let trav_params = Std140(Vec::with_capacity(128))
-            .f32s(&view_proj)
-            .i32s(&[
-                base[0],
-                base[1],
-                base[2],
-                crate::gpu_arena::GPU_TRAV_QUEUE_CAP as i32,
-            ])
-            .f32s(&[sub[0], sub[1], sub[2], focal_px])
-            .i32s(&[w as i32, h as i32, mips as i32, 1])
-            .f32s(&[lod_threshold, 0.0, 0.0, 0.0])
-            .0;
-        for iter in 0..=crate::octree::MAX_OCTREE_DETAIL {
-            let (q_in, q_out, d_in_ref, d_out) = if iter % 2 == 0 {
-                (
-                    slices.queue_a,
-                    slices.queue_b,
-                    dispatch_a_ref,
-                    slices.dispatch_b,
-                )
-            } else {
-                (
-                    slices.queue_b,
-                    slices.queue_a,
-                    dispatch_b_ref,
-                    slices.dispatch_a,
-                )
-            };
-            let tclear_bindings = DrawBindings::new()
-                .storage_buffer("QueueOut", q_out)
-                .storage_buffer("DispatchOut", d_out);
-            report(
-                "trav_clear dispatch",
-                ctx.dispatch(trav_clear, &tclear_bindings, [1, 1, 1]),
-            );
-            let trav_bindings = DrawBindings::new()
                 .inline_uniform("TraversalParams", &trav_params)
                 .storage_buffer("NodeBuffer", slices.nodes)
                 .storage_buffer("QueueIn", q_in)
                 .storage_buffer("QueueOut", q_out)
-                .storage_buffer("DispatchOut", d_out)
-                .storage_buffer("VisibilityBuffer", slices.visibility)
-                .texture("HizPyramid", hiz.all_mips());
-            report(
-                "traversal dispatch_indirect",
-                ctx.dispatch_indirect(traversal, &trav_bindings, d_in_ref, 0),
-            );
+                .storage_buffer("QueueMetaIn", slices.queue_meta[iter])
+                .storage_buffer("QueueMetaOut", slices.queue_meta[next])
+                .storage_buffer("RenderQueue", slices.render_queue);
+            let dispatched = if iter == 0 {
+                ctx.dispatch(traversal, &bindings, [root_groups, 1, 1])
+            } else {
+                ctx.dispatch_indirect(traversal, &bindings, arena.queue_meta[iter], 0)
+            };
+            compute_dispatches += u32::from(report("traversal dispatch", dispatched).is_some());
         }
         let clear_bindings =
             DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
-        report(
-            "trans_clear dispatch",
-            ctx.dispatch(trans_clear, &clear_bindings, [1, 1, 1]),
+        compute_dispatches += u32::from(
+            report(
+                "trans_clear dispatch",
+                ctx.dispatch(trans_clear, &clear_bindings, [1, 1, 1]),
+            )
+            .is_some(),
         );
-        let params = cmdgen_params_bytes(view_proj, camera.position, sections, [w, h], mips, true);
+        let params = Std140(Vec::with_capacity(16))
+            .i32s(&[base[0], base[1], base[2], sections as i32])
+            .0;
         let bindings = DrawBindings::new()
             .inline_uniform("CmdgenParams", &params)
             .storage_buffer("SectionBuffer", slices.sections)
-            .storage_buffer("VisibilityBuffer", slices.visibility)
+            .storage_buffer("RenderQueue", slices.render_queue)
             .storage_buffer("OpaqueCommands", slices.opaque_commands)
             .storage_buffer("TranslucentCommands", slices.translucent_commands)
             .storage_buffer("TransSortMeta", slices.trans_sort_meta)
-            .storage_buffer("TransSortEntries", slices.trans_sort_entries)
-            .texture("HizPyramid", hiz.all_mips());
-        report(
-            "cmdgen dispatch",
-            ctx.dispatch(
-                cmdgen,
-                &bindings,
-                [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
-            ),
+            .storage_buffer("TransSortEntries", slices.trans_sort_entries);
+        compute_dispatches += u32::from(
+            report(
+                "cmdgen dispatch",
+                ctx.dispatch(cmdgen, &bindings, section_groups),
+            )
+            .is_some(),
         );
         let prefix_bindings =
             DrawBindings::new().storage_buffer("TransSortMeta", slices.trans_sort_meta);
-        report(
-            "trans_prefix dispatch",
-            ctx.dispatch(trans_prefix, &prefix_bindings, [1, 1, 1]),
+        compute_dispatches += u32::from(
+            report(
+                "trans_prefix dispatch",
+                ctx.dispatch(trans_prefix, &prefix_bindings, [1, 1, 1]),
+            )
+            .is_some(),
         );
         let scatter_bindings = DrawBindings::new()
             .storage_buffer("SectionBuffer", slices.sections)
             .storage_buffer("TranslucentCommands", slices.translucent_commands)
             .storage_buffer("TransSortMeta", slices.trans_sort_meta)
             .storage_buffer("TransSortEntries", slices.trans_sort_entries);
-        report(
-            "trans_scatter dispatch",
-            ctx.dispatch(
-                trans_scatter,
-                &scatter_bindings,
-                [sections.div_ceil(CMDGEN_WORKGROUP), 1, 1],
-            ),
+        compute_dispatches += u32::from(
+            report(
+                "trans_scatter dispatch",
+                ctx.dispatch(trans_scatter, &scatter_bindings, section_groups),
+            )
+            .is_some(),
         );
     });
     report("add_compute_pass", added);
@@ -1270,19 +1074,23 @@ pub fn setup_compute(
                 .inline_uniform("SsaoParams", &ssao_params)
                 .texture("WorldDepthTex", TextureSource::WorldDepth)
                 .storage_image("SsaoOut", ssao_target.dest());
-            report(
-                "ssao dispatch",
-                ctx.dispatch(
-                    ssao_pipe,
-                    &bindings,
-                    [sw.div_ceil(HIZ_WORKGROUP), sh.div_ceil(HIZ_WORKGROUP), 1],
-                ),
+            compute_dispatches += u32::from(
+                report(
+                    "ssao dispatch",
+                    ctx.dispatch(
+                        ssao_pipe,
+                        &bindings,
+                        [sw.div_ceil(SSAO_WORKGROUP), sh.div_ceil(SSAO_WORKGROUP), 1],
+                    ),
+                )
+                .is_some(),
             );
         });
         if report("add_ssao_compute_pass", added_ssao).is_some() {
             SSAO_WRITTEN.store(true, Ordering::Release);
         }
     }
+    COMPUTE_DISPATCHES.store(compute_dispatches, Ordering::Relaxed);
 }
 
 /// Prepares this frame's two indirect draws (opaque in [`OPAQUE_STAGE`], translucent in
@@ -1546,6 +1354,7 @@ pub struct DhStats {
     pub generated_columns: u64,
     pub saved_sections: u64,
     pub frames_drawn: u64,
+    pub compute_dispatches: u32,
 }
 
 /// Shared runtime state accessible from `Hooks` and the stage renderer.
@@ -1788,6 +1597,7 @@ pub fn stats() -> DhStats {
         generated_columns,
         saved_sections: rt.saved_sections.load(Ordering::Relaxed),
         frames_drawn: rt.frames_drawn.load(Ordering::Relaxed),
+        compute_dispatches: COMPUTE_DISPATCHES.load(Ordering::Relaxed),
     }
 }
 
@@ -1917,8 +1727,186 @@ fn report_arena<T>(what: &'static str, result: Result<T, ArenaError>) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mod_api::BufferError;
+    use mod_api::{BindingKind, BufferError};
     use std::cell::Cell;
+
+    /// Returns `(size, alignment)` for a GLSL struct or interface block. This handles the
+    /// declaration subset used by the compute shaders; unsupported member syntax fails loudly.
+    fn glsl_struct_layout(
+        context: &str,
+        body: &[&str],
+        std140: bool,
+        structs: &HashMap<&str, [(u32, u32); 2]>,
+    ) -> (u32, u32) {
+        let body = body
+            .strip_suffix(&[";"])
+            .unwrap_or_else(|| panic!("{context}: expected a terminated member list"));
+        let mut members = body.split(|&token| token == ";").peekable();
+        let mut offset = 0u32;
+        let mut struct_align = if std140 { 16 } else { 1 };
+        while let Some(member) = members.next() {
+            let &[ty, _, ref suffix @ ..] = member else {
+                panic!("{context}: unsupported member declaration {member:?}");
+            };
+            let (mut size, mut align) = match ty {
+                "uint" | "int" | "float" => (4, 4),
+                "uvec2" | "ivec2" | "vec2" => (8, 8),
+                "uvec4" | "ivec4" | "vec4" => (16, 16),
+                "mat4" => (64, 16),
+                _ => structs
+                    .get(ty)
+                    .unwrap_or_else(|| panic!("{context}: unsupported member type {ty}"))
+                    [usize::from(std140)],
+            };
+            let count = match suffix {
+                [] => None,
+                ["[", "]"] if members.peek().is_none() => Some(1),
+                ["[", count, "]"] => Some(
+                    count
+                        .parse::<u32>()
+                        .unwrap_or_else(|_| panic!("{context}: unsupported array length {count}")),
+                ),
+                _ => panic!("{context}: unsupported member declaration {member:?}"),
+            };
+            if let Some(count) = count {
+                if std140 {
+                    align = align.max(16);
+                }
+                // The minimum binding includes one stride for an unsized trailing array.
+                size = size.next_multiple_of(align) * count;
+            }
+            offset = offset.next_multiple_of(align) + size;
+            struct_align = struct_align.max(align);
+        }
+        // Naga rounds the whole block, including when the last member is an unsized array.
+        (offset.next_multiple_of(struct_align), struct_align)
+    }
+
+    /// Finds interface blocks by block name (not their optional instance name).
+    fn glsl_buffer_min_sizes<'a>(
+        shader: &str,
+        mut source: &'a str,
+    ) -> HashMap<&'a str, (bool, u32)> {
+        let mut tokens = Vec::new();
+        loop {
+            source = source.trim_start();
+            let Some(first) = source.chars().next() else {
+                break;
+            };
+            if let Some(comment) = source.strip_prefix("//") {
+                source = comment.split_once('\n').map_or("", |(_, rest)| rest);
+            } else if let Some(comment) = source.strip_prefix("/*") {
+                source = comment
+                    .split_once("*/")
+                    .unwrap_or_else(|| panic!("{shader}: unterminated block comment"))
+                    .1;
+            } else {
+                let word_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                let end = if word_char(first) {
+                    source.find(|c| !word_char(c)).unwrap_or(source.len())
+                } else {
+                    first.len_utf8()
+                };
+                let (token, rest) = source.split_at(end);
+                tokens.push(token);
+                source = rest;
+            }
+        }
+
+        let mut structs = HashMap::new();
+        let mut blocks = HashMap::new();
+        for (i, declaration) in tokens.windows(3).enumerate() {
+            let &[kind @ ("struct" | "buffer" | "uniform"), name, "{"] = declaration else {
+                continue;
+            };
+            let context = format!("{shader} / {name}");
+            let tail = &tokens[i + 3..];
+            let end = tail
+                .iter()
+                .position(|&token| token == "}")
+                .unwrap_or_else(|| panic!("{context}: unterminated declaration"));
+            let body = &tail[..end];
+            if kind == "struct" {
+                let layouts = [false, true]
+                    .map(|std140| glsl_struct_layout(&context, body, std140, &structs));
+                assert!(
+                    structs.insert(name, layouts).is_none(),
+                    "{context}: duplicate struct"
+                );
+            } else {
+                let std140 = kind == "uniform";
+                let standard = if std140 { "std140" } else { "std430" };
+                let header = tokens[..i]
+                    .rsplit(|&token| matches!(token, ";" | "}" | "{"))
+                    .next()
+                    .unwrap();
+                assert!(
+                    header
+                        .windows(4)
+                        .any(|layout| layout == ["layout", "(", standard, ")"]),
+                    "{context}: expected layout({standard})"
+                );
+                let (size, _) = glsl_struct_layout(&context, body, std140, &structs);
+                assert!(
+                    blocks.insert(name, (std140, size)).is_none(),
+                    "{context}: duplicate block"
+                );
+            }
+        }
+        blocks
+    }
+
+    #[test]
+    fn compute_pipeline_buffer_min_binding_sizes_match_glsl() {
+        let old_queue = glsl_buffer_min_sizes(
+            "old cmdgen",
+            "layout(std430) readonly buffer RenderQueue { uvec4 header; uint section_ids[]; };",
+        );
+        // This is the old declaration that made the 20-byte binding too small.
+        assert_eq!(old_queue["RenderQueue"], (false, 32));
+
+        let uniform = glsl_buffer_min_sizes(
+            "std140 padding",
+            "struct Pair { vec2 xy; float z; };
+             layout(std140) uniform Params { float head; Pair values[2]; float tail[2]; };",
+        );
+        assert_eq!(uniform["Params"], (true, 80));
+
+        for pipeline in compute_pipelines() {
+            let shader = &pipeline.shader;
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "assets/{}/shaders/compute/{}.csh",
+                shader.namespace(),
+                shader.path(),
+            ));
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            let mut blocks = glsl_buffer_min_sizes(shader.as_str(), &source);
+            for entry in pipeline.bind_group_layout.entries() {
+                let (std140, declared) = match entry.kind {
+                    BindingKind::StorageBuffer { min_size, .. } => (false, min_size),
+                    BindingKind::UniformBuffer { min_size, .. } => (true, min_size),
+                    _ => continue,
+                };
+                let name = entry.name.as_str();
+                let (block_std140, required) = blocks
+                    .remove(name)
+                    .unwrap_or_else(|| panic!("{shader} / {name}: missing GLSL block"));
+                assert_eq!(
+                    std140, block_std140,
+                    "{shader} / {name}: buffer kind mismatch"
+                );
+                assert!(
+                    declared >= required,
+                    "{shader} / {name}: min_binding_size {declared} is below GLSL minimum {required}"
+                );
+            }
+            assert!(
+                blocks.is_empty(),
+                "{shader}: unbound GLSL blocks: {blocks:?}"
+            );
+        }
+    }
 
     #[test]
     fn ssao_size_rounds_up_to_half_resolution() {
