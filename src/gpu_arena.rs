@@ -918,7 +918,6 @@ impl GpuArena {
         dimension: Option<&str>,
         y_bounds: Option<(i32, i32)>,
     ) -> Result<(), ArenaError> {
-        self.residency.nodes_dirty |= self.residency.last_flushed_y_bounds != y_bounds;
         let Some(pending) = self
             .residency
             .prepare_flush(dimension, y_bounds, GPU_MAX_NODES)?
@@ -1024,13 +1023,13 @@ impl ArenaResidency {
     }
 
     fn prepare_flush(
-        &self,
+        &mut self,
         dimension: Option<&str>,
         y_bounds: Option<(i32, i32)>,
         max_nodes: u64,
     ) -> Result<Option<PendingFlush>, ArenaError> {
-        let rebuild = self.nodes_dirty || self.last_flushed_y_bounds != y_bounds;
-        if !rebuild && self.dirty.is_empty() {
+        self.nodes_dirty |= self.last_flushed_y_bounds != y_bounds;
+        if self.is_published() {
             return Ok(None);
         }
         let mut pending = PendingFlush {
@@ -1039,7 +1038,7 @@ impl ArenaResidency {
             root_count: self.root_count,
             section_runs: Vec::new(),
         };
-        if rebuild {
+        if self.nodes_dirty {
             let known_empty = dimension.and_then(|dim| self.known_empty.get(dim));
             let (nodes, mut roots) = build_node_tree(&self.live_meta, known_empty, y_bounds);
             if nodes.len() as u64 > max_nodes {
@@ -1465,5 +1464,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        // A bounds-only rebuild also invalidates the published snapshot until committed.
+        assert!(!arena.is_published());
     }
 }
