@@ -638,11 +638,14 @@ impl NeighborBorders {
     }
 }
 
-/// `Mipper.mip` with surface-wins tie-breaking: pick the parent voxel from eight children
-/// `children[x << 2 | y << 1 | z]`. Primary key is `opacity(block_id)` (`Mapper.getBlockStateOpacity`);
-/// among equal-opacity children, the upper layer (`y = 1`) always beats the lower layer (`y = 0`)
-/// so surface grass/snow/leaves never lose to underground dirt/stone on slopes, and within that
-/// layer the majority block wins (breaking ties deterministically by index).
+/// Pick the parent voxel from eight `children[x << 2 | y << 1 | z]` with a surface-wins rule:
+/// use the upper layer (`y = 1`) unless all four of its children are air. In the chosen layer,
+/// prefer higher `opacity(block_id)` (`Mapper.getBlockStateOpacity`), then the majority block,
+/// breaking ties by higher index.
+///
+/// Unlike Voxy's `Mipper.mip`, which takes the highest opacity across all eight children, this
+/// prioritizes the upper layer because it is what the top-down view of an LOD voxel shows.
+/// Opacity-first across both layers would erase water over a shallow ocean or river floor.
 pub fn mip_voxels(children: [Voxel; 8], opacity: &dyn Fn(u32) -> u8) -> Voxel {
     let mut best_op: i32 = -1;
     let mut best_y: i32 = -1;
@@ -652,7 +655,7 @@ pub fn mip_voxels(children: [Voxel; 8], opacity: &dyn Fn(u32) -> u8) -> Voxel {
         }
         let op = opacity(v.block_id()) as i32;
         let y = ((idx >> 1) & 1) as i32;
-        if op > best_op || (op == best_op && y > best_y) {
+        if y > best_y || (y == best_y && op > best_op) {
             best_op = op;
             best_y = y;
         }
@@ -879,6 +882,7 @@ mod tests {
     const LOG: u32 = 2;
     const LEAVES: u32 = 3;
     const WATER: u32 = 4;
+    const SAND: u32 = 5;
 
     fn opacity(id: u32) -> u8 {
         match id {
@@ -994,6 +998,23 @@ mod tests {
         let mut kids = [Voxel::AIR; 8];
         kids[0b010] = Voxel::new(WATER, 0, 0, 0);
         assert_eq!(mip_voxels(kids, &opacity).block_id(), WATER);
+    }
+
+    #[test]
+    fn mip_preserves_upper_water_over_stone() {
+        let mut kids = [Voxel::AIR; 8];
+        kids[0b010] = Voxel::new(WATER, 0, 15, 0);
+        kids[0b101] = Voxel::new(STONE, 0, 15, 0);
+        assert_eq!(mip_voxels(kids, &opacity), kids[0b010]);
+    }
+
+    #[test]
+    fn mip_prefers_upper_sand_over_water_in_the_same_layer() {
+        let mut kids = [Voxel::AIR; 8];
+        kids[0b010] = Voxel::new(SAND, 0, 15, 0);
+        kids[0b111] = Voxel::new(WATER, 0, 15, 0);
+        kids[0b101] = Voxel::new(STONE, 0, 15, 0);
+        assert_eq!(mip_voxels(kids, &opacity), kids[0b010]);
     }
 
     #[test]

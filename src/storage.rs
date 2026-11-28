@@ -328,12 +328,12 @@ pub fn legacy_section_path(world_dir: &Path, dimension: &str, pos: SectionPos) -
 //
 // ```text
 //  0  magic            "DHLOD003"
-//  8  format_version   u8   = 4             local record version
+//  8  format_version   u8   = 5             local record version
 //  9  compression      u8                   DTO compressionModeValue (lines 89, 132); MODE values
 // 10  detail           u8   0..=4           `OctreeSectionPos::detail` (DTO packs it in `pos` long, line 765)
 // 11  x, y, z          i32 each             rest of `OctreeSectionPos`
 // 23  revision         u64                  `OctreeSection::revision` (DTO lastModifiedUnixDateTime, line 799)
-// 31  flags            u8                   bit 0: complete source coverage (v4 only)
+// 31  flags            u8                   bit 0: complete source coverage (absent in legacy v3)
 // 32  data_len         u32  + data blob     DTO compressedDataByteArray (lines 75, 769-770)
 //     mapping_len      u32  + mapping blob  DTO compressedMappingByteArray (lines 86, 789-790)
 //     crc32            u32  over all preceding bytes   DTO dataChecksum (lines 73, 766)
@@ -357,7 +357,8 @@ pub fn legacy_section_path(world_dir: &Path, dimension: &str, pos: SectionPos) -
 pub const MAGIC_V3: &[u8; 8] = b"DHLOD003";
 // DHLOD003 originally used the upstream DTO version as its version byte.
 const OCTREE_FORMAT_VERSION_LEGACY_V3: u8 = 3;
-pub const OCTREE_FORMAT_VERSION: u8 = 4;
+// Reject v4 records so cached coarse terrain rebuilds with the surface water rules.
+pub const OCTREE_FORMAT_VERSION: u8 = 5;
 const OCTREE_FLAG_COMPLETE: u8 = 1;
 /// Default compressor: `Config.java` line 1688 sets `dataCompression` to `Z_STD_BLOCK` (4).
 pub const DEFAULT_OCTREE_COMPRESSION: DhV2CompressionMode = DhV2CompressionMode::ZstdBlock;
@@ -2282,7 +2283,7 @@ mod tests {
         ] {
             let bytes = encode_octree_section(&sec, &mapping, true, mode).unwrap();
             assert_eq!(&bytes[..8], MAGIC_V3);
-            assert_eq!(bytes[8], 4);
+            assert_eq!(bytes[8], 5);
             assert_eq!(bytes[9], mode as u8);
             let (back, back_map, complete) = decode_octree_section(&bytes).unwrap();
             assert_eq!(back.pos, pos, "{mode:?}");
@@ -2372,7 +2373,7 @@ mod tests {
             v[n..].copy_from_slice(&crc.to_be_bytes());
             v
         };
-        for version in [0, 1, 2, 5, u8::MAX] {
+        for version in [0, 1, 2, 4, u8::MAX] {
             let mut v = good.clone();
             v[8] = version;
             assert_eq!(
