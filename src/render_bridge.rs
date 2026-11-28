@@ -72,15 +72,22 @@ fn storage(name: &str, read_only: bool, min_size: u32) -> mod_api::BindEntry {
     )
 }
 
+const QUAD_PARAMS_BYTES: u32 = 128;
+
 /// The quad pipelines' set-1 layout (`voxy_quads.vsh/fsh`).
 pub fn quad_layout() -> mod_api::BindGroupLayout {
     use mod_api::{SamplerAddress, SamplerFilter};
     mod_api::BindGroupLayout::builder()
-        .uniform_buffer("QuadParams", 160)
+        .uniform_buffer("QuadParams", QUAD_PARAMS_BYTES)
         .entry(storage("QuadBuffer", true, 8))
         .entry(storage("SectionBuffer", true, 32))
         .entry(storage("ModelBuffer", true, 64))
         .entry(storage("BiomeTintBuffer", true, 4))
+        .sampler(
+            "Lightmap",
+            SamplerFilter::Linear,
+            SamplerAddress::ClampToEdge,
+        )
         .sampler(
             "BlockAtlas",
             SamplerFilter::Linear,
@@ -323,32 +330,23 @@ impl Std140 {
     }
 }
 
-/// `QuadParams` (160 bytes), shared by `voxy_quads.vsh` / `.fsh`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors the 160-byte QuadParams block field by field"
-)]
+/// `QuadParams` (128 bytes), shared by `voxy_quads.vsh` / `.fsh`.
+/// `fog_and_clip` holds fog start, fog end, vanilla clip distance, and spherical fog (0/1).
 pub fn quad_params_bytes(
     view_proj: [f32; 16],
     camera: [f64; 3],
-    near_dh: f32,
-    far_dh: f32,
-    clip_dist: f32,
-    sun: f32,
-    fog: [f32; 4],
+    near_plane: f32,
+    fog_and_clip: [f32; 4],
     fog_color: [f32; 4],
-    is_hdr: bool,
     shading: bool,
 ) -> Vec<u8> {
     let (base, sub) = camera_split(camera);
-    Std140(Vec::with_capacity(160))
+    Std140(Vec::with_capacity(QUAD_PARAMS_BYTES as usize))
         .f32s(&view_proj)
-        .i32s(&[base[0], base[1], base[2], 0])
-        .f32s(&[sub[0], sub[1], sub[2], 0.0])
-        .f32s(&[near_dh, far_dh, clip_dist, sun])
-        .f32s(&fog)
-        .f32s(&fog_color)
-        .u32s(&[u32::from(is_hdr), u32::from(shading), 0, 0])
+        .i32s(&[base[0], base[1], base[2], i32::from(shading)])
+        .f32s(&[sub[0], sub[1], sub[2], near_plane])
+        .f32s(&fog_and_clip)
+        .f32s(&[fog_color[0], fog_color[1], fog_color[2], 0.0]) // std140 tail padding
         .0
 }
 
@@ -1147,17 +1145,13 @@ pub fn prepare_draws(
         view_proj,
         camera.position,
         camera.near,
-        far_dh,
-        clip_dist,
-        frame.sun_brightness,
         [
             fog_start,
             fog_end,
-            0.0, // unused fog.z lane
+            clip_dist,
             f32::from(frame.config.fog_spherical),
         ],
         frame.fog_color,
-        false, // frames store vanilla gamma; no sRGB decode in the shader
         frame.config.shading_enabled,
     );
     let (base, sub) = camera_split(camera.position);
@@ -1251,6 +1245,7 @@ pub fn prepare_draws(
                 .storage_buffer("SectionBuffer", s.sections)
                 .storage_buffer("ModelBuffer", s.models)
                 .storage_buffer("BiomeTintBuffer", s.biome_tints)
+                .texture("Lightmap", TextureSource::Lightmap)
                 .texture("BlockAtlas", TextureSource::DynamicTexture(&atlas_id))
         };
         let draw = IndirectDraw::new(pipeline, cmds, count, &bindings).with_mesh(quad_mesh);
@@ -1342,7 +1337,6 @@ pub struct RenderFrameParams {
     pub config: DhConfig,
     pub fog_color: [f32; 4],
     pub vanilla_far_blocks: f32,
-    pub sun_brightness: f32,
 }
 
 /// Telemetry counters surfaced on the F3 debug screen (`RegisterDebugEntriesEvent`).
@@ -1378,7 +1372,6 @@ pub struct DhState {
     pub has_camera: bool,
     pub fog_color: [f32; 4],
     pub vanilla_far_blocks: f32,
-    pub sun_brightness: f32,
     pub rain_level: f32,
     pub thunder_level: f32,
     /// Client's current vanilla render distance in chunks (from `ClientHost::graphics_options`).
@@ -1435,7 +1428,6 @@ impl Default for DhState {
             has_camera: false,
             fog_color: [0.75, 0.85, 1.0, 1.0],
             vanilla_far_blocks: 80.0,
-            sun_brightness: 1.0,
             rain_level: 0.0,
             thunder_level: 0.0,
             vanilla_render_distance_chunks: 12,
@@ -1545,7 +1537,6 @@ pub fn begin_render_frame(camera: [f64; 3]) -> RenderFrameParams {
         config: st.config,
         fog_color: st.fog_color,
         vanilla_far_blocks: st.vanilla_far_blocks,
-        sun_brightness: st.sun_brightness,
     }
 }
 
@@ -1599,36 +1590,6 @@ pub fn stats() -> DhStats {
         frames_drawn: rt.frames_drawn.load(Ordering::Relaxed),
         compute_dispatches: COMPUTE_DISPATCHES.load(Ordering::Relaxed),
     }
-}
-
-/// Compute sun brightness `0.18..=1.0` from Minecraft's `day_time` (`0..24000`), dimension, and
-/// live rain/thunder weather levels (`0.0..=1.0`).
-pub fn sun_brightness_from_day_time_and_weather(
-    day_time: i64,
-    dimension: &str,
-    rain_level: f32,
-    thunder_level: f32,
-) -> f32 {
-    if dimension == "minecraft:the_nether" {
-        return 0.72;
-    }
-    if dimension == "minecraft:the_end" {
-        return 0.80;
-    }
-    let t = (day_time.rem_euclid(24_000) as f32) / 24_000.0;
-    // Vanilla celestial angle: noon at t = 0.25 (6000), midnight at t = 0.75 (18000).
-    let angle = (t - 0.25) * std::f32::consts::TAU;
-    let sun_h = angle.cos();
-    let day_factor = ((sun_h * 2.0) + 0.5).clamp(0.0, 1.0);
-    // Match vanilla `ClientLevel.getSkyDarken`: rain dims sky up to 31.25%, thunder another 25%.
-    let weather_scale =
-        (1.0 - rain_level.clamp(0.0, 1.0) * 0.3125) * (1.0 - thunder_level.clamp(0.0, 1.0) * 0.25);
-    (0.24 + 0.76 * day_factor * weather_scale).clamp(0.18, 1.0)
-}
-
-/// Compute sun brightness `0.2..=1.0` from Minecraft's `day_time` (`0..24000`) in clear weather.
-pub fn sun_brightness_from_day_time(day_time: i64, dimension: &str) -> f32 {
-    sun_brightness_from_day_time_and_weather(day_time, dimension, 0.0, 0.0)
 }
 
 const REPORT_INITIAL_BURST: u64 = 5;
@@ -1731,8 +1692,51 @@ mod tests {
     use std::cell::Cell;
     use std::path::Path;
 
-    /// Returns `(size, alignment)` for a GLSL struct or interface block. This handles the
-    /// declaration subset used by the compute shaders; unsupported member syntax fails loudly.
+    #[test]
+    fn quad_params_match_both_shader_blocks() {
+        let layout = quad_layout();
+        let entry = layout
+            .entries()
+            .iter()
+            .find(|entry| entry.name.as_str() == "QuadParams")
+            .unwrap();
+        let BindingKind::UniformBuffer { min_size, .. } = entry.kind else {
+            panic!("QuadParams must be a uniform buffer");
+        };
+        for source in [
+            include_str!("../assets/distantsunrises/shaders/core/voxy_quads.vsh"),
+            include_str!("../assets/distantsunrises/shaders/core/voxy_quads.fsh"),
+        ] {
+            assert_eq!(
+                glsl_buffer_min_sizes("voxy_quads", source)["QuadParams"],
+                (true, min_size)
+            );
+        }
+        for shading in [false, true] {
+            let bytes = quad_params_bytes(
+                [0.0; 16],
+                [-31.0, 34.0, 67.0],
+                0.25,
+                [256.0, 512.0, 64.0, 1.0],
+                [0.5, 0.75, 1.0, 1.0],
+                shading,
+            );
+            assert_eq!(bytes.len(), min_size as usize);
+            assert_eq!(bytes.len(), 128);
+            let base_and_shading = [-1i32, 1, 2, i32::from(shading)];
+            assert_eq!(
+                &bytes[64..80],
+                base_and_shading.map(i32::to_le_bytes).as_flattened()
+            );
+            let remaining = [
+                1.0f32, 2.0, 3.0, 0.25, 256.0, 512.0, 64.0, 1.0, 0.5, 0.75, 1.0, 0.0,
+            ];
+            assert_eq!(&bytes[80..], remaining.map(f32::to_le_bytes).as_flattened());
+        }
+    }
+
+    /// Returns `(size, alignment)` for a GLSL struct or interface block. Unsupported member
+    /// syntax fails loudly.
     fn glsl_struct_layout(
         context: &str,
         body: &[&str],
@@ -1752,6 +1756,7 @@ mod tests {
             let (mut size, mut align) = match ty {
                 "uint" | "int" | "float" => (4, 4),
                 "uvec2" | "ivec2" | "vec2" => (8, 8),
+                "ivec3" | "vec3" => (12, 16),
                 "uvec4" | "ivec4" | "vec4" => (16, 16),
                 "mat4" => (64, 16),
                 _ => structs
@@ -1955,7 +1960,6 @@ mod tests {
             has_camera: true,
             fog_color: [0.1, 0.2, 0.3, 1.0],
             vanilla_far_blocks: 512.0,
-            sun_brightness: 0.5,
             rain_level: 0.25,
             thunder_level: 0.75,
             vanilla_render_distance_chunks: 32,
@@ -2032,7 +2036,6 @@ mod tests {
         assert_eq!(st.camera_pos, camera.position);
         assert_eq!(st.fog_color, [0.1, 0.2, 0.3, 1.0]);
         assert_eq!(st.vanilla_far_blocks, 512.0);
-        assert_eq!(st.sun_brightness, 0.5);
         assert_eq!((st.rain_level, st.thunder_level), (0.25, 0.75));
         assert_eq!(st.vanilla_render_distance_chunks, 32);
         for dim in [unloaded, active] {
@@ -2369,26 +2372,5 @@ mod tests {
             reports.flush(|key, total, suppressed| flushed.push((key, total, suppressed)));
         }
         assert_eq!(flushed, [(cause, 63, 13)]);
-    }
-
-    #[test]
-    fn weather_dims_overworld_sun_brightness_but_not_nether_or_end() {
-        let clear_noon =
-            sun_brightness_from_day_time_and_weather(6_000, "minecraft:overworld", 0.0, 0.0);
-        let storm_noon =
-            sun_brightness_from_day_time_and_weather(6_000, "minecraft:overworld", 1.0, 1.0);
-        let clear_midnight =
-            sun_brightness_from_day_time_and_weather(18_000, "minecraft:overworld", 0.0, 0.0);
-        assert!(clear_noon > 0.99);
-        assert!(storm_noon < clear_noon - 0.25);
-        assert!(storm_noon > clear_midnight);
-        assert_eq!(
-            sun_brightness_from_day_time_and_weather(18_000, "minecraft:the_nether", 1.0, 1.0),
-            0.72
-        );
-        assert_eq!(
-            sun_brightness_from_day_time_and_weather(18_000, "minecraft:the_end", 1.0, 1.0),
-            0.80
-        );
     }
 }

@@ -8,8 +8,8 @@
 //! - `pipeline` greedy-meshes each section into 8-byte packed quads (`mesh`) using the baked
 //!   per-block models and 4x4 face atlas (`bakery`) and hands them to the GPU arena.
 //! - `network::octree_sync` streams sections to remote clients over one raw play channel.
-//! - The client tracks camera, day-time lighting, settings (`Options > Mods`), fog colors
-//!   (`render_fog`) and F3 telemetry. Five GLSL octree traversal dispatches cull and select LOD
+//! - The client tracks camera, settings (`Options > Mods`), fog colors (`render_fog`) and
+//!   F3 telemetry. Five GLSL octree traversal dispatches cull and select LOD
 //!   sections into a compact `RenderQueue`. Command generation consumes it without reculling
 //!   sections, and GPU indirect draws render the quads from `gpu_arena`; shader packs use
 //!   pack-linked pipelines.
@@ -48,9 +48,7 @@ use crate::lod::{
 use crate::octree::MAX_OCTREE_DETAIL;
 use crate::octree_ingest::OctreeIngestStore;
 use crate::pipeline::DistantCoverage;
-use crate::render_bridge::{
-    DesiredCache, DhState, runtime, stats, sun_brightness_from_day_time_and_weather,
-};
+use crate::render_bridge::{DesiredCache, DhState, runtime, stats};
 use mod_api::client::fog::FogType;
 use mod_api::{
     self, BlockChangedEvent, ChunkLoadEvent, ClientBlockChangedEvent, ClientChunkLoadEvent,
@@ -296,7 +294,6 @@ impl Hooks for DistantHorizonsMod {
 
         // Don't publish a camera from menu ticks when play is obstructed.
         let cam = host.playing().then(|| host.camera()).flatten();
-        let clock = host.clock();
         let gfx_opts = host.graphics_options();
         let active_dim_now = rt.inner.lock().unwrap().active_dimension.clone();
         let (rain_level, thunder_level) = host
@@ -315,14 +312,6 @@ impl Hooks for DistantHorizonsMod {
                 st.camera_pos = camera.position;
                 st.has_camera = true;
                 st.vanilla_far_blocks = (st.vanilla_render_distance_chunks as f32) * 16.0;
-            }
-            if let Some(clk) = clock {
-                st.sun_brightness = sun_brightness_from_day_time_and_weather(
-                    clk.day_time,
-                    &st.active_dimension,
-                    st.rain_level,
-                    st.thunder_level,
-                );
             }
 
             let active_dim = st.active_dimension.clone();
