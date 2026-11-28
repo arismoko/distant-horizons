@@ -596,23 +596,6 @@ pub(crate) fn test_node_tree(
     build_node_tree(&live, Some(&empty), y_bounds).0
 }
 
-fn rebuild_node_tree_if_dirty(
-    nodes_dirty: bool,
-    live_meta: &HashMap<u32, LiveSectionMeta>,
-    known_empty: Option<&HashSet<OctreeSectionPos>>,
-    y_bounds: Option<(i32, i32)>,
-    max_nodes: u64,
-) -> Result<Option<NodeTree>, ArenaError> {
-    if !nodes_dirty {
-        return Ok(None);
-    }
-    let (nodes, roots) = build_node_tree(live_meta, known_empty, y_bounds);
-    if (nodes.len() as u64) > max_nodes {
-        return Err(ArenaError::NodesFull);
-    }
-    Ok(Some((nodes, roots)))
-}
-
 /// Whole-buffer [`StorageBufferSlice`]s of the arena's bound buffers.
 #[derive(Clone, Copy)]
 pub struct ArenaSlices {
@@ -679,10 +662,17 @@ struct ArenaResidency {
     live_meta: HashMap<u32, LiveSectionMeta>,
     /// Resolved empty meshes, scoped to the dimension whose geometry is resident.
     known_empty: HashMap<String, HashSet<OctreeSectionPos>>,
-    y_bounds: HashMap<String, (i32, i32)>,
+    last_flushed_y_bounds: Option<(i32, i32)>,
     nodes_dirty: bool,
     root_count: u32,
     dirty: BTreeMap<u32, SectionMeta>,
+}
+
+struct PendingFlush {
+    nodes_bytes: Vec<u8>,
+    roots_bytes: Vec<u8>,
+    root_count: u32,
+    section_runs: Vec<(u64, Vec<u8>)>,
 }
 
 impl GpuArena {
@@ -907,20 +897,12 @@ impl GpuArena {
         }
     }
 
-    pub(crate) fn set_dimension_y_bounds(&mut self, dimension: String, bounds: (i32, i32)) {
-        self.residency.nodes_dirty |=
-            self.residency.y_bounds.insert(dimension, bounds) != Some(bounds);
-    }
-
     pub(crate) fn clear_dimension_coverage(&mut self, dimension: Option<&str>) {
         if let Some(dim) = dimension {
             self.residency.nodes_dirty |= self.residency.known_empty.remove(dim).is_some();
-            self.residency.nodes_dirty |= self.residency.y_bounds.remove(dim).is_some();
         } else {
-            self.residency.nodes_dirty |=
-                !self.residency.known_empty.is_empty() || !self.residency.y_bounds.is_empty();
+            self.residency.nodes_dirty |= !self.residency.known_empty.is_empty();
             self.residency.known_empty.clear();
-            self.residency.y_bounds.clear();
         }
     }
 
@@ -934,27 +916,29 @@ impl GpuArena {
         &mut self,
         host: &mut dyn ClientHost,
         dimension: Option<&str>,
+        y_bounds: Option<(i32, i32)>,
     ) -> Result<(), ArenaError> {
-        let (nodes, roots, sections) = (self.nodes, self.roots, self.sections);
-        self.residency.flush_with(
-            dimension,
-            GPU_MAX_NODES,
-            |bytes| {
-                nodes
-                    .write_range(&*host, 0, bytes)
-                    .map_err(ArenaError::from)
-            },
-            |bytes| {
-                roots
-                    .write_range(&*host, 0, bytes)
-                    .map_err(ArenaError::from)
-            },
-            |offset, bytes| {
-                sections
-                    .write_range(&*host, offset, bytes)
-                    .map_err(ArenaError::from)
-            },
-        )
+        self.residency.nodes_dirty |= self.residency.last_flushed_y_bounds != y_bounds;
+        let Some(pending) = self
+            .residency
+            .prepare_flush(dimension, y_bounds, GPU_MAX_NODES)?
+        else {
+            return Ok(());
+        };
+        // The buffer API queues each write separately. A failure leaves the whole batch pending
+        // and traversal disabled until every write in a subsequent flush succeeds.
+        if !pending.nodes_bytes.is_empty() {
+            self.nodes.write_range(&*host, 0, &pending.nodes_bytes)?;
+        }
+        if !pending.roots_bytes.is_empty() {
+            self.roots.write_range(&*host, 0, &pending.roots_bytes)?;
+        }
+        for (offset, bytes) in pending.section_runs {
+            self.sections.write_range(&*host, offset, &bytes)?;
+        }
+        self.residency.commit_flush(pending.root_count);
+        self.residency.last_flushed_y_bounds = y_bounds;
+        Ok(())
     }
 
     /// Writes baked model records starting at `first_model` (`words.len()` a multiple of 16).
@@ -1014,7 +998,7 @@ impl ArenaResidency {
             live: HashMap::new(),
             live_meta: HashMap::new(),
             known_empty: HashMap::new(),
-            y_bounds: HashMap::new(),
+            last_flushed_y_bounds: None,
             nodes_dirty: false,
             root_count: 0,
             dirty: BTreeMap::new(),
@@ -1039,64 +1023,65 @@ impl ArenaResidency {
         Ok(())
     }
 
-    /// Publish the replacement tree before retiring metadata. On failure keep the unwritten
-    /// changes pending, so traversal cannot run until a later flush finishes the generation.
-    fn flush_with(
-        &mut self,
+    fn prepare_flush(
+        &self,
         dimension: Option<&str>,
+        y_bounds: Option<(i32, i32)>,
         max_nodes: u64,
-        mut write_nodes: impl FnMut(&[u8]) -> Result<(), ArenaError>,
-        mut write_roots: impl FnMut(&[u8]) -> Result<(), ArenaError>,
-        mut write_sections: impl FnMut(u64, &[u8]) -> Result<(), ArenaError>,
-    ) -> Result<(), ArenaError> {
-        let known_empty = dimension.and_then(|dim| self.known_empty.get(dim));
-        let y_bounds = dimension.and_then(|dim| self.y_bounds.get(dim).copied());
-        if let Some((node_list, root_list)) = rebuild_node_tree_if_dirty(
-            self.nodes_dirty,
-            &self.live_meta,
-            known_empty,
-            y_bounds,
-            max_nodes,
-        )? {
-            if !node_list.is_empty() {
-                let mut nbytes = Vec::with_capacity(node_list.len() * GPU_NODE_BYTES as usize);
-                for n in &node_list {
-                    nbytes.extend_from_slice(&n.to_bytes());
-                }
-                write_nodes(&nbytes)?;
+    ) -> Result<Option<PendingFlush>, ArenaError> {
+        let rebuild = self.nodes_dirty || self.last_flushed_y_bounds != y_bounds;
+        if !rebuild && self.dirty.is_empty() {
+            return Ok(None);
+        }
+        let mut pending = PendingFlush {
+            nodes_bytes: Vec::new(),
+            roots_bytes: Vec::new(),
+            root_count: self.root_count,
+            section_runs: Vec::new(),
+        };
+        if rebuild {
+            let known_empty = dimension.and_then(|dim| self.known_empty.get(dim));
+            let (nodes, mut roots) = build_node_tree(&self.live_meta, known_empty, y_bounds);
+            if nodes.len() as u64 > max_nodes {
+                return Err(ArenaError::NodesFull);
             }
-            let rcount = root_list.len().min(GPU_TRAV_QUEUE_CAP as usize);
-            if rcount > 0 {
-                let mut rbytes = Vec::with_capacity(rcount * 4);
-                for &r in &root_list[..rcount] {
-                    rbytes.extend_from_slice(&r.to_le_bytes());
-                }
-                write_roots(&rbytes)?;
-            }
-            self.root_count = rcount as u32;
-            self.nodes_dirty = false;
+            roots.truncate(GPU_TRAV_QUEUE_CAP as usize);
+            pending.root_count = roots.len() as u32;
+            pending
+                .nodes_bytes
+                .reserve(nodes.len() * GPU_NODE_BYTES as usize);
+            pending
+                .nodes_bytes
+                .extend(nodes.into_iter().flat_map(GpuNode::to_bytes));
+            pending.roots_bytes.reserve(roots.len() * 4);
+            pending
+                .roots_bytes
+                .extend(roots.into_iter().flat_map(u32::to_le_bytes));
         }
 
-        // Coalesce consecutive metadata slots; retain the whole batch on any failed write.
-        let mut run_start = 0u32;
-        let mut run: Vec<u8> = Vec::new();
-        let mut next = 0u32;
+        // Coalesce consecutive metadata slots.
+        let mut next = None;
         for (&id, meta) in &self.dirty {
-            if !run.is_empty() && id != next {
-                write_sections(run_start as u64 * SECTION_METADATA_BYTES, &run)?;
-                run.clear();
+            if next != Some(id) {
+                pending
+                    .section_runs
+                    .push((u64::from(id) * SECTION_METADATA_BYTES, Vec::new()));
             }
-            if run.is_empty() {
-                run_start = id;
-            }
-            run.extend_from_slice(&meta.to_bytes());
-            next = id + 1;
+            pending
+                .section_runs
+                .last_mut()
+                .unwrap()
+                .1
+                .extend_from_slice(&meta.to_bytes());
+            next = Some(id + 1);
         }
-        if !run.is_empty() {
-            write_sections(run_start as u64 * SECTION_METADATA_BYTES, &run)?;
-        }
+        Ok(Some(pending))
+    }
+
+    fn commit_flush(&mut self, root_count: u32) {
+        self.root_count = root_count;
+        self.nodes_dirty = false;
         self.dirty.clear();
-        Ok(())
     }
 }
 
@@ -1423,80 +1408,62 @@ mod tests {
             .known_empty
             .insert(dim.to_owned(), kids[2..].iter().copied().collect());
         arena.nodes_dirty = true;
-        let child_mask = |bytes: &[u8]| u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        arena
-            .flush_with(
-                Some(dim),
-                GPU_MAX_NODES,
-                |bytes| {
-                    assert_eq!(child_mask(bytes), 0b11);
-                    Ok(())
-                },
-                |_| Ok(()),
-                |_, _| Ok(()),
-            )
+        let initial = arena
+            .prepare_flush(Some(dim), None, GPU_MAX_NODES)
+            .unwrap()
             .unwrap();
+        assert_eq!(&initial.nodes_bytes[16..20], &0b11u32.to_le_bytes());
+        assert_eq!(initial.root_count, 1);
+        arena.commit_flush(initial.root_count);
         assert!(arena.is_published());
 
         arena.remove(1).unwrap();
         assert!(!arena.is_published());
-        let oversized = arena.flush_with(
-            Some(dim),
-            1,
-            |_| panic!("oversized node tree written"),
-            |_| panic!("roots written for oversized tree"),
-            |_, _| panic!("retired metadata written before tree fit"),
-        );
-        assert!(matches!(oversized, Err(ArenaError::NodesFull)));
-        assert!(arena.nodes_dirty);
-        assert_eq!(arena.root_count, 1);
-        assert_eq!(arena.dirty.get(&1), Some(&SectionMeta::default()));
-        assert!(!arena.is_published());
-
-        let failed_root_write = arena.flush_with(
-            Some(dim),
-            GPU_MAX_NODES,
-            |_| Ok(()),
-            |_| Err(ArenaError::Buffer(BufferError::OutOfRange)),
-            |_, _| panic!("retired metadata written after failed root write"),
-        );
         assert!(matches!(
-            failed_root_write,
-            Err(ArenaError::Buffer(BufferError::OutOfRange))
+            arena.prepare_flush(Some(dim), None, 1),
+            Err(ArenaError::NodesFull)
         ));
         assert!(arena.nodes_dirty);
         assert_eq!(arena.root_count, 1);
         assert_eq!(arena.dirty.get(&1), Some(&SectionMeta::default()));
-        assert!(!arena.is_published());
 
-        let write_step = std::cell::Cell::new(0);
-        arena
-            .flush_with(
-                Some(dim),
-                GPU_MAX_NODES,
-                |bytes| {
-                    assert_eq!(write_step.replace(1), 0);
-                    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
-                    assert_eq!(
-                        u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-                        GpuNode::NONE
-                    );
-                    assert_eq!(child_mask(bytes), 0);
-                    Ok(())
-                },
-                |_| {
-                    assert_eq!(write_step.replace(2), 1);
-                    Ok(())
-                },
-                |offset, bytes| {
-                    assert_eq!(write_step.replace(3), 2);
-                    assert_eq!(offset, SECTION_METADATA_BYTES);
-                    assert_eq!(bytes, SectionMeta::default().to_bytes().as_slice());
-                    Ok(())
-                },
-            )
+        let failed_write = arena
+            .prepare_flush(Some(dim), None, GPU_MAX_NODES)
+            .unwrap()
             .unwrap();
-        assert_eq!(write_step.get(), 3);
+        // The caller discards this batch if a buffer write fails, without committing.
+        assert!(!arena.is_published());
+        assert_eq!(arena.root_count, 1);
+        let retry = arena
+            .prepare_flush(Some(dim), None, GPU_MAX_NODES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_write.nodes_bytes, retry.nodes_bytes);
+        assert_eq!(failed_write.roots_bytes, retry.roots_bytes);
+        assert_eq!(failed_write.section_runs, retry.section_runs);
+        assert_eq!(&retry.nodes_bytes[8..12], &0u32.to_le_bytes());
+        assert_eq!(&retry.nodes_bytes[12..16], &GpuNode::NONE.to_le_bytes());
+        assert_eq!(&retry.nodes_bytes[16..20], &0u32.to_le_bytes());
+        assert_eq!(
+            retry.section_runs,
+            [(
+                SECTION_METADATA_BYTES,
+                SectionMeta::default().to_bytes().to_vec()
+            )]
+        );
+        arena.commit_flush(retry.root_count);
         assert!(arena.is_published());
+        assert!(
+            arena
+                .prepare_flush(Some(dim), None, GPU_MAX_NODES)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            arena
+                .prepare_flush(Some(dim), Some((0, 64)), GPU_MAX_NODES)
+                .unwrap()
+                .is_some()
+        );
     }
 }

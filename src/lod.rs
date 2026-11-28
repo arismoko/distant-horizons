@@ -589,7 +589,8 @@ pub fn downsample_quad(samples: [LodColumn; 4]) -> LodColumn {
 pub struct DimensionLodStore {
     pub sections: HashMap<SectionPos, LodSection>,
     pub disk_checked: HashSet<SectionPos>,
-    pub sampled_distant_sections: HashSet<SectionPos>,
+    /// Terminal jobs for custom generators and the legacy D0/D5/D6 scheduler.
+    pub legacy_terminal_targets: HashSet<SectionPos>,
     pub generated_columns: u64,
 }
 
