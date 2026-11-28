@@ -2,6 +2,10 @@
 //! renderer (`gpu_arena`, GLSL shaders under `assets/distantsunrises/shaders/`).
 //!
 //! No `wgpu` types and no `[native.*]`: everything goes through Sunrise's general render API.
+//!
+//! On the plain classic transparency route, optional `voxy_ssao` samples opaque LOD depth and
+//! `voxy_ssao_apply` composites before translucent LODs. A shader pack bound to the terrain
+//! pipeline shades the opaque LODs itself; neither plain SSAO pass runs on that route.
 
 use crate::api::{LodWorldGenerator, RemoteLodProvider};
 use crate::config::DhConfig;
@@ -58,6 +62,17 @@ const SUBDIVISION_SIZE: f32 = 64.0;
 
 fn id(text: &str) -> mod_api::Identifier {
     mod_api::Identifier::parse(text).expect("static identifier")
+}
+
+fn pack_owns_terrain(assets: &dyn mod_api::RenderAssets) -> bool {
+    assets
+        .render_pipeline(&id(PIPELINE_PACK_TERRAIN))
+        .ok()
+        .is_some_and(|p| assets.pipeline_pack_bound(p))
+}
+
+fn plain_ssao_enabled(enabled: bool, pack_bound: bool) -> bool {
+    enabled && !pack_bound
 }
 
 /// A storage-buffer layout entry (`std430`, set 1). `min_size` is the size of the GLSL block's
@@ -862,6 +877,11 @@ static PREPARED: Mutex<Vec<(mod_api::RenderLevelStage, mod_api::PreparedWorldDra
 
 /// Opaque LOD draw stage, after traversal and indirect command generation.
 pub const OPAQUE_STAGE: mod_api::RenderLevelStage = mod_api::RenderLevelStage::AfterOpaqueFeatures;
+/// With slots running before their stage's mod draws, the `AfterOpaqueFeatures` slot is too
+/// early to see opaque LOD depth. On the classic route, `AfterTranslucentFeatures` comes after
+/// opaque LODs and before vanilla water/glass, `PIPELINE_SSAO_APPLY`, and `PIPELINE_TRANSLUCENT`.
+pub const SSAO_AFTER_STAGE: mod_api::RenderLevelStage =
+    mod_api::RenderLevelStage::AfterTranslucentFeatures;
 /// Stage of the translucent LOD draw.
 pub const TRANSLUCENT_STAGE: mod_api::RenderLevelStage =
     mod_api::RenderLevelStage::AfterTranslucentBlocks;
@@ -875,8 +895,8 @@ pub fn begin_frame(camera: [f64; 3]) {
     PREPARED.lock().unwrap().clear();
 }
 
-/// Records this frame's traversal, command generation and optional SSAO. Called from
-/// `Hooks::frame_graph_setup`.
+/// Records traversal and command generation on both routes, and optional SSAO for plain classic
+/// transparency. Called from `Hooks::frame_graph_setup`.
 pub fn setup_compute(
     host: &dyn mod_api::ClientHost,
     camera: &CameraMatrices,
@@ -885,7 +905,7 @@ pub fn setup_compute(
     use mod_api::{
         ComputePassDescriptor, DrawBindings, FrameTarget, RenderLevelStage, TextureSource,
     };
-    // Every early return below leaves SSAO unwritten for the next frame's `ssao_apply`.
+    // Early returns and skipping SSAO for a terrain-owning pack leave this frame unwritten.
     SSAO_WRITTEN.store(false, Ordering::Release);
     COMPUTE_DISPATCHES.store(0, Ordering::Relaxed);
     let Some(frame) = FRAME.lock().unwrap().clone() else {
@@ -1044,11 +1064,11 @@ pub fn setup_compute(
     });
     report("add_compute_pass", added);
 
-    // Compute SSAO pass on opaque LOD depth (runs after opaque LODs, before translucents).
+    // A terrain-owning pack shades the LODs itself; its WorldDepth copy can predate their draw.
     // `frame_graph_setup` runs before `prepare_render_buffers` in Dev 2, so compute ensures the
     // `ssao_size` target first and `prepare_draws` ensures the same size before binding it.
     let [sw, sh] = ssao_size([w, h]);
-    if frame.config.ssao_enabled
+    if plain_ssao_enabled(frame.config.ssao_enabled, pack_owns_terrain(assets))
         && let (Ok(ssao_pipe), Some(ssao_target)) = (
             assets.compute_pipeline(&id("distantsunrises:voxy_ssao")),
             ensure_ssao(host, [sw, sh]),
@@ -1067,7 +1087,7 @@ pub fn setup_compute(
         let ssao_desc = ComputePassDescriptor::new("distantsunrises:ssao")
             .reads(FrameTarget::MainDepth)
             .writes(FrameTarget::Mod(ssao_target.target))
-            .after_stage(OPAQUE_STAGE)
+            .after_stage(SSAO_AFTER_STAGE)
             .before_stage(TRANSLUCENT_STAGE);
         let added_ssao = graph.add_compute_pass(ssao_desc, &mut |ctx| {
             let bindings = DrawBindings::new()
@@ -1093,9 +1113,10 @@ pub fn setup_compute(
     COMPUTE_DISPATCHES.store(compute_dispatches, Ordering::Relaxed);
 }
 
-/// Prepares this frame's two indirect draws (opaque in [`OPAQUE_STAGE`], translucent in
-/// [`TRANSLUCENT_STAGE`]); a shader pack that compiled `dh_terrain` / `dh_water` draws the
-/// pack-linked pipelines instead. Called from `Hooks::prepare_render_buffers`.
+/// Prepares opaque and translucent indirect draws, using pack-linked pipelines where bound.
+/// On the plain classic route, the optional SSAO composite goes before the translucent LOD draw
+/// in [`TRANSLUCENT_STAGE`]; a terrain-owning pack skips this composite. Called from
+/// `Hooks::prepare_render_buffers`.
 pub fn prepare_draws(
     host: &dyn mod_api::ClientHost,
     camera: &CameraMatrices,
@@ -1179,7 +1200,7 @@ pub fn prepare_draws(
     let s = arena.slices;
     // Apply compute SSAO multiplicatively onto opaque LODs before sorted translucent water draws.
     // Ensure the same `ssao_size` as `setup_compute` so the draw uses its target.
-    if frame.config.ssao_enabled
+    if plain_ssao_enabled(frame.config.ssao_enabled, pack_owns_terrain(assets))
         && let (Some(win_size), Ok(ssao_apply), Ok(_)) = (
             host.window_size(),
             assets.render_pipeline(&id(PIPELINE_SSAO_APPLY)),
@@ -1907,6 +1928,17 @@ mod tests {
                 "{shader}: unbound GLSL blocks: {blocks:?}"
             );
         }
+    }
+
+    #[test]
+    fn plain_ssao_uses_the_classic_slot_and_skips_pack_owned_terrain() {
+        use mod_api::RenderLevelStage;
+
+        assert_eq!(SSAO_AFTER_STAGE, RenderLevelStage::AfterTranslucentFeatures);
+        assert_eq!(TRANSLUCENT_STAGE, RenderLevelStage::AfterTranslucentBlocks);
+        assert!(plain_ssao_enabled(true, false));
+        assert!(!plain_ssao_enabled(true, true));
+        assert!(!plain_ssao_enabled(false, false));
     }
 
     #[test]
