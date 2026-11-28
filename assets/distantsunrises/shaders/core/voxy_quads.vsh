@@ -11,23 +11,24 @@ struct SectionMeta {
 
 layout(std140) uniform QuadParams {
     mat4 view_proj;        // camera-relative, jittered (world.jittered)
-    ivec4 base_section;    // xyz = camera block >> 5
-    vec4 camera_sub_pos;   // xyz = camera - base_section*32
-    vec4 depth_and_light;  // x = camera near (depth = near / w), y = far_dh, z = clip_dist (blocks, 0 = off), w = sun brightness
-    vec4 fog;              // x = start, y = end, z = unused, w = spherical (0/1)
-    vec4 fog_color;        // sRGB
-    uvec4 flags;           // x = is_hdr, y = shading, z/w = unused
+    ivec3 base_section;    // camera block >> 5
+    int shading_enabled;
+    vec3 camera_sub_pos;   // camera - base_section*32
+    float near_plane;      // depth = near_plane / w
+    vec4 fog_and_clip;     // x = start, y = end, z = clip distance (0 = off), w = spherical (0/1)
+    vec3 fog_color;        // sRGB
 };
 
 layout(std430) readonly buffer QuadBuffer { uvec2 quads[]; };
 layout(std430) readonly buffer SectionBuffer { SectionMeta sections[]; };
 layout(std430) readonly buffer ModelBuffer { uint models[]; };      // 16 words per model
 layout(std430) readonly buffer BiomeTintBuffer { uint biome_tints[]; }; // grass, foliage, water
+uniform sampler2D Lightmap;
 
-layout(location = 0) out flat uvec4 inter;   // x: face | model<<8 ; y: tint rgb ; z: light ; w: lod
+layout(location = 0) out flat uvec4 inter;   // x: face | model<<8 ; y: tint rgb ; z: unused ; w: lod
 layout(location = 1) out vec2 uv;            // tile units across the merged quad
 layout(location = 2) out vec3 rel_pos;       // camera-relative world position
-layout(location = 3) out flat float face_shade;
+layout(location = 4) out flat vec3 lit_shade;
 
 // Vanilla CardinalLighting.DEFAULT: down 0.5, up 1.0, north/south 0.8, west/east 0.6.
 const float FACE_SHADE[6] = float[6](0.5, 1.0, 0.8, 0.8, 0.6, 0.6);
@@ -63,13 +64,13 @@ void main() {
     int y = (int(meta.a.x) << 4) >> 24;
     int x = (int(meta.a.y) << 4) >> 8;
     int z = (int(((meta.a.x & 0xFFFFFu) << 4) | (meta.a.y >> 28)) << 8) >> 8;
-    ivec3 section = (ivec3(x, y, z) << int(detail)) - base_section.xyz;
+    ivec3 section = (ivec3(x, y, z) << int(detail)) - base_section;
 
     uint axis = face >> 1;
     vec3 base = qpos + swizzle_axis(axis, vec3(0.0, 0.0, float(face & 1u)));
     vec2 corner_mask = vec2(float((corner >> 1) & 1u), float(corner & 1u));
     vec3 local = base + swizzle_axis(axis, vec3(vec2(size) * corner_mask, 0.0));
-    vec3 world = local * lod_scale + vec3(section << 5) - camera_sub_pos.xyz;
+    vec3 world = local * lod_scale + vec3(section << 5) - camera_sub_pos;
 
     // Model entry: tint kind selects biome LUT column or a constant.
     uint mbase = model_id * 16u;
@@ -89,7 +90,7 @@ void main() {
     vec4 clip = view_proj * vec4(world, 1.0);
     // The world's reversed depth over an infinite far plane (depth = near / w), so LOD and vanilla
     // geometry order correctly where they overlap and nothing clips at vanilla's far plane.
-    clip.z = depth_and_light.x;
+    clip.z = near_plane;
     gl_Position = clip;
 
     bool double_sided = (mflags & 8u) != 0u;
@@ -107,7 +108,7 @@ void main() {
             inter = uvec4(0u);
             uv = vec2(0.0);
             rel_pos = vec3(0.0);
-            face_shade = 1.0;
+            lit_shade = vec3(1.0);
             return;
         }
     }
@@ -118,8 +119,13 @@ void main() {
         tint = biome_tints[biome * 3u + (tint_kind - 1u)];
     }
 
-    inter = uvec4(face | (model_id << 8), tint, light, detail);
+    inter = uvec4(face | (model_id << 8), tint, 0u, detail);
     uv = vec2(size) * corner_mask;
     rel_pos = world;
-    face_shade = ((mflags & 2u) != 0u) ? FACE_SHADE[face] : 1.0;
+
+    // Match terrain.wgsl: sample the center of the (block, sky) lightmap texel.
+    vec2 lm_uv = (vec2(float((light >> 4) & 15u), float(light & 15u)) + 0.5) / 16.0;
+    vec3 lm = textureLod(Lightmap, lm_uv, 0.0).rgb;
+    float shade = (shading_enabled != 0 && (mflags & 2u) != 0u) ? FACE_SHADE[face] : 1.0;
+    lit_shade = lm * shade;
 }

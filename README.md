@@ -19,12 +19,13 @@ Sunrise's general mod API: `sunrise-mod.toml` has no `[[native.mixin]]` rows and
 - **GPU arena.** `src/gpu_arena.rs` keeps every section's quads in one persistent storage-buffer
   arena (free-list sub-allocation, 32-byte section metadata, 8 quad buckets per section: translucent,
   double-sided and the six faces). A section that cannot be stored keeps its previous mesh.
-- **GLSL Hi-Z compute and GPU indirect draws.** Each frame a compute node (`voxy_hiz.csh`) builds a
-  Hi-Z depth pyramid from the world depth, `voxy_cmdgen.csh` frustum, Hi-Z and back-face culls every
-  section and rewrites its indirect draw commands, and two `draw_indirect` calls (opaque after the
-  opaque features, translucent after the translucent blocks) pull quads from the arena in
-  `voxy_quads.vsh/fsh`. Settings that tune the look (fog, shading, overdraw prevention) feed its
-  uniform block.
+- **GLSL octree traversal and GPU indirect draws.** Each frame `voxy_traversal.csh` traverses the
+  octree in five compute dispatches, culling full node cubes against the frustum and horizontal
+  render distance and emitting selected section IDs into a compact `RenderQueue`. `voxy_cmdgen.csh`
+  builds indirect commands from that queue without another section cull, filtering face buckets
+  and feeding the translucent sort. Two `draw_indirect` calls (opaque after opaque features,
+  translucent after translucent blocks) pull quads from the arena in `voxy_quads.vsh/fsh`. Fog,
+  shading and overdraw-prevention settings feed the quad uniform block.
 - **Shader packs.** When the active Iris/OptiFine shader pack compiles `dh_terrain`, `dh_water` or
   `dh_shadow`, the mod's vertex stages `voxy_pack_*.vsh` link against the pack's fragment shader and
   the pack-linked pipelines draw instead (`src/shader_pack.rs`).
