@@ -340,6 +340,11 @@ pub trait RemoteLodProvider: Send + Sync + 'static {
     fn close(&self) {}
 }
 
+enum InstallOutcome {
+    Installed(Option<Arc<dyn LodWorldGenerator>>),
+    Rejected,
+}
+
 impl DhState {
     fn rewind_legacy_cursors(&mut self, dimension: &str) {
         for ((dim, _), cache) in &mut self.desired_cache {
@@ -354,18 +359,18 @@ impl DhState {
         &mut self,
         dimension: &str,
         generator: &Arc<dyn LodWorldGenerator>,
-    ) -> Result<Option<Arc<dyn LodWorldGenerator>>, ()> {
+    ) -> InstallOutcome {
         if let Some(existing) = self.world_generators.get(dimension)
             && existing.priority() > generator.priority()
         {
-            return Err(());
+            return InstallOutcome::Rejected;
         }
         let replaced = self
             .world_generators
             .insert(dimension.to_owned(), Arc::clone(generator));
         self.world_generator_epoch = self.world_generator_epoch.wrapping_add(1);
         self.rewind_legacy_cursors(dimension);
-        Ok(replaced)
+        InstallOutcome::Installed(replaced)
     }
 
     fn remove_world_generator(&mut self, dimension: &str) -> Option<Arc<dyn LodWorldGenerator>> {
@@ -381,7 +386,7 @@ impl DhState {
 /// generator). Returns `true` if installed. Newly eligible legacy cache rows are reconsidered
 /// without waiting for a player to move.
 pub fn register_world_generator(dimension: &str, generator: Arc<dyn LodWorldGenerator>) -> bool {
-    let Ok(replaced) = runtime()
+    let InstallOutcome::Installed(replaced) = runtime()
         .inner
         .lock()
         .unwrap()
@@ -945,7 +950,7 @@ mod tests {
         });
         assert!(matches!(
             st.install_world_generator(dim, &generator),
-            Ok(None)
+            InstallOutcome::Installed(None)
         ));
         let range = st.world_generators[dim].detail_range();
         let cache = crate::ensure_desired_cache(&mut st, key.clone(), cam, cfg);
@@ -967,7 +972,7 @@ mod tests {
 
         assert!(matches!(
             st.install_world_generator(dim, &generator),
-            Ok(Some(_))
+            InstallOutcome::Installed(Some(_))
         ));
         let cache = st.desired_cache.get_mut(&key).unwrap();
         assert_eq!((cache.disk_cursor, cache.sample_cursor), (0, 0));
@@ -1019,7 +1024,7 @@ mod tests {
             Arc::from([d1]);
         assert!(matches!(
             st.install_world_generator(dim, &generator),
-            Ok(None)
+            InstallOutcome::Installed(None)
         ));
         let state = Mutex::new(st);
 
@@ -1075,12 +1080,13 @@ mod tests {
         assert_eq!(cursors(), (1, 1));
 
         mutable.0.store(1, Ordering::Relaxed);
-        let replaced = state
+        let InstallOutcome::Installed(Some(replaced)) = state
             .lock()
             .unwrap()
             .install_world_generator(dim, &old_generator)
-            .unwrap()
-            .unwrap();
+        else {
+            panic!("expected to replace the registered generator");
+        };
         assert!(Arc::ptr_eq(&replaced, &old_generator));
         let (disk, sample) = scan(&old_generator, old_epoch, old_range);
         assert!(disk.is_none() && sample.is_none());

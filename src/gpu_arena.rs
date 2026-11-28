@@ -18,8 +18,8 @@
 //! (ruling point 9); this module adds no other cap.
 //!
 //! Culled sections are drawn with `instance_count = 0` (ruling point 18): the command buffers use
-//! one fixed slot per `(section id, bucket)`, rewritten every frame by `voxy_cmdgen.csh`, so the
-//! draw count is simply the id high-water mark times the bucket count.
+//! one fixed slot per `(render queue index, bucket)`, rewritten every frame by `voxy_cmdgen.csh`.
+//! Until count-driven draws are available, the draw count uses the id high-water mark.
 
 use crate::octree::{MAX_OCTREE_DETAIL, OctreeSectionPos, child_index};
 use crate::octree_ingest::is_out_of_build_height;
@@ -377,10 +377,14 @@ pub const GPU_NODE_BYTES: u64 = 32;
 pub const GPU_MAX_NODES: u64 = 1 << 18;
 /// Maximum node indices in each ping-pong traversal queue (`512 KiB`).
 pub const GPU_TRAV_QUEUE_CAP: u32 = 1 << 17;
-/// Size in bytes of one ping-pong queue buffer (`4 * u32` header + `GPU_TRAV_QUEUE_CAP * u32`).
-pub const GPU_TRAV_QUEUE_BYTES: u64 = (4 + GPU_TRAV_QUEUE_CAP as u64) * 4;
-/// Size in bytes of one indirect compute dispatch buffer (`wg_x, wg_y, wg_z, pad`).
-pub const GPU_DISPATCH_BYTES: u64 = 16;
+/// Byte size shared by the flat root and ping-pong queues of node indices.
+const GPU_TRAV_QUEUE_BYTES: u64 = GPU_TRAV_QUEUE_CAP as u64 * 4;
+/// One traversal dispatch per octree level, from the detail-4 roots to detail-0 leaves.
+pub const TRAVERSAL_ITERATIONS: usize = MAX_OCTREE_DETAIL as usize + 1;
+/// Layout: `[wg_x, wg_y, wg_z, count]`, also usable as indirect dispatch arguments.
+const QUEUE_META_BYTES: u64 = 16;
+/// Count and three pad words before the render queue's section IDs.
+pub const RENDER_QUEUE_HEADER_BYTES: usize = 16;
 
 /// One 32-byte node in `NodeBuffer` for `voxy_traversal.csh`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -607,11 +611,10 @@ pub struct ArenaSlices {
     pub trans_sort_entries: StorageBufferSlice,
     pub nodes: StorageBufferSlice,
     pub roots: StorageBufferSlice,
-    pub visibility: StorageBufferSlice,
+    pub render_queue: StorageBufferSlice,
     pub queue_a: StorageBufferSlice,
     pub queue_b: StorageBufferSlice,
-    pub dispatch_a: StorageBufferSlice,
-    pub dispatch_b: StorageBufferSlice,
+    pub queue_meta: [StorageBufferSlice; TRAVERSAL_ITERATIONS],
     pub models: StorageBufferSlice,
     pub biome_tints: StorageBufferSlice,
 }
@@ -630,18 +633,15 @@ pub struct GpuArena {
     pub trans_sort_entries: StorageBufferRef,
     /// Hierarchical octree node table (`voxy_traversal.csh`).
     pub nodes: StorageBufferRef,
-    /// Top-level `detail == MAX_OCTREE_DETAIL` root node indices (`voxy_trav_init.csh`).
+    /// Top-level `detail == MAX_OCTREE_DETAIL` node indices, read directly in iteration 0.
     pub roots: StorageBufferRef,
-    /// Per-section visibility flags written by `voxy_traversal.csh` and read by `voxy_cmdgen.csh`.
-    pub visibility: StorageBufferRef,
-    /// Ping-pong traversal queue A (`count`, pad, `items[]`).
+    /// Count header followed by compact section IDs emitted by traversal.
+    pub render_queue: StorageBufferRef,
+    /// Flat ping-pong traversal queues of node indices (same layout as `roots`).
     pub queue_a: StorageBufferRef,
-    /// Ping-pong traversal queue B (`count`, pad, `items[]`).
     pub queue_b: StorageBufferRef,
-    /// Indirect compute dispatch arguments for queue A (`indirect: true`).
-    pub dispatch_a: StorageBufferRef,
-    /// Indirect compute dispatch arguments for queue B (`indirect: true`).
-    pub dispatch_b: StorageBufferRef,
+    /// Per-iteration metadata. Indirect reads must not alias writable storage in a dispatch.
+    pub queue_meta: [StorageBufferRef; TRAVERSAL_ITERATIONS],
     /// Baked model table: `MODEL_WORDS` (16) `u32`s per 20-bit state id (see `voxy_quads.vsh`).
     pub models: StorageBufferRef,
     /// Biome tint LUT: grass, foliage, water `0x00BBGGRR` per 9-bit biome id.
@@ -735,21 +735,17 @@ impl GpuArena {
         let trans_sort_meta = make(host, StorageBufferDescriptor::new(TRANS_SORT_META_BYTES))?;
         let trans_sort_entries = make(host, StorageBufferDescriptor::new(tsort_entry_bytes))?;
         let node_bytes = GPU_MAX_NODES * GPU_NODE_BYTES;
-        let root_bytes = GPU_TRAV_QUEUE_CAP as u64 * 4;
-        let vis_bytes = n * 4;
+        let render_queue_bytes = RENDER_QUEUE_HEADER_BYTES as u64 + n * 4;
         let nodes = make(host, StorageBufferDescriptor::new(node_bytes))?;
-        let roots = make(host, StorageBufferDescriptor::new(root_bytes))?;
-        let visibility = make(host, StorageBufferDescriptor::new(vis_bytes))?;
+        let roots = make(host, StorageBufferDescriptor::new(GPU_TRAV_QUEUE_BYTES))?;
+        let render_queue = make(host, StorageBufferDescriptor::new(render_queue_bytes))?;
         let queue_a = make(host, StorageBufferDescriptor::new(GPU_TRAV_QUEUE_BYTES))?;
         let queue_b = make(host, StorageBufferDescriptor::new(GPU_TRAV_QUEUE_BYTES))?;
-        let dispatch_a = make(
-            host,
-            StorageBufferDescriptor::new(GPU_DISPATCH_BYTES).indirect(true),
-        )?;
-        let dispatch_b = make(
-            host,
-            StorageBufferDescriptor::new(GPU_DISPATCH_BYTES).indirect(true),
-        )?;
+        let queue_meta_desc = || StorageBufferDescriptor::new(QUEUE_META_BYTES).indirect(true);
+        let mut queue_meta = [make(host, queue_meta_desc())?; TRAVERSAL_ITERATIONS];
+        for meta in &mut queue_meta[1..] {
+            *meta = make(host, queue_meta_desc())?;
+        }
         let model_bytes = MODEL_COUNT * MODEL_WORDS * 4;
         let biome_bytes = BIOME_COUNT * 3 * 4;
         let models = make(host, StorageBufferDescriptor::new(model_bytes))?;
@@ -762,12 +758,11 @@ impl GpuArena {
             trans_sort_meta: trans_sort_meta.slice(0, TRANS_SORT_META_BYTES),
             trans_sort_entries: trans_sort_entries.slice(0, tsort_entry_bytes),
             nodes: nodes.slice(0, node_bytes),
-            roots: roots.slice(0, root_bytes),
-            visibility: visibility.slice(0, vis_bytes),
+            roots: roots.slice(0, GPU_TRAV_QUEUE_BYTES),
+            render_queue: render_queue.slice(0, render_queue_bytes),
             queue_a: queue_a.slice(0, GPU_TRAV_QUEUE_BYTES),
             queue_b: queue_b.slice(0, GPU_TRAV_QUEUE_BYTES),
-            dispatch_a: dispatch_a.slice(0, GPU_DISPATCH_BYTES),
-            dispatch_b: dispatch_b.slice(0, GPU_DISPATCH_BYTES),
+            queue_meta: queue_meta.map(|meta| meta.slice(0, QUEUE_META_BYTES)),
             models: models.slice(0, model_bytes),
             biome_tints: biome_tints.slice(0, biome_bytes),
         };
@@ -783,11 +778,10 @@ impl GpuArena {
             trans_sort_entries,
             nodes,
             roots,
-            visibility,
+            render_queue,
             queue_a,
             queue_b,
-            dispatch_a,
-            dispatch_b,
+            queue_meta,
             max_sections,
             residency: ArenaResidency::new(max_sections, geometry_bytes / QUAD_BYTES),
         })
@@ -797,7 +791,7 @@ impl GpuArena {
         self.max_sections
     }
 
-    /// Sections cmdgen must visit (`indirect_lookup`-free: ids are dense up to this mark).
+    /// Number of command slots per bucket; bounds the number of resident sections.
     pub fn section_high_water(&self) -> u32 {
         self.residency.ids.high_water()
     }
@@ -918,7 +912,6 @@ impl GpuArena {
         dimension: Option<&str>,
         y_bounds: Option<(i32, i32)>,
     ) -> Result<(), ArenaError> {
-        self.residency.nodes_dirty |= self.residency.last_flushed_y_bounds != y_bounds;
         let Some(pending) = self
             .residency
             .prepare_flush(dimension, y_bounds, GPU_MAX_NODES)?
@@ -980,11 +973,12 @@ impl GpuArena {
         let _ = self.trans_sort_entries.release(&*host);
         let _ = self.nodes.release(&*host);
         let _ = self.roots.release(&*host);
-        let _ = self.visibility.release(&*host);
+        let _ = self.render_queue.release(&*host);
         let _ = self.queue_a.release(&*host);
         let _ = self.queue_b.release(&*host);
-        let _ = self.dispatch_a.release(&*host);
-        let _ = self.dispatch_b.release(&*host);
+        for meta in self.queue_meta {
+            let _ = meta.release(&*host);
+        }
         let _ = self.models.release(&*host);
         let _ = self.biome_tints.release(&*host);
     }
@@ -1024,13 +1018,13 @@ impl ArenaResidency {
     }
 
     fn prepare_flush(
-        &self,
+        &mut self,
         dimension: Option<&str>,
         y_bounds: Option<(i32, i32)>,
         max_nodes: u64,
     ) -> Result<Option<PendingFlush>, ArenaError> {
-        let rebuild = self.nodes_dirty || self.last_flushed_y_bounds != y_bounds;
-        if !rebuild && self.dirty.is_empty() {
+        self.nodes_dirty |= self.last_flushed_y_bounds != y_bounds;
+        if self.is_published() {
             return Ok(None);
         }
         let mut pending = PendingFlush {
@@ -1039,7 +1033,7 @@ impl ArenaResidency {
             root_count: self.root_count,
             section_runs: Vec::new(),
         };
-        if rebuild {
+        if self.nodes_dirty {
             let known_empty = dimension.and_then(|dim| self.known_empty.get(dim));
             let (nodes, mut roots) = build_node_tree(&self.live_meta, known_empty, y_bounds);
             if nodes.len() as u64 > max_nodes {
@@ -1257,11 +1251,15 @@ mod tests {
         let (nodes, roots) = build_node_tree(&live, None, None);
         assert_eq!(roots.len(), 1);
         let root = nodes[roots[0] as usize];
+        assert_eq!(
+            unpack_section_pos([root.pos0, root.pos1]).0,
+            MAX_OCTREE_DETAIL
+        );
         assert_eq!(root.section_id, GpuNode::NONE);
         assert_ne!(root.child_mask, 0);
         // Walk down 4 levels from root to detail-0 leaf section 10.
         let mut cur = root;
-        for _ in 0..4 {
+        for _ in 1..TRAVERSAL_ITERATIONS {
             assert_ne!(cur.child_base, GpuNode::NONE);
             let ci = cur.child_mask.trailing_zeros() as usize;
             cur = nodes[cur.child_base as usize + ci];
@@ -1465,5 +1463,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        // A bounds-only rebuild also invalidates the published snapshot until committed.
+        assert!(!arena.is_published());
     }
 }

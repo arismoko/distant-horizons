@@ -617,7 +617,7 @@ impl OctreeIngestStore {
                     }
                 }
                 // Retained direct octants do not acquire a new mip proof.
-                if rebuild_all {
+                if rebuild_all && !outside.iter().all(|&o| o) {
                     self.complete_sections.insert(parent, CompleteKind::Mip);
                 } else if !preserve {
                     self.complete_sections.remove(&parent);
@@ -1154,6 +1154,23 @@ mod tests {
         let (saved, _, complete) = decode_octree_section(&record).unwrap();
         assert!(complete);
         assert_eq!(saved.to_dense(), merged.to_dense());
+    }
+
+    #[test]
+    fn all_children_outside_build_height_do_not_complete_mip() {
+        let parent = OctreeSectionPos::new(1, 0, 1, 0);
+        let children = parent.children().unwrap();
+        let bounds = (0, 64);
+        let mut store = OctreeIngestStore::new();
+        store.set_y_bounds(bounds);
+        assert!(
+            children
+                .iter()
+                .all(|&child| is_out_of_build_height(child, bounds))
+        );
+        store.dirty.extend(children);
+        assert!(store.propagate_dirty(&|_| 15).contains(&parent));
+        assert_eq!(store.complete_sections.get(&parent), None);
     }
 
     #[test]
